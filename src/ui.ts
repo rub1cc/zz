@@ -1,5 +1,5 @@
 import {
-  Input, Key, ScrollView, VStack, matchesKey, wrapTextWithAnsi,
+  Input, Key, ScrollView, VStack, matchesKey, visibleWidth, wrapTextWithAnsi,
   type Component, type Focusable, type OverlayHandle,
   type TuiAltScreen, type TuiMouseEvent, type TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
@@ -42,27 +42,39 @@ class SessionList extends Dynamic {
       if (row.kind === "project" && lines.length) lines.push("");
       const id = rowId(row);
       this.positions.set(id, lines.length);
-      this.hits.set(lines.length, row);
       const selected = c.selection === id;
-      let line: string;
+      let rowLines: string[];
       if (row.kind === "project") {
         const count = c.store.state.sessions.filter((s) => s.projectId === row.project.id).length;
-        line = `${selected ? ">" : " "} ${bold(oneLine(displayPath(row.project.path)))}${dim(`  ${count} session${count === 1 ? "" : "s"}`)}`;
+        const heading = `${selected ? ">" : " "} ${bold(oneLine(displayPath(row.project.path)))}`;
+        rowLines = [`${heading}${dim(`  ${count} session${count === 1 ? "" : "s"}`)}`];
       } else {
         const { session } = row;
         const symbol = session.status === "working" ? accent("*") : session.status === "needs-input" ? warning("?")
           : session.status === "failed" ? warning("!") : session.status === "paused" ? dim("-") : green(".");
         const time = age(session.updatedAt);
-        const titleWidth = Math.min(28, Math.max(8, Math.floor(width * 0.3)));
-        const title = pad(fit(oneLine(session.title), titleWidth), titleWidth);
+        const title = oneLine(session.title);
+        const titleWidth = Math.max(visibleWidth(title), Math.min(28, Math.max(8, Math.floor(width * 0.3))));
         const previewWidth = Math.max(0, width - titleWidth - time.length - 10);
-        line = previewWidth > 8
-          ? `  ${symbol} ${title}  ${dim(pad(fit(oneLine(session.preview), previewWidth), previewWidth))}  ${dim(time)}`
-          : `  ${symbol} ${oneLine(session.title)}`;
+        if (previewWidth > 8) {
+          const preview = dim(pad(fit(oneLine(session.preview), previewWidth), previewWidth));
+          rowLines = [`  ${symbol} ${pad(title, titleWidth)}  ${preview}  ${dim(time)}`];
+        } else {
+          const indent = width >= 6 ? "    " : "";
+          rowLines = wrapTextWithAnsi(title, Math.max(1, width - indent.length))
+            .map((part, index) => `${index === 0 && indent ? `  ${symbol} ` : indent}${part}`);
+        }
       }
-      line = fit(line, width);
-      // Truncation inserts full SGR resets; restore inverse so the entire row stays selected.
-      lines.push(selected ? `\x1b[7m${pad(line, width).replaceAll("\x1b[0m", "\x1b[0m\x1b[7m")}\x1b[27m` : line);
+      // Keep selection and mouse targets across every wrapped title line.
+      const background = "\x1b[48;5;254m";
+      const foreground = "\x1b[38;5;236m";
+      for (const rowLine of rowLines) {
+        const line = fit(rowLine, width);
+        this.hits.set(lines.length, row);
+        lines.push(selected ? `${background}${foreground}${pad(line, width)
+          .replaceAll("\x1b[0m", `\x1b[0m${background}${foreground}`)
+          .replaceAll("\x1b[39m", foreground)}\x1b[39m\x1b[49m` : line);
+      }
     }
     if (!lines.length) lines.push("  No projects. Press a to add a directory.");
     else if (c.mode === "sessions" && !c.store.state.sessions.some((s) => c.store.state.projects.some((p) => p.id === s.projectId))) {

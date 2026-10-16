@@ -28,38 +28,69 @@ function setup() {
 
 function assertFullyHighlighted(line: string, width: number): void {
   assert.equal(visibleWidth(line), width);
-  let inverse = false;
+  let highlighted = false;
+  assert.ok(!line.includes("\x1b[7m"), "Selection must not use inverse video");
+  assert.ok(line.includes("\x1b[38;5;236m"), "Selection must use readable dark text");
   for (const match of line.matchAll(/\x1b\[([\d;]*)m|([^\x1b]+)/g)) {
     if (match[1] !== undefined) {
-      for (const code of match[1].split(";").map(Number)) {
-        if (code === 0 || code === 27) inverse = false;
-        else if (code === 7) inverse = true;
-      }
+      if (match[1] === "0" || match[1] === "49") highlighted = false;
+      else if (match[1] === "48;5;254") highlighted = true;
     } else {
-      assert.ok(inverse, `Unhighlighted text: ${JSON.stringify(match[2])}`);
+      assert.ok(highlighted, `Unhighlighted text: ${JSON.stringify(match[2])}`);
     }
   }
-  assert.equal(inverse, false, "Highlight must not leak into the next row");
+  assert.equal(highlighted, false, "Highlight must not leak into the next row");
+  assert.ok(line.endsWith("\x1b[39m\x1b[49m"), "Selection must restore default colors");
 }
 
-test("selected sessions stay highlighted through title and preview truncation", async () => {
+test("session titles stay complete and selected rows stay highlighted through wrapping and preview truncation", async () => {
   const f = setup();
   try {
     f.c.send("task"); await tick();
     const session = f.store.state.sessions[0]!;
     f.c.select(`session:${session.id}`);
     for (const width of [18, 40, 80, 120, 200]) {
-      for (const title of ["short title", "a long title that exceeds the title column", "界面 😀 ".repeat(12)]) {
+      for (const title of ["short title", "a long title that exceeds the title column", "unbroken".repeat(20), "界面 😀 ".repeat(12)]) {
         for (const preview of ["Done", "a long preview ".repeat(30)]) {
           session.title = title; session.preview = preview;
           const lines = f.app.body.render(width);
-          const line = lines[f.app.body.positions.get(`session:${session.id}`)!]!;
-          assertFullyHighlighted(line, width);
-          assert.match(line, /\x1b\[32m/, "Status color must be preserved");
-          assert.ok(lines.filter((other) => other !== line).every((other) => !other.includes("\x1b[7m")));
+          const start = f.app.body.positions.get(`session:${session.id}`)!;
+          const end = [...f.app.body.positions.values()].find((position) => position > start) ?? lines.length;
+          const titleLines = lines.slice(start, end);
+          for (const line of titleLines) assertFullyHighlighted(line, width);
+          assert.match(titleLines[0]!, /\x1b\[32m/, "Status color must be preserved");
+          const text = titleLines.map((line) => stripTerminalSequences(line).slice(4)).join("").replace(/\s/g, "");
+          assert.ok(text.startsWith(title.replace(/\s/g, "")), "The entire title must be visible without ellipsis");
+          assert.ok([...lines.slice(0, start), ...lines.slice(end)].every((line) => !line.includes("\x1b[48;5;254m")));
         }
       }
     }
+  } finally { await f.cleanup(); }
+});
+
+test("wrapped unselected titles keep following row positions and continuation-line mouse targets", async () => {
+  const f = setup();
+  try {
+    f.c.select(`project:${f.pa.id}`); f.c.send("task"); await tick();
+    const session = f.store.state.sessions[0]!;
+    session.title = "Show the complete session title even when it needs several terminal lines";
+    f.c.select(`project:${f.pa.id}`);
+    const width = 24;
+    const lines = f.app.body.render(width);
+    const start = f.app.body.positions.get(`session:${session.id}`)!;
+    const nextProject = f.app.body.positions.get(`project:${f.pb.id}`)!;
+    const titleLines = lines.slice(start, nextProject).filter((line) => line.trim());
+    assert.ok(titleLines.length > 1);
+    assert.ok(titleLines.every((line) => visibleWidth(line) <= width && !line.includes("\x1b[48;5;254m")));
+    assert.equal(titleLines.map((line) => stripTerminalSequences(line).slice(4)).join("").replace(/\s/g, ""), session.title.replace(/\s/g, ""));
+    assert.ok(lines[nextProject]!.includes("\x1b[1m"), "Following project position must point to its heading");
+    const event = { type: "move" as const, button: "left" as const, x: 5, y: start + 1, screenX: 5, screenY: start + 1,
+      width, height: 32, shift: false, ctrl: false, alt: false };
+    assert.equal(f.app.body.handleMouse(event)?.handled, true);
+    assert.equal(f.c.selection, `session:${session.id}`);
+    f.app.body.render(width);
+    f.app.body.handleMouse({ ...event, type: "click", clickCount: 2 });
+    assert.equal(f.c.openedSessionId, session.id);
   } finally { await f.cleanup(); }
 });
 
