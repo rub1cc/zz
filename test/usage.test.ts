@@ -128,3 +128,47 @@ test("cached compaction activity is validated and round-trips with session metad
     }
   } finally { temp.cleanup(); }
 });
+
+test("pending follow-ups and cached inbox inputs are validated and survive index checkpoints", () => {
+  const temp = temporary();
+  try {
+    const store = new Store(temp.root); const s = session(); store.state.sessions.push(s);
+    s.pendingInput = { requestId: "initial", prompt: "initial" };
+    s.followUps = [{ requestId: "follow-up", prompt: "then raise a PR", prepared: { content: "then raise a PR" } }];
+    s.queuedInputs = [{ id: 2, text: "then raise a PR" }];
+    store.save(); assert.deepEqual(new Store(temp.root).state.sessions[0], s);
+    for (const change of [
+      (value: Session) => { value.followUps = [null as never]; },
+      (value: Session) => { value.followUps![0]!.requestId = 42 as never; },
+      (value: Session) => { value.followUps![0]!.prepared = { content: 42 as never }; },
+      (value: Session) => { value.queuedInputs![0]!.id = -1; },
+      (value: Session) => { value.queuedInputs![0]!.text = null as never; },
+    ]) {
+      const state = structuredClone(store.state); change(state.sessions[0]!);
+      writeFileSync(store.file, JSON.stringify(state));
+      assert.throws(() => new Store(temp.root), /Invalid zz state/);
+    }
+  } finally { temp.cleanup(); }
+});
+
+test("application settings default safely, round-trip and validate delivery modes", () => {
+  const temp = temporary();
+  try {
+    const store = new Store(temp.root); const s = session(); store.state.sessions.push(s);
+    store.save(); assert.deepEqual(new Store(temp.root).settings, { replyBehavior: "followUp" });
+    store.state.settings = { replyBehavior: "steer" };
+    s.pendingInput = { requestId: "input", prompt: "correction", whenBusy: "steer" };
+    s.queuedInputs = [{ id: 1, text: "correction", mode: "steer" }];
+    store.save(); assert.deepEqual(new Store(temp.root).state, store.state);
+    for (const change of [
+      (state: typeof store.state) => { state.settings = null as never; },
+      (state: typeof store.state) => { state.settings!.replyBehavior = "interrupt" as never; },
+      (state: typeof store.state) => { state.sessions[0]!.pendingInput!.whenBusy = "reject" as never; },
+      (state: typeof store.state) => { state.sessions[0]!.queuedInputs![0]!.mode = "write" as never; },
+    ]) {
+      const state = structuredClone(store.state); change(state);
+      writeFileSync(store.file, JSON.stringify(state));
+      assert.throws(() => new Store(temp.root), /Invalid zz state/);
+    }
+  } finally { temp.cleanup(); }
+});

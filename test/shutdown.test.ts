@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { test } from "node:test";
+import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { createShutdown } from "../src/shutdown.js";
 import { temporary } from "./helpers.js";
 
@@ -73,7 +74,7 @@ for (const stalled of [false, true]) test(stalled
   let rejectWait: (error: Error) => void = () => {};
   child.stdout.on("data", (chunk) => {
     output += chunk.toString();
-    if (!sent && output.includes("New task in")) {
+    if (!sent && stripTerminalSequences(output).includes("describe a task for a new session")) {
       sent = true;
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => rejectWait(new Error(`CLI shutdown did not finish: ${output.slice(-500)}`)), 2000);

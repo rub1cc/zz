@@ -9,6 +9,7 @@ import { Composer } from "../src/composer.js";
 import { rows, rowId, type CompactResult } from "../src/model.js";
 import { Store } from "../src/store.js";
 import { Dashboard, scrollToEndIndicator } from "../src/ui.js";
+import { UndoDialog } from "../src/undo-dialog.js";
 import { FakeEngine, FakeTerminal, temporary, tick } from "./helpers.js";
 
 function setup() {
@@ -267,10 +268,9 @@ test("multiline task and reply composers use Ctrl+J for newlines and Enter to se
     f.terminal.onInput("reply one"); f.terminal.onInput("\x0a"); f.terminal.onInput("reply two");
     f.c.opened!.status = "working";
     f.terminal.onInput("\r");
-    assert.equal(f.app.composer.getValue(), "reply one\nreply two");
-    assert.match(f.c.notice, /still working/);
-    f.c.opened!.status = "completed";
-    f.terminal.onInput("\r"); await tick();
+    assert.equal(f.app.composer.getValue(), "");
+    assert.equal(f.c.notice, "");
+    await tick();
     assert.equal(f.engine.calls.at(-1)?.prompt, "reply one\nreply two");
     assert.equal(f.store.state.sessions.length, 1);
   } finally { await f.cleanup(); }
@@ -842,14 +842,14 @@ test("command discovery follows project selection, session selection and the ope
     f.c.send("task"); await tick();
     const session = f.store.state.sessions[0]!;
     f.c.select(`project:${f.pb.id}`);
-    for (const command of ["/session", "/compact", "/stop", "/bottom", "/expand", "/collapse"]) await expectSuggestion(command, false);
-    for (const command of ["/model", "/thinking", "/skills", "/help"]) await expectSuggestion(command, true);
+    for (const command of ["/session", "/compact", "/undo", "/stop", "/bottom", "/expand", "/collapse"]) await expectSuggestion(command, false);
+    for (const command of ["/model", "/thinking", "/skills", "/settings", "/help"]) await expectSuggestion(command, true);
     f.c.select(`session:${session.id}`);
     assert.equal(f.app.composer.showingSuggestions, false, "Selection changes dismiss the old menu");
-    for (const command of ["/session", "/compact", "/stop"]) await expectSuggestion(command, true);
+    for (const command of ["/session", "/compact", "/undo", "/stop"]) await expectSuggestion(command, true);
     await expectSuggestion("/bottom", false);
     f.c.open();
-    for (const command of ["/session", "/compact", "/stop", "/bottom", "/expand", "/collapse"]) await expectSuggestion(command, true);
+    for (const command of ["/session", "/compact", "/undo", "/stop", "/bottom", "/expand", "/collapse"]) await expectSuggestion(command, true);
     f.c.back();
     await expectSuggestion("/bottom", false);
     f.c.select(`project:${f.pb.id}`);
@@ -871,11 +871,12 @@ test("help lists only the current view's commands and explains their scope", asy
     const project = help();
     assert.match(project, /Commands: Dashboard \(project selected\)/);
     assert.match(project, /\/model\s+Choose the model for new tasks/);
-    assert.doesNotMatch(project, /\|\s*\/(session|compact|stop|bottom|expand|collapse)\s/);
+    assert.doesNotMatch(project, /\|\s*\/(session|compact|undo|stop|bottom|expand|collapse)\s/);
     f.c.send("task"); await tick();
     const selected = help();
     assert.match(selected, /Commands: Dashboard \(session selected\)/);
     assert.match(selected, /\/compact\s+Summarize older context in the selected session/);
+    assert.match(selected, /\/undo\s+Choose a checkpoint/);
     assert.doesNotMatch(selected, /\|\s*\/(bottom|expand|collapse)\s/);
     f.c.open();
     const open = help();
@@ -974,7 +975,7 @@ test("composer status always shows below the editor with no shortcut toggle or h
     const idle = "test/mock · off · ?/100k · ◉ ? · cost ?";
     assert.deepEqual(belowComposer(), [idle]);
     assert.equal(render().filter((line) => line.includes("test/mock")).length, 1, "Model appears only below the composer");
-    assert.doesNotMatch(render().join("\n"), /shortcuts|ctrl\+l model|shift\+tab cycle|ctrl\+j newline/);
+    assert.doesNotMatch(render().join("\n"), /shortcuts|ctrl\+l model|shift\+tab cycle|ctrl\+j newline|New task in /);
     f.terminal.onInput("?");
     assert.equal(Boolean(f.c.dialog), false);
     assert.equal(f.app.composer.getValue(), "?", "Question marks are now ordinary draft text, even at the start");
@@ -982,10 +983,12 @@ test("composer status always shows below the editor with no shortcut toggle or h
     assert.equal(f.engine.calls.length, 0);
     f.app.composer.setValue("");
     f.c.send("task"); await tick(); f.c.open();
+    f.c.opened!.title = "Composer header test";
     f.c.opened!.context = { tokens: 1234 };
     f.c.opened!.agent = { model: { provider: "test", modelId: "reasoner" }, thinkingLevel: "high" };
     const active = "test/reasoner · high · ░░░░░░░░ ~1%/100k · ◉ ? · cost ?";
     assert.deepEqual(belowComposer(), [active]);
+    assert.doesNotMatch(render().join("\n"), /Reply to Composer header test|Enter queues/);
     for (const width of [1, 4, 12, 24, 80, 120]) {
       assert.ok(f.app.render(width).every((line) => visibleWidth(line) <= width));
     }
@@ -1095,6 +1098,318 @@ test("automatic compaction, retries, failures and summary cards render safely at
       assert.ok(lines.every((line) => !line.includes("\x1b[2J")));
     }
     assert.equal(f.c.canStop(session), true);
+  } finally { await f.cleanup(); }
+});
+
+test("busy-session replies clear the composer, preserve work and display queued messages separately", async () => {
+  const f = setup();
+  const finish: (() => void)[] = [];
+  f.engine.run = async (session, project, prompt) => {
+    f.engine.calls.push({ session, project, prompt });
+    session.status = "working";
+    await new Promise<void>((resolve) => finish.push(resolve));
+  };
+  try {
+    f.c.send("initial"); f.c.open();
+    const s = f.c.opened!;
+    const work = s.work;
+    s.preview = "Running bash";
+    for (const text of ["then raise a PR", "one more\nline two"]) {
+      f.app.composer.setValue(text); f.terminal.onInput("\r");
+      assert.equal(f.app.composer.getValue(), "");
+      assert.equal(s.work, work); assert.equal(s.preview, "Running bash");
+    }
+    assert.equal(f.store.state.sessions.length, 1);
+    assert.deepEqual(f.engine.calls.map((call) => call.prompt), ["initial", "then raise a PR", "one more\nline two"]);
+    assert.deepEqual(s.messages.map((m) => m.text), ["initial"], "queued text is not yet part of the transcript");
+    // Native inbox projection drives queue presentation, not optimistic transcript messages.
+    s.queuedInputs = [{ id: 1, text: "then raise a PR" }, { id: 2, text: "one more\nline two" }];
+    const transcript = f.app.body.transcript.render(120).map(stripTerminalSequences).join("\n");
+    assert.match(transcript, /Queued follow-ups \(2\)/);
+    assert.match(transcript, /1\. then raise a PR/); assert.match(transcript, /2\. one more/); assert.match(transcript, /line two/);
+    assert.doesNotMatch(f.app.render(120).map(stripTerminalSequences).join("\n"), /Enter queues/);
+    for (const width of [10, 24, 80]) assert.ok(f.app.render(width).every((line) => visibleWidth(line) <= width));
+    s.status = "completed";
+    finish[0]!(); await tick();
+    assert.equal(f.c.canStop(s), true, "settling the first request must not clear pending follow-ups");
+    assert.equal(s.work?.finishedAt, undefined);
+    assert.equal(await f.c.configure({ model: { provider: "test", modelId: "reasoner" } }, s.id), false);
+    finish[1]!(); await tick();
+    assert.equal(f.c.canStop(s), true);
+    delete s.queuedInputs;
+    finish[2]!(); await tick();
+    assert.equal(f.c.canStop(s), false); assert.ok(s.work?.finishedAt);
+  } finally { finish.forEach((done) => done()); await tick(); await f.cleanup(); }
+});
+
+test("peek accepts follow-ups while working, but stopping or deleting a session still rejects sends", async () => {
+  const f = setup();
+  let release!: () => void;
+  try {
+    f.c.send("initial"); await tick();
+    const s = f.store.state.sessions[0]!; s.status = "working";
+    f.c.peek(); f.app.sync();
+    s.queuedInputs = [{ id: 1, text: "existing queue" }];
+    f.tui.renderNow();
+    assert.match(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Enter queues a follow-up \/ 1 queued/);
+    f.terminal.onInput("then raise a PR"); f.terminal.onInput("\r"); await tick();
+    assert.equal(f.c.dialog, undefined);
+    assert.equal(f.engine.calls.at(-1)?.prompt, "then raise a PR");
+    assert.equal(f.engine.calls.at(-1)?.session.id, s.id);
+
+    s.status = "working";
+    f.engine.cancel = async () => new Promise<void>((resolve) => { release = resolve; });
+    const stopping = f.c.cancel(s.id);
+    assert.equal(f.c.send("not while stopping", s.id), false); assert.match(f.c.notice, /stopping/);
+    release(); await stopping;
+    f.engine.stop = async () => new Promise<void>((resolve) => { release = resolve; });
+    f.c.requestDelete(); const deleting = f.c.confirmDelete();
+    assert.equal(f.c.send("not while deleting", s.id), false); assert.match(f.c.notice, /stopping/);
+    release(); await deleting;
+    assert.equal(f.store.state.sessions.length, 0);
+  } finally { release?.(); await f.cleanup(); }
+});
+
+test("a restored queue remains stoppable even if its last run failed", async () => {
+  const f = setup();
+  try {
+    f.c.send("task"); await tick();
+    const s = f.store.state.sessions[0]!;
+    s.status = "failed";
+    s.pendingInput = { requestId: "queued", prompt: "queued reply" };
+    s.queuedInputs = [{ id: 1, text: "queued reply" }];
+    assert.equal(f.c.canStop(s), true);
+    await f.c.cancel(s.id);
+    assert.deepEqual(f.engine.cancelled, [s.id]);
+    assert.equal(s.status, "paused"); assert.equal(s.pendingInput, undefined); assert.equal(s.queuedInputs, undefined);
+    assert.equal(f.c.notice, "Stopped. Reply to continue.");
+  } finally { await f.cleanup(); }
+});
+
+test("/settings is a saved configuration page with busy-reply behavior and model/thinking pickers", async () => {
+  const f = setup();
+  const screen = () => { f.tui.renderNow(); return f.tui.getScreenLines().map(stripTerminalSequences).join("\n"); };
+  const kind = () => f.c.dialog?.kind;
+  try {
+    f.terminal.onInput("/settings"); f.terminal.onInput("\r");
+    assert.equal(kind(), "settings"); assert.equal(f.engine.calls.length, 0);
+    assert.match(screen(), /Busy-session replies\s+Follow-up/);
+    assert.match(screen(), /New-task model/); assert.match(screen(), /Already queued messages keep their mode/);
+    f.terminal.onInput("\r");
+    assert.equal(kind(), "settings"); assert.equal(f.store.settings.replyBehavior, "steer");
+    assert.equal(new Store(f.store.root).settings.replyBehavior, "steer");
+    assert.match(screen(), /Busy-session replies\s+Steer/);
+    f.terminal.onInput("\x0e"); f.terminal.onInput("\r"); await tick();
+    assert.equal(kind(), "model");
+    f.terminal.onInput("reasoner"); f.terminal.onInput("\r"); await tick();
+    assert.equal(kind(), "settings"); assert.equal(f.c.configuration.model?.modelId, "reasoner");
+    assert.match(screen(), /New-task model\s+test\/reasoner/);
+    f.terminal.onInput("\x0e"); f.terminal.onInput("\r"); await tick();
+    assert.equal(kind(), "thinking");
+    f.terminal.onInput("\x10"); f.terminal.onInput("\r"); await tick();
+    assert.equal(kind(), "settings"); assert.equal(f.c.configuration.thinkingLevel, "high");
+    f.terminal.onInput("\x1b"); assert.equal(f.c.dialog, undefined);
+    f.terminal.onInput("/config"); f.terminal.onInput("\r");
+    assert.equal(kind(), "settings"); assert.match(screen(), /Busy-session replies\s+Steer/);
+    assert.equal(f.store.state.sessions.length, 0);
+  } finally { await f.cleanup(); }
+});
+
+test("settings preserves session scope and drafts; cancelling a nested picker returns to the page", async () => {
+  const f = setup();
+  const kind = () => f.c.dialog?.kind;
+  try {
+    f.c.send("task"); await tick(); f.c.open();
+    const s = f.c.opened!; s.status = "working";
+    f.app.composer.setValue("keep my reply");
+    f.c.showSettings();
+    f.tui.renderNow();
+    assert.match(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Session model/);
+    f.terminal.onInput("\r"); // Global behavior may change even while a session works.
+    assert.equal(f.store.settings.replyBehavior, "steer");
+    assert.equal(s.status, "working"); assert.equal(f.engine.cancelled.length, 0);
+    f.terminal.onInput("\x1b[B"); f.terminal.onInput("\r"); await tick();
+    assert.equal(kind(), "model");
+    f.terminal.onInput("\x1b"); assert.equal(kind(), "settings");
+    assert.equal(f.app.composer.getValue(), "keep my reply");
+    s.status = "completed";
+    f.terminal.onInput("\r"); await tick(); // Re-open the selected model row.
+    f.terminal.onInput("reasoner"); f.terminal.onInput("\r"); await tick();
+    assert.equal(kind(), "settings"); assert.equal(s.agent?.model?.modelId, "reasoner");
+    assert.equal(f.engine.configuration().model?.modelId, "mock", "session settings must not change new-task defaults");
+    for (const width of [10, 24, 50, 120]) {
+      f.terminal.columns = width; f.terminal.onResize(); f.tui.renderNow();
+      assert.ok(f.tui.getScreenLines().every((line) => visibleWidth(line) <= width));
+    }
+    f.terminal.onInput("\x1b");
+    assert.equal(f.app.composer.getValue(), "keep my reply");
+    f.terminal.columns = 120; f.terminal.onResize();
+    s.status = "working"; f.c.changed(); f.tui.renderNow();
+    assert.doesNotMatch(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Enter queues steering/);
+    assert.equal(f.engine.cancelled.length, 0);
+  } finally { await f.cleanup(); }
+});
+
+test("settings opens without model lookup, reports save errors and never reopens a dismissed page", async (t) => {
+  const f = setup();
+  let release!: () => void;
+  try {
+    const original = f.engine.listModels.bind(f.engine);
+    let lookups = 0;
+    f.engine.listModels = async () => { lookups++; await new Promise<void>((resolve) => { release = resolve; }); return original(); };
+    f.c.showSettings(); assert.equal(lookups, 0);
+    const save = t.mock.method(f.store, "save", () => { throw new Error("Disk full"); });
+    f.terminal.onInput("\r");
+    assert.equal(f.store.settings.replyBehavior, "followUp"); assert.match(f.c.notice, /Disk full/);
+    assert.equal(f.c.dialog?.kind, "settings");
+    save.mock.restore();
+    f.terminal.onInput("\x1b[B"); f.terminal.onInput("\r");
+    assert.equal(lookups, 1);
+    f.terminal.onInput("\x1b"); assert.equal(f.c.dialog, undefined);
+    release(); await tick(); assert.equal(f.c.dialog, undefined);
+  } finally { release?.(); await f.cleanup(); }
+});
+
+test("mixed queued modes retain truthful labels after changing the busy-reply setting", async () => {
+  const f = setup();
+  try {
+    f.c.send("task"); await tick(); f.c.open();
+    const s = f.c.opened!; s.status = "working";
+    s.queuedInputs = [{ id: 1, text: "finish later", mode: "followUp" }, { id: 2, text: "change course", mode: "steer" }];
+    f.c.setReplyBehavior("steer");
+    const text = f.app.body.transcript.render(120).map(stripTerminalSequences).join("\n");
+    assert.match(text, /Queued messages \(2\)/);
+    assert.match(text, /1\. \[follow-up\] finish later/); assert.match(text, /2\. \[steer\] change course/);
+    f.c.setReplyBehavior("followUp");
+    assert.equal(f.app.body.transcript.render(120).map(stripTerminalSequences).join("\n"), text);
+  } finally { await f.cleanup(); }
+});
+
+test("/undo opens a cancellable picker, restores only the chosen checkpoint, and keeps session scope", async () => {
+  const f = setup();
+  const kind = () => f.c.dialog?.kind;
+  try {
+    f.app.composer.onSubmit?.("/undo"); await tick();
+    assert.match(f.c.notice, /Open or select a session/);
+    assert.equal(f.engine.undos.length, 0);
+    f.c.send("first task"); await tick();
+    const first = f.store.state.sessions[0]!;
+    f.c.send("second task"); await tick();
+    const second = f.store.state.sessions[1]!;
+    const calls = f.engine.calls.length;
+    f.c.select(`session:${first.id}`);
+    f.app.composer.onSubmit?.("/undo"); await tick();
+    assert.equal(kind(), "undo");
+    assert.equal(f.engine.undos.length, 0, "opening the picker must not restore anything");
+    f.tui.renderNow();
+    const text = f.tui.getScreenLines().map(stripTerminalSequences).join("\n");
+    assert.match(text, /Restore a checkpoint/); assert.match(text, /Latest prompt/); assert.match(text, /Older prompt/);
+    f.terminal.onInput("\x1b");
+    assert.equal(kind(), undefined); assert.equal(f.engine.undos.length, 0, "Escape cancels without restoring");
+    f.app.composer.onSubmit?.("/undo"); await tick();
+    f.terminal.onInput("\x1b[B");
+    assert.equal(f.engine.undos.length, 0, "browsing must not restore anything");
+    f.terminal.onInput("\r"); await tick();
+    assert.equal(f.engine.undos[0]?.id, first.id);
+    assert.equal(f.engine.undoIds[0], "older");
+    assert.equal(kind(), undefined);
+    assert.equal(f.app.composer.getValue(), "", "dashboard undo must not prefill a new task");
+    assert.match(f.c.notice, /conversation and 1 tracked file restored/);
+    f.c.open(); f.c.selection = `session:${second.id}`;
+    f.terminal.onInput("/undo"); f.terminal.onInput("\r"); await tick();
+    assert.equal(f.engine.undos.length, 1);
+    f.terminal.onInput("\r"); await tick();
+    assert.equal(f.engine.undos[1]?.id, first.id);
+    assert.equal(f.engine.undoIds[1], "latest");
+    assert.equal(f.app.composer.getValue(), "Restored prompt");
+    assert.equal(f.engine.calls.length, calls);
+    assert.equal(f.store.state.sessions.length, 2);
+    f.app.composer.onSubmit?.("/undo 2"); await tick();
+    assert.match(f.c.notice, /Usage: \/undo/);
+    assert.equal(f.engine.undos.length, 2);
+  } finally { await f.cleanup(); }
+});
+
+test("checkpoint restore refuses busy projects, blocks sends, preserves new drafts, and reports failures", async () => {
+  const f = setup();
+  let finish!: (result: { prompt: string; files: number; shell: boolean }) => void;
+  try {
+    f.c.send("task"); await tick(); f.c.open();
+    const s = f.c.opened!;
+    s.status = "working";
+    await f.c.showUndo(); assert.match(f.c.notice, /Wait for this project's sessions/);
+    assert.equal(f.engine.undos.length, 0);
+    s.status = "completed";
+    f.engine.undo = async () => new Promise((resolve) => { finish = resolve; });
+    f.terminal.onInput("/undo"); f.terminal.onInput("\r"); await tick();
+    f.terminal.onInput("\r");
+    assert.equal(f.c.send("too soon", s.id), false);
+    assert.equal(f.c.send("new task in same project"), false);
+    f.app.composer.setValue("new unsent draft");
+    finish({ prompt: "old prompt", files: 0, shell: true }); await tick();
+    assert.equal(f.app.composer.getValue(), "new unsent draft");
+    assert.match(f.c.notice, /Shell-command changes were NOT undone/);
+    f.engine.undo = async () => { throw new Error("file changed since the agent edited it"); };
+    await f.c.showUndo();
+    await f.c.undo("latest", s.id);
+    assert.match(f.c.notice, /file changed since/);
+    assert.equal(f.c.dialog?.kind, "undo", "a failed restore leaves the picker open for retry or cancellation");
+    assert.equal(f.app.composer.getValue(), "new unsent draft");
+    f.terminal.onInput("\x1b");
+    assert.equal(f.c.send("now allowed", s.id), true); await tick();
+  } finally { finish?.({ prompt: "", files: 0, shell: false }); await f.cleanup(); }
+});
+
+test("checkpoint picker filters prompts without restoring, and handles empty or stale results", async () => {
+  const f = setup();
+  try {
+    f.c.send("task"); await tick(); f.c.open();
+    f.terminal.onInput("/undo"); f.terminal.onInput("\r"); await tick();
+    f.terminal.onInput("Older");
+    assert.equal(f.engine.undos.length, 0);
+    f.terminal.onInput("\r"); await tick();
+    assert.deepEqual(f.engine.undoIds, ["older"]);
+    f.engine.undoCheckpoints = async () => [];
+    await f.c.showUndo();
+    assert.match(f.c.notice, /No undo checkpoints yet/);
+    assert.equal(f.c.dialog, undefined);
+    let resolve!: (points: Awaited<ReturnType<typeof f.engine.undoCheckpoints>>) => void;
+    const points = [{ id: "stale", turn: 1, prompt: "stale prompt", turns: 1, files: 0, shell: false }];
+    f.engine.undoCheckpoints = async () => new Promise((done) => { resolve = done; });
+    const loading = f.c.showUndo();
+    f.c.back(); resolve(points); await loading;
+    assert.equal(f.c.dialog, undefined, "late results must not open a picker in a different view");
+  } finally { await f.cleanup(); }
+});
+
+test("checkpoint picker renders safely in narrow terminals and a mouse click selects without restoring", async () => {
+  const f = setup();
+  try {
+    f.c.send("task"); await tick(); f.c.open();
+    const choices = await f.engine.undoCheckpoints(f.c.opened!);
+    choices[1]!.prompt = "Older prompt\x1b[2J\nwith long details 界面 😀 ".repeat(3);
+    f.engine.undoCheckpoints = async () => choices;
+    await f.c.showUndo();
+    const dialog = f.c.dialog;
+    assert.ok(dialog?.kind === "undo");
+    const picker = new UndoDialog(f.c, f.tui, dialog, () => {});
+    for (const rows of [24, 32]) {
+      f.terminal.rows = rows;
+      for (const width of [18, 40, 80]) {
+        const lines = picker.render(width);
+        assert.ok(lines.every((line) => visibleWidth(line) <= width));
+        assert.ok(lines.length <= Math.floor(rows * 0.85));
+        assert.ok(!lines.join("\n").includes("\x1b[2J"));
+      }
+    }
+    const lines = picker.render(80).map(stripTerminalSequences);
+    const y = lines.findIndex((line) => line.includes("Turn 1:"));
+    assert.ok(y > 0);
+    picker.handleMouse({ type: "click", button: "left", clickCount: 1, x: 4, y, screenX: 4, screenY: y,
+      width: 80, height: 32, shift: false, ctrl: false, alt: false });
+    assert.equal(f.engine.undos.length, 0);
+    picker.handleInput("\r"); await tick();
+    assert.deepEqual(f.engine.undoIds, ["older"]);
   } finally { await f.cleanup(); }
 });
 

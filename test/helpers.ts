@@ -29,6 +29,16 @@ export class FakeEngine implements Engine {
     this.compactions.push({ session, instructions });
     return "compacted" as const;
   }
+  undos: Session[] = [];
+  undoIds: string[] = [];
+  async undoCheckpoints(_session: Session) {
+    return [{ id: "latest", turn: 2, prompt: "Latest prompt", turns: 1, files: 1, shell: false },
+      { id: "older", turn: 1, prompt: "Older prompt", turns: 2, files: 2, shell: true }];
+  }
+  async undo(session: Session, checkpointId: string) {
+    this.undos.push(session); this.undoIds.push(checkpointId);
+    return { prompt: "Restored prompt", files: 1, shell: false };
+  }
   stopped: string[] = [];
   cancelled: string[] = [];
   async run(session: Session, project: Project, prompt: string): Promise<void> {

@@ -2,6 +2,18 @@ import type { ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
 import type { CompactionFailure, CompactionStatus, ModelRef } from "@earendil-works/pi-durable";
 
 export type CompactResult = "compacted" | "unchanged" | "stale" | "aborted";
+export interface UndoResult { prompt: string; files: number; shell: boolean }
+export interface UndoCheckpoint {
+  id: string;
+  prompt: string;
+  turn: number;
+  timestamp?: number;
+  /** Includes the selected turn and every later turn. */
+  turns: number;
+  files: number;
+  shell: boolean;
+  pending?: boolean;
+}
 
 export const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
@@ -37,6 +49,25 @@ export interface SkillOption {
 export interface PreparedInput {
   content: string;
   skill?: { name: string; filePath: string; text: string };
+}
+
+export type ReplyBehavior = "followUp" | "steer";
+export function isReplyBehavior(value: unknown): value is ReplyBehavior {
+  return value === "followUp" || value === "steer";
+}
+
+export interface AppSettings {
+  replyBehavior: ReplyBehavior;
+}
+
+export type SettingsSelection = "replyBehavior" | "model" | "thinking";
+
+export interface PendingInput {
+  requestId: string;
+  prompt: string;
+  prepared?: PreparedInput;
+  /** Captured at send time; changing settings never retimes an accepted message. */
+  whenBusy?: ReplyBehavior;
 }
 
 export type SessionStatus = "working" | "needs-input" | "completed" | "failed" | "paused";
@@ -75,7 +106,12 @@ export interface Session {
   context?: ContextEstimate;
   id: string;
   conversationId?: number;
-  pendingInput?: { requestId: string; prompt: string; prepared?: PreparedInput };
+  /** Oldest outstanding submission; retained for compatibility with existing checkpoints. */
+  pendingInput?: PendingInput;
+  /** Additional outstanding submissions, including inputs awaiting durable admission. */
+  followUps?: PendingInput[];
+  /** Presentation cache of native pi.inbox inputs, rebuilt from the durable view. */
+  queuedInputs?: { id: number; text: string; mode?: ReplyBehavior }[];
   agent?: AgentSettings;
   projectId: string;
   title: string;
@@ -101,6 +137,8 @@ export function markStopped(session: Session, now = Date.now()): void {
   session.preview = "Stopped. Reply to continue.";
   session.updatedAt = now;
   delete session.pendingInput;
+  delete session.followUps;
+  delete session.queuedInputs;
   if (session.work && session.work.finishedAt === undefined) session.work.finishedAt = Math.max(session.work.startedAt, now);
 }
 
@@ -110,6 +148,7 @@ export interface State {
   sessions: Session[];
   selectedProjectId?: string;
   defaults?: AgentSettings;
+  settings?: AppSettings;
 }
 
 export type Row =

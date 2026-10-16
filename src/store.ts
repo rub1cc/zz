@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { isThinkingLevel, type AgentSettings, type PreparedInput, type Project, type State, type ToolActivity } from "./model.js";
+import { isReplyBehavior, isThinkingLevel, type AppSettings, type AgentSettings, type PendingInput, type PreparedInput, type Project, type State, type ToolActivity } from "./model.js";
 
 export function directory(value: string): string {
   const expanded = value === "~" ? homedir() : value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
@@ -23,11 +23,15 @@ function isState(value: unknown): value is State {
   const state = value as State;
   return state.version === 1 && Array.isArray(state.projects) && Array.isArray(state.sessions)
     && (state.defaults === undefined || isAgentSettings(state.defaults))
+    && (state.settings === undefined || !!state.settings && isReplyBehavior(state.settings.replyBehavior))
     && state.projects.every((p) => typeof p.id === "string" && typeof p.path === "string")
     && state.sessions.every((s) => typeof s.id === "string" && typeof s.projectId === "string"
       && (s.conversationId === undefined || Number.isSafeInteger(s.conversationId) && s.conversationId >= 0)
-      && (s.pendingInput === undefined || typeof s.pendingInput?.requestId === "string" && typeof s.pendingInput?.prompt === "string")
-      && (s.pendingInput?.prepared === undefined || isPreparedInput(s.pendingInput.prepared))
+      && (s.pendingInput === undefined || isPendingInput(s.pendingInput))
+      && (s.followUps === undefined || Array.isArray(s.followUps) && s.followUps.every(isPendingInput))
+      && (s.queuedInputs === undefined || Array.isArray(s.queuedInputs) && s.queuedInputs.every((input) =>
+        !!input && Number.isSafeInteger(input.id) && input.id >= 0 && typeof input.text === "string"
+        && (input.mode === undefined || isReplyBehavior(input.mode))))
       && typeof s.title === "string" && typeof s.preview === "string"
       && (s.stopped === undefined || typeof s.stopped === "boolean")
       && (s.agent === undefined || isAgentSettings(s.agent))
@@ -76,6 +80,12 @@ function isToolActivity(value: ToolActivity): boolean {
     && typeof value.output === "string" && ["pending", "running", "done", "error", "interrupted"].includes(value.status);
 }
 
+function isPendingInput(value: PendingInput): boolean {
+  return !!value && typeof value.requestId === "string" && typeof value.prompt === "string"
+    && (value.whenBusy === undefined || isReplyBehavior(value.whenBusy))
+    && (value.prepared === undefined || isPreparedInput(value.prepared));
+}
+
 function isPreparedInput(value: PreparedInput): boolean {
   return !!value && typeof value.content === "string" && (value.skill === undefined || !!value.skill
     && typeof value.skill.name === "string" && typeof value.skill.filePath === "string" && typeof value.skill.text === "string");
@@ -96,6 +106,8 @@ export class Store {
       this.state = { version: 1, projects: [], sessions: [] };
     }
   }
+
+  get settings(): AppSettings { return { replyBehavior: this.state.settings?.replyBehavior ?? "followUp" }; }
 
   addProject(value: string): Project {
     const path = directory(value);

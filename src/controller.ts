@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { finishWork, markStopped, rowId, rows, type AgentSettings, type CompactResult, type ModelOption, type Project, type Row, type Session, type SessionStats, type SkillOption } from "./model.js";
+import { finishWork, isReplyBehavior, markStopped, rowId, rows, type ReplyBehavior, type SettingsSelection, type AgentSettings, type CompactResult, type ModelOption, type Project, type Row, type Session, type SessionStats, type SkillOption, type UndoResult, type UndoCheckpoint } from "./model.js";
 import { Store } from "./store.js";
 
 export interface Engine {
   run(session: Session, project: Project, prompt: string, changed: () => void): Promise<void>;
   compact(session: Session, instructions: string | undefined, changed: () => void): Promise<CompactResult>;
+  undoCheckpoints(session: Session): Promise<UndoCheckpoint[]>;
+  undo(session: Session, checkpointId: string, changed: () => void): Promise<UndoResult>;
   stop(sessionId: string): Promise<void>;
   cancel(sessionId: string): Promise<void>;
   close(): Promise<void>;
@@ -19,9 +21,11 @@ export type Mode = "sessions" | "projects" | "session";
 export type Dialog =
   | { kind: "peek"; sessionId: string }
   | { kind: "add-project" }
-  | { kind: "model" | "thinking"; sessionId?: string; choices: ModelOption[] }
+  | { kind: "settings"; sessionId?: string; selected: SettingsSelection }
+  | { kind: "model" | "thinking"; sessionId?: string; choices: ModelOption[]; returnToSettings?: boolean }
   | { kind: "skills"; sessionId?: string; skills: SkillOption[] }
   | { kind: "usage"; sessionId: string }
+  | { kind: "undo"; sessionId: string; checkpoints: UndoCheckpoint[] }
   | { kind: "help" };
 
 export class Controller {
@@ -37,9 +41,11 @@ export class Controller {
   private closing = false;
   private closePromise?: Promise<void>;
   private saveTimer?: ReturnType<typeof setTimeout>;
-  private pending = new Set<string>();
+  private pending = new Map<string, number>();
+  private deletingSessions = new Set<string>();
   private cancelling = new Set<string>();
   private compacting = new Set<string>();
+  private undoing = new Set<string>();
   private configuring = false;
   private thinkingQueue = Promise.resolve();
 
@@ -73,12 +79,32 @@ export class Controller {
     this.changed();
   }
 
+  showSettings(selected: SettingsSelection = "replyBehavior"): void {
+    if (this.closing) return;
+    this.dialog = { kind: "settings", sessionId: this.mode === "session" ? this.openedSessionId : undefined, selected };
+    this.notice = "";
+    this.changed();
+  }
+
+  setReplyBehavior(value: ReplyBehavior): boolean {
+    if (this.closing) return false;
+    if (!isReplyBehavior(value)) { this.fail("Choose follow-up or steer."); return false; }
+    const previous = this.store.state.settings;
+    this.store.state.settings = { ...this.store.settings, replyBehavior: value };
+    try { this.store.save(); }
+    catch (error) { this.store.state.settings = previous; this.fail(error); return false; }
+    this.notice = "";
+    this.changed();
+    return true;
+  }
+
   async settings(kind: "model" | "thinking"): Promise<void> {
     const sessionId = this.mode === "session" ? this.openedSessionId : undefined;
     const mode = this.mode;
+    const previousDialog = this.dialog;
     const choices = await this.engine.listModels();
-    if (this.closing || this.mode !== mode || (mode === "session" && this.openedSessionId !== sessionId)) return;
-    this.dialog = { kind, sessionId, choices };
+    if (this.closing || this.dialog !== previousDialog || this.mode !== mode || (mode === "session" && this.openedSessionId !== sessionId)) return;
+    this.dialog = { kind, sessionId, choices, returnToSettings: previousDialog?.kind === "settings" || undefined };
     this.notice = "";
     this.changed();
   }
@@ -121,14 +147,16 @@ export class Controller {
     if (this.closing || this.configuring) return false;
     if (sessionId && !session) { this.fail("Session no longer exists."); return false; }
     const thinkingOnly = change.thinkingLevel !== undefined && change.model === undefined;
-    if (!thinkingOnly && session && (session.status === "working" || this.pending.has(session.id)
+    if (!thinkingOnly && session && (this.hasPendingRun(session)
       || session.compactions?.length || this.compacting.has(session.id))) {
       this.fail("Wait for this session to finish before changing its model or thinking."); return false;
     }
     this.configuring = true;
+    const picker = this.dialog;
     try {
       await this.engine.configure(change, session);
-      this.dialog = undefined;
+      this.dialog = picker && (picker.kind === "model" || picker.kind === "thinking") && picker.returnToSettings
+        ? { kind: "settings", sessionId: picker.sessionId, selected: picker.kind } : undefined;
       this.notice = "";
       this.changed(true);
       return true;
@@ -220,9 +248,65 @@ export class Controller {
     finally { this.compacting.delete(session.id); this.changed(true); }
   }
 
+  private undoTarget(): Session | undefined {
+    return this.mode === "session" ? this.opened : this.selected?.kind === "session" ? this.selected.session : undefined;
+  }
+
+  private undoReady(session: Session): boolean {
+    if (this.closing || this.undoing.has(session.projectId)) return false;
+    const busy = this.store.state.sessions.some((other) => other.projectId === session.projectId
+      && (this.canStop(other) || this.deletingSessions.has(other.id)));
+    if (busy || this.configuring) { this.fail("Wait for this project's sessions to finish, or /stop them, before /undo."); return false; }
+    return true;
+  }
+
+  async showUndo(): Promise<void> {
+    const session = this.undoTarget();
+    if (!session) { this.fail("Open or select a session first to /undo."); return; }
+    if (!this.undoReady(session)) return;
+    const previousDialog = this.dialog;
+    const mode = this.mode;
+    try {
+      const checkpoints = await this.engine.undoCheckpoints(session);
+      if (this.closing || this.dialog !== previousDialog || this.mode !== mode || this.undoTarget()?.id !== session.id) return;
+      if (!this.undoReady(session)) return;
+      if (!checkpoints.length) { this.fail("No undo checkpoints yet. Only turns started after undo support was added can be restored."); return; }
+      this.dialog = { kind: "undo", sessionId: session.id, checkpoints };
+      this.notice = "";
+      this.changed();
+    } catch (error) { this.fail(error); }
+  }
+
+  async undo(checkpointId: string, sessionId: string): Promise<UndoResult | undefined> {
+    const dialog = this.dialog;
+    const session = this.session(sessionId);
+    if (!session || dialog?.kind !== "undo" || dialog.sessionId !== sessionId
+      || !dialog.checkpoints.some((point) => point.id === checkpointId)) {
+      this.fail("Open /undo and select a checkpoint first."); return;
+    }
+    if (!this.undoReady(session)) return;
+    this.undoing.add(session.projectId);
+    this.notice = "Restoring the selected checkpoint...";
+    this.changed();
+    try {
+      const result = await this.engine.undo(session, checkpointId, () => this.changed(true));
+      if (this.dialog === dialog) this.dialog = undefined;
+      this.notice = `Undone: conversation and ${result.files} tracked file${result.files === 1 ? "" : "s"} restored.`
+        + (result.shell ? " Shell-command changes were NOT undone." : "");
+      this.store.save();
+      return result;
+    } catch (error) { this.fail(error); }
+    finally { this.undoing.delete(session.projectId); this.changed(); }
+  }
+
+  private hasPendingRun(session: Session): boolean {
+    return session.status === "working" || !!session.pendingInput || !!session.followUps?.length
+      || !!session.queuedInputs?.length || this.pending.has(session.id);
+  }
+
   canStop(session: Session): boolean {
-    return session.status === "working" || !!session.compactions?.length || this.compacting.has(session.id)
-      || this.pending.has(session.id) || this.cancelling.has(session.id);
+    return this.hasPendingRun(session) || !!session.compactions?.length || this.compacting.has(session.id)
+      || this.cancelling.has(session.id);
   }
 
   async cancel(sessionId?: string): Promise<void> {
@@ -233,7 +317,7 @@ export class Controller {
     if (!this.canStop(session)) {
       this.notice = session.stopped ? "Stopped. Reply to continue." : "This session is already idle."; this.changed(); return;
     }
-    const stoppingRun = session.status === "working" || this.pending.has(session.id);
+    const stoppingRun = this.hasPendingRun(session);
     this.cancelling.add(session.id);
     this.notice = "Stopping...";
     this.changed();
@@ -281,7 +365,7 @@ export class Controller {
     this.deleting = true;
     this.deletingProjectId = selected.kind === "project" ? selected.project.id : undefined;
     try {
-      for (const id of ids) this.pending.add(id);
+      for (const id of ids) this.deletingSessions.add(id);
       const results = await Promise.allSettled(sessions.map((s) => this.engine.stop(s.id)));
       const failure = results.find((result) => result.status === "rejected");
       if (failure?.status === "rejected") throw failure.reason;
@@ -298,7 +382,7 @@ export class Controller {
       this.fail(error);
       return;
     } finally {
-      for (const id of ids) this.pending.delete(id);
+      for (const id of ids) this.deletingSessions.delete(id);
       this.deleting = false;
       this.deletingProjectId = undefined;
     }
@@ -327,11 +411,13 @@ export class Controller {
       ? this.store.state.projects.find((p) => p.id === session?.projectId)
       : this.project;
     if (!project || (target && !session)) { this.fail("Select a project first. Use ctrl+o to add one."); return false; }
+    if (this.undoing.has(project.id)) { this.fail("This project is being restored. Wait for /undo to finish."); return false; }
     if (project.id === this.deletingProjectId) { this.fail("This project's sessions are being deleted."); return false; }
-    if (session?.status === "working" || (target && (this.pending.has(target) || this.cancelling.has(target)))) {
-      this.fail("This session is still working. Wait for its reply before sending another.");
+    if (target && (this.cancelling.has(target) || this.deletingSessions.has(target))) {
+      this.fail("This session is stopping. Wait until it is idle before sending another.");
       return false;
     }
+    const busy = !!session && this.hasPendingRun(session);
     if (!session) {
       const now = Date.now();
       session = {
@@ -347,22 +433,29 @@ export class Controller {
       }
       this.selection = `session:${session.id}`;
     }
-    session.messages.push({ role: "user", text, timestamp: Date.now() });
-    delete session.stopped;
-    session.status = "working";
-    session.preview = "Starting...";
-    session.updatedAt = Date.now();
-    session.work = { startedAt: session.updatedAt };
+    if (!busy) {
+      session.messages.push({ role: "user", text, timestamp: Date.now() });
+      delete session.stopped;
+      session.status = "working";
+      session.preview = "Starting...";
+      session.updatedAt = Date.now();
+      session.work = { startedAt: session.updatedAt };
+    }
     this.notice = "";
     this.dialog = undefined;
     const active = session;
-    this.pending.add(active.id);
+    this.pending.set(active.id, (this.pending.get(active.id) ?? 0) + 1);
     void this.engine.run(active, project, text, () => this.changed(true))
       .catch((error: unknown) => {
         active.status = "failed";
         active.preview = error instanceof Error ? error.message : String(error);
         active.messages.push({ role: "error", text: active.preview, timestamp: Date.now() });
-      }).finally(() => { finishWork(active); this.pending.delete(active.id); this.changed(true); });
+      }).finally(() => {
+        const remaining = (this.pending.get(active.id) ?? 1) - 1;
+        if (remaining > 0) this.pending.set(active.id, remaining);
+        else { this.pending.delete(active.id); finishWork(active); }
+        this.changed(true);
+      });
     this.changed(true);
     return true;
   }

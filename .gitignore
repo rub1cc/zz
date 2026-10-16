@@ -1,5 +1,6 @@
 node_modules/
 dist/
+release/
 .npm-cache/
 .zz/
 .zz-test-*/

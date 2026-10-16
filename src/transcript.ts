@@ -115,6 +115,19 @@ export class Transcript implements Component {
     const compacting = compactionLabel(session);
     if (compacting) lines.push(`  ${accent(oneLine(compacting))}`, "");
     if (session.compactionFailure) lines.push(`  ${warning(oneLine(`Compaction failed (${session.compactionFailure.reason}): ${session.compactionFailure.error}`))}`, "");
+    if (session.queuedInputs?.length) {
+      const modes = new Set(session.queuedInputs.map((input) => input.mode ?? "followUp"));
+      const label = modes.size > 1 ? "Queued messages" : modes.has("steer") ? "Queued steering" : "Queued follow-ups";
+      lines.push(`  ${accent(`${label} (${session.queuedInputs.length})`)}`);
+      for (const [index, input] of session.queuedInputs.entries()) {
+        const mode = modes.size > 1 ? `[${input.mode === "steer" ? "steer" : "follow-up"}] ` : "";
+        for (const [lineIndex, source] of plain(input.text).split("\n").entries()) {
+          const prefix = lineIndex === 0 ? `${index + 1}. ${mode}` : "   ";
+          lines.push(...wrapTextWithAnsi(`${prefix}${source}`, Math.max(1, width - 4)).map((line) => `  ${dim(line)}`));
+        }
+      }
+      lines.push("");
+    }
     const status = workLabel(session);
     if (status) lines.push(`  ${status}`, "");
     return lines.map((line) => fit(line, width));

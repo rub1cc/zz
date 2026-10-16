@@ -3,7 +3,33 @@
 A small terminal dashboard for agent sessions, grouped by project directory.
 Built with `@earendil-works/pi-durable` and `@earendil-works/pi-tui` (pinned to 1.3.0).
 
-## Run
+## Install
+
+Requires **Node.js 22.19+ (with npm)**, curl, and macOS or Linux.
+
+```sh
+curl -fsSL https://github.com/rub1cc/zz/releases/latest/download/install.sh | bash
+zz
+```
+
+The installer downloads the latest GitHub release, verifies its SHA-256 checksum,
+and uses npm to install the prebuilt command and locked production dependencies.
+It does not install Node.js, run dependency install scripts, or require sudo.
+The default prefix is `~/.local`; if needed, add `~/.local/bin` to your `PATH`
+(the installer prints the command). Re-run the same command to upgrade.
+A published GitHub release is required; the first release is **v0.0.1**.
+
+To pin a version or choose a different install prefix:
+
+```sh
+curl -fsSL https://github.com/rub1cc/zz/releases/download/v0.0.1/install.sh | ZZ_VERSION=v0.0.1 ZZ_INSTALL_PREFIX="$HOME/.local" bash
+```
+
+To review before running, download `install.sh` and inspect it first. To uninstall:
+`npm uninstall --global --prefix "$HOME/.local" zz` (use your custom prefix if set).
+Uninstalling does not remove your sessions or Pi credentials.
+
+## Run From Source
 
 Requires Node.js 22.19+.
 
@@ -36,6 +62,23 @@ credential-file locking. Credentials are not copied into zz's database.
 The dashboard can open without a login; starting an agent requires a configured
 Pi provider. This shares Pi's login and model configuration, not its existing
 JSONL conversation history; zz conversations remain in durable storage.
+
+## Settings
+
+`/settings` (alias `/config`) opens the settings page. Use arrows or Ctrl+N/P to
+navigate, Enter to change a value or open a picker, and Escape to return. Changes
+save immediately in zz's data directory; no restart is needed.
+
+- **Busy-session replies** applies globally to future sends in all sessions:
+  - **Follow-up** (default) waits until the current run finishes.
+  - **Steer** delivers after the current tool round, before the next model request.
+    It does not abort running tools.
+- Messages already queued keep their original delivery mode, even after changing
+  settings or restarting. The transcript distinguishes steering from follow-ups.
+- **Model** and **thinking** open the existing pickers. On the dashboard these
+  configure new-task defaults; inside a session they configure only that session.
+  Selecting or cancelling a picker returns to the settings page. Busy-reply
+  behavior can change during a run; the existing model/thinking restrictions apply.
 
 ## Model And Thinking
 
@@ -129,6 +172,41 @@ No separate model, dependency, or hand-written summarization pipeline is used.
 Automatic thresholds remain the SDK defaults; zz does not yet expose a toggle or
 threshold editor.
 
+## Undo
+
+- `/undo` opens a **checkpoint picker** for the open session, or the selected
+  session on the dashboard. Nothing is restored automatically. Browse with arrows
+  or Ctrl+N/P, type to filter prompts, then press Enter to restore the selected
+  checkpoint. Escape cancels without changing the conversation or files.
+- Each checkpoint is the state **before its prompt**. Selecting an older one
+  rewinds that turn and every later turn, restoring both conversation and tracked
+  file edits. The picker shows the prompt, turn/file counts, and any shell warning.
+  In an open session, the selected prompt returns to the composer for editing or
+  resending. Opening or using the picker never sends a model request.
+- Checkpoints and file backups survive restarting zz. Existing conversations gain
+  checkpoints on their next turn; older turns cannot be restored retroactively.
+  Queued follow-ups get separate checkpoints when they start. Steering messages
+  belong to the turn already in progress, so undo restores that whole turn.
+- Only direct `write`/`edit` tool changes are tracked. Existing file contents and
+  permissions are restored; files created by those tools are removed. Shell
+  commands, external effects, and directory creation are **not undone**. A notice
+  explicitly warns when the restored turn ran shell commands.
+- Stop or finish all working sessions in the same project before undoing. If a
+  tracked file has changed since the agent edited it, undo refuses rather than
+  overwriting your work. Changes made between checkpoints also block an older
+  restore; choose a newer checkpoint instead. Linked/non-regular files and replaced
+  parent directories are refused for safety; direct agent writes to linked files
+  are also blocked.
+- The original conversation remains in durable audit history, and recorded usage
+  and cost totals are retained. There is currently no `/redo` command or picker for
+  abandoned branches. Backups are private files in the data directory's `undo/`
+  folder and are retained with the audit history, including after session deletion.
+- An interrupted multi-file undo resumes the **same selected checkpoint** on
+  restart. If an I/O error prevents completion, fix it and reopen `/undo` to resume
+  that restore before sending another prompt; its target cannot be changed midway.
+
+Undo is session-level recovery, not a replacement for Git or backups.
+
 ## Compact Activity
 
 Tool calls and results are combined into one collapsed row, showing the tool,
@@ -154,15 +232,17 @@ Activity is presentation only: collapsed output is still retained for the model.
 
 The transcript ends with a shimmering `✻ Working` while a task runs. On completion,
 it shows e.g. `✻ Worked for 3s · done 3:22 PM`, using your local time. Timing is
-saved per session and resets with each reply; failures and input requests are
+saved per session and resets with each idle-session reply; queued follow-ups keep
+the current work timer running until the queue finishes. Failures and input requests are
 labelled accordingly. Set `ZZ_REDUCED_MOTION=1` to disable shimmer animation
 (`NO_COLOR` also disables it).
 
 ## Composer Discovery
 
 - Type `/` at the start of a task or session reply to search commands available
-  in the current view. A project row offers `/model`, `/thinking`, `/skills`, and
-  `/help`. Selecting a session also offers `/session`, `/compact`, and `/stop`.
+  in the current view. A project row offers `/model`, `/thinking`, `/skills`,
+  `/settings`, and `/help`. Selecting a session also offers `/session`, `/compact`,
+  `/undo`, and `/stop`.
   Opening a session adds transcript actions: `/bottom`, `/expand`, `/collapse`.
   On the dashboard, model/thinking choices apply to **new tasks**, not the selected
   session; in an open session they apply to that session.
@@ -248,7 +328,14 @@ and session lists never follow chat output.
 - With an empty composer, Enter opens the selected session's transcript.
   Space peeks at its latest agent reply in a dialog with a reply field.
 - In an open session or peek dialog, Enter sends a reply to that same session.
-  A running session must finish before it can accept another reply.
+  While it is working, replies enter Pi Durable's persisted inbox. By default
+  they follow up one at a time after the current run finishes; `/settings` can
+  switch future sends to steering at the next tool-round boundary.
+  The transcript shows queued messages separately until they enter the conversation;
+  the reply footer and peek show the queue count. Queued replies survive restart,
+  including replies sent while the initial conversation is still starting.
+  Escape in the session or `/stop` cancels the active work and withdraws queued replies.
+  If a run fails, Pi retains the queue until another reply resumes processing.
 - In an open session or peek reply, ↑ recalls earlier sent prompts from that
   session; ↓ moves forward and restores your unsent draft after the newest entry.
   Start with an empty draft, or place the cursor at the start of its first line.
@@ -281,7 +368,9 @@ and session lists never follow chat output.
   is restored immediately while cleanup finishes. A second Ctrl+C forces exit;
   stalled cleanup also exits after five seconds rather than hanging indefinitely.
 
-Stopping cannot undo file edits or external effects that have already happened.
+Stopping alone cannot undo file edits or external effects that have already
+happened. Once idle, `/undo` lets you choose a checkpoint to restore tracked file
+edits and conversation; shell-command changes and external effects remain.
 
 `*` means working, `?` needs input, `.` completed, `!` failed, and `-` paused.
 Agents are instructed to use the explicit `ask_user` tool whenever they expect an
@@ -297,6 +386,7 @@ Data lives in `$XDG_DATA_HOME/zz` (default `~/.local/share/zz`). Override it wit
 
 - `state.json`: project list, selection, session index, and cached display history.
 - `sessions.sqlite`: durable conversations, model context, tools, and checkpoints.
+- `undo/`: persistent file backups for `/undo` (may contain sensitive source contents).
 - A heartbeat lock permits only one dashboard per data directory. After a crash,
   allow 10 seconds for the stale lock to expire.
 
@@ -318,6 +408,38 @@ Deleting sessions individually or by project never deletes project files. Sessio
 deletion removes its UI record, but the underlying durable audit history remains
 in SQLite (the current durable API has no conversation-purge operation). Back up
 the complete data directory while zz is stopped if you need to preserve it.
+
+## Releases
+
+Pushing a stable version tag runs `.github/workflows/release.yml`. It type-checks,
+executes the test suite, and smoke-tests the packaged command on macOS/Linux with
+Node.js 22.19 and 24. Only after all checks pass does it create a GitHub release
+with `zz.tgz`, `zz.tgz.sha256`, and `install.sh`. No npm registry publish or npm
+publish token is needed; the workflow uses the repository's `GITHUB_TOKEN`.
+
+For the first release, commit the release setup and push it along with the tag:
+
+```sh
+git tag v0.0.1
+git push origin main
+git push origin v0.0.1
+```
+
+For subsequent releases, run `npm version patch --no-git-tag-version` (or choose
+`minor`/`major`), commit both package files, then tag that commit with the matching
+`vX.Y.Z`. Packaging rejects mismatches between the tag, package.json, and lockfile.
+
+To inspect a release package locally:
+
+```sh
+npm run build
+npm run package:release
+# Outputs release/zz.tgz, release/zz.tgz.sha256, and release/install.sh
+```
+
+The archive contains compiled JavaScript and an npm shrinkwrap derived from the
+lockfile, not a standalone binary. Node.js and npm registry access are still
+required on the installing machine.
 
 ## Verify
 

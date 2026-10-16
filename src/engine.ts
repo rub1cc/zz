@@ -1,26 +1,28 @@
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { type JsonRepresentation } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { Type, type Message as ModelMessage, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { Type, type Message as ModelMessage, type ModelThinkingLevel, type Usage } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, getSupportedThinkingLevels, type Models } from "@earendil-works/pi-ai/models";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   Harness, createRegistry, defineDoc, defineExtension, defineTool, section,
-  type AgentState, type Conversation, type ConversationId, type ConversationView, type Cursor, type LiveState, type ModelRef, type UsageState,
+  type AgentState, type Conversation, type ConversationId, type ConversationView, type Cursor, type InboxState, type LiveState, type ModelRef, type Submission, type UsageState, type EntryId, type Tx,
 } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import type { Engine } from "./controller.js";
-import { compactionLabel, finishWork, isThinkingLevel, lastReply, markStopped, type AgentSettings, type CompactResult, type Message, type ModelOption, type PreparedInput, type Project, type Session, type SessionStats, type SkillOption } from "./model.js";
+import { compactionLabel, finishWork, isThinkingLevel, lastReply, markStopped, type AgentSettings, type CompactResult, type Message, type ModelOption, type PendingInput, type PreparedInput, type Project, type Session, type SessionStats, type SkillOption, type UndoResult, type UndoCheckpoint } from "./model.js";
 import { directory, Store } from "./store.js";
 import { SkillCatalog } from "./skills.js";
 import { generateSessionTitle } from "./title.js";
-import { contextEstimate, conversationUsage, sessionStats } from "./usage.js";
+import { contextEstimate, conversationUsage, sessionStats, sumUsage } from "./usage.js";
 import { settleWithin } from "./shutdown.js";
+import { UndoDoc, UndoHistory } from "./undo.js";
 
 const ctx = BACKGROUND_CONTEXT;
-const SessionMeta = defineDoc<{ sessionId: string }>({
+const SessionMeta = defineDoc<{ sessionId: string; priorUsage?: JsonRepresentation<Usage> }>({
   kind: "zz.session", version: 1, scope: "conversation", history: "latest", fork: "initial",
   initial: () => ({ sessionId: "" }),
 });
@@ -37,9 +39,19 @@ function skillEntry(data: unknown): { prompt: string; skill: NonNullable<Prepare
     && typeof value.skill.filePath === "string" && typeof value.skill.text === "string") return { prompt: value.prompt, skill: value.skill };
 }
 
-export function applyView(session: Session, view: ConversationView): void {
+export function applyView(session: Session, view: ConversationView, priorUsage?: Usage): void {
   const messages: Message[] = [];
-  session.usage = conversationUsage(view.docs["pi.usage"] as UsageState | undefined);
+  const usage = conversationUsage(view.docs["pi.usage"] as UsageState | undefined);
+  session.usage = priorUsage ? sumUsage([priorUsage, usage]) : usage;
+  const inbox = view.docs["pi.inbox"] as InboxState | undefined;
+  const queued = (inbox?.items ?? []).flatMap((item) => {
+    if (item.mode === "write") return [];
+    const skill = item.entry?.kind === "zz.skill" ? skillEntry(item.entry.data) : undefined;
+    const text = skill?.prompt ?? (typeof item.content === "string" ? item.content
+      : item.content.filter((block) => block.type === "text").map((block) => block.text).join("\n"));
+    return [{ id: item.id, text, mode: item.mode }];
+  });
+  session.queuedInputs = queued.length ? queued : undefined;
   const live = view.docs["pi.live"] as LiveState | undefined;
   session.compactions = live?.compactions?.length ? structuredClone(live.compactions) : undefined;
   session.compactionFailure = live?.compactionFailure && structuredClone(live.compactionFailure);
@@ -143,8 +155,10 @@ export function applyView(session: Session, view: ConversationView): void {
 
 export class DurableEngine implements Engine {
   private handles = new Map<string, Conversation>();
-  private views = new Map<string, { dispose(): void }>();
-  private active = new Map<string, Promise<void>>();
+  private views = new Map<string, { dispose(): void; readonly value: ConversationView }>();
+  private active = new Map<string, Set<Promise<void>>>();
+  /** Serialize preparation and admission, not completion: Durable owns the actual follow-up queue. */
+  private admissions = new Map<string, Promise<void>>();
   private manualCompactions = new Map<string, Promise<CompactResult>>();
   private contextUpdates = new Map<string, Promise<void>>();
   private stopping = new Set<string>();
@@ -152,18 +166,24 @@ export class DurableEngine implements Engine {
   private titles = new Map<string, { abort: AbortController; done: Promise<void> }>();
   private closing = false;
   private closePromise?: Promise<void>;
+  private undoing = new Map<string, Promise<UndoResult>>();
+  private undoProjects = new Set<string>();
+  private undoPending = new Set<string>();
 
   private constructor(
     readonly store: Store, readonly harness: Harness, readonly models: Models,
     readonly model: ModelRef | undefined, readonly report: (error: unknown) => void,
     readonly thinkingLevel: ModelThinkingLevel,
     readonly skills: SkillCatalog,
+    readonly undoHistory: UndoHistory,
   ) {}
 
   static async open(store: Store, model: ModelRef | undefined, report: (error: unknown) => void, models?: Models, thinkingLevel: ModelThinkingLevel = "off", skills = new SkillCatalog()): Promise<DurableEngine> {
     models ??= await ModelRuntime.create({ allowModelNetwork: false });
     const registry = createRegistry();
     registry.install(CodingTools);
+    const undoHistory = new UndoHistory(store.root);
+    registry.install(undoHistory.extension);
     registry.install(defineExtension({
       name: "zz",
       sections: [
@@ -183,7 +203,8 @@ export class DurableEngine implements Engine {
         return new NodeExecutionEnv({ cwd: directory(cwd) });
       }, onReport: report,
     }, ctx);
-    const engine = new DurableEngine(store, harness, models, model, report, thinkingLevel, skills);
+    undoHistory.harness = harness;
+    const engine = new DurableEngine(store, harness, models, model, report, thinkingLevel, skills, undoHistory);
     void harness.closed.then((end) => { if (end.reason === "failed") report(end.error); });
     return engine;
   }
@@ -211,6 +232,7 @@ export class DurableEngine implements Engine {
 
   async configure(change: Partial<AgentSettings>, session?: Session): Promise<void> {
     if (this.closing) throw new Error("zz is closing.");
+    if (session && (this.undoProjects.has(session.projectId) || this.pendingUndo(session.projectId))) throw new Error("Wait for /undo to finish first.");
     const thinkingOnly = change.thinkingLevel !== undefined && change.model === undefined;
     if (!thinkingOnly && session && (this.active.has(session.id) || session.status === "working" || session.compactions?.length || this.manualCompactions.has(session.id))) throw new Error("Wait for this session to finish first.");
     const current = this.configuration(session);
@@ -253,22 +275,48 @@ export class DurableEngine implements Engine {
       }
     }
     this.store.save();
+    // Complete a restore interrupted between filesystem writes and the conversation fork.
+    for (const session of this.store.state.sessions) {
+      const conversation = this.handles.get(session.id);
+      const undo = conversation && await this.harness.snapshot(UndoDoc, conversation.id, ctx);
+      if (undo?.restoring) {
+        this.undoPending.add(session.id);
+        try {
+          const checkpointId = undo.restoreTo ?? undo.points.at(-1)?.id;
+          if (!checkpointId) throw new Error("The selected undo checkpoint is missing.");
+          await this.undo(session, checkpointId, changed);
+        }
+        catch (error) {
+          delete session.stopped;
+          session.status = "failed";
+          session.preview = `Interrupted /undo could not finish. Fix the file conflict or I/O error and retry /undo: ${error instanceof Error ? error.message : String(error)}`;
+          session.messages.push({ role: "error", text: session.preview, timestamp: Date.now() });
+          changed();
+        }
+      }
+    }
+    this.store.save();
     for (const session of this.store.state.sessions) {
       if (session.stopped) { await this.cancel(session.id); continue; }
-      const pending = session.pendingInput;
-      if (!pending) continue;
+      const inputs = [session.pendingInput, ...(session.followUps ?? [])].filter((input): input is PendingInput => !!input);
       const project = this.store.state.projects.find((p) => p.id === session.projectId) ?? { id: session.projectId, path: session.projectId };
-      void this.run(session, project, pending.prompt, changed).catch((error: unknown) => { this.failure(session, error); changed(); });
+      // Replay the saved request IDs, including admissions committed just before a crash.
+      for (const input of inputs) void this.startInput(session, project, input, changed)
+        .catch((error: unknown) => { this.report(error); });
     }
     this.harness.resume();
   }
 
   private failure(session: Session, error: unknown): void {
     if (session.stopped) { markStopped(session); return; }
+    // A rejected follow-up (e.g. a missing skill) must not relabel an unrelated live run.
+    if (!this.closing && (this.views.get(session.id)?.value.docs["pi.live"] as LiveState | undefined)?.run) {
+      this.report(error);
+      return;
+    }
     session.status = this.closing ? "paused" : "failed";
     session.preview = this.closing ? "Paused. Work resumes when zz reopens." : error instanceof Error ? error.message : String(error);
     if (!this.closing) {
-      delete session.pendingInput;
       session.messages.push({ role: "error", text: session.preview, timestamp: Date.now() });
     }
   }
@@ -276,6 +324,7 @@ export class DurableEngine implements Engine {
   private async observe(session: Session, conversation: Conversation, changed: () => void): Promise<void> {
     if (this.views.has(session.id)) return;
     const view = await conversation.viewState(ctx);
+    const priorUsage = (await this.harness.snapshot(SessionMeta, conversation.id, ctx))?.priorUsage;
     let entries = view.value.entries;
     let revision = 0;
     // Coalesce committed entry updates. Streaming/live-doc changes never rescan context.
@@ -300,9 +349,9 @@ export class DurableEngine implements Engine {
       this.contextUpdates.set(session.id, update);
       return update;
     };
-    applyView(session, view.value);
+    applyView(session, view.value, priorUsage);
     view.subscribe((value) => {
-      applyView(session, value);
+      applyView(session, value, priorUsage);
       if (value.entries !== entries) { entries = value.entries; void refresh(); }
       changed();
     });
@@ -332,30 +381,59 @@ export class DurableEngine implements Engine {
   }
 
   async run(session: Session, project: Project, prompt: string, changed: () => void): Promise<void> {
+    if (this.closing) throw new Error("zz is closing.");
+    if (this.undoProjects.has(session.projectId)) throw new Error("This project is being restored. Wait for /undo to finish.");
+    if (this.pendingUndo(session.projectId)) throw new Error("An interrupted /undo in this project must finish before sending another prompt. Retry /undo.");
     if (this.stopping.has(session.id)) throw new Error("This session is still stopping. Try again when it is idle.");
-    const existing = this.active.get(session.id);
-    if (existing) return existing;
     delete session.stopped;
     if (!session.pendingInput && session.work?.finishedAt !== undefined) session.work = undefined;
     session.work ??= { startedAt: Date.now() };
-    session.pendingInput ??= { requestId: randomUUID(), prompt };
+    const input: PendingInput = { requestId: randomUUID(), prompt, whenBusy: this.store.settings.replyBehavior };
+    if (!session.pendingInput) session.pendingInput = input;
+    else (session.followUps ??= []).push(input);
     this.store.save();
-    const promise = this.execute(session, project, changed).catch((error: unknown) => {
+    return this.startInput(session, project, input, changed);
+  }
+
+  private removeInput(session: Session, input: PendingInput): void {
+    if (session.pendingInput?.requestId === input.requestId) session.pendingInput = session.followUps?.shift();
+    else session.followUps = session.followUps?.filter((item) => item.requestId !== input.requestId);
+    if (!session.followUps?.length) delete session.followUps;
+  }
+
+  private startInput(session: Session, project: Project, input: PendingInput, changed: () => void): Promise<void> {
+    const previous = this.admissions.get(session.id) ?? Promise.resolve();
+    const admitted = previous.then(() => this.admit(session, project, input, changed));
+    // Only admission is serialized. Waiting here would turn this into a host-side queue.
+    const tail = admitted.then(() => {}, () => {});
+    this.admissions.set(session.id, tail);
+    void tail.then(() => { if (this.admissions.get(session.id) === tail) this.admissions.delete(session.id); });
+    const runs = this.active.get(session.id) ?? new Set<Promise<void>>();
+    this.active.set(session.id, runs);
+    const promise = admitted.then(async (submission) => {
+      if (!submission) return;
+      const result = await submission.wait(ctx);
+      await this.contextUpdates.get(session.id);
+      this.removeInput(session, input);
+      if (result.status === "unanswered") throw new Error(`${result.reason}${result.detail ? `: ${JSON.stringify(result.detail)}` : ""}`);
+    }).catch((error: unknown) => {
+      if (!this.closing) this.removeInput(session, input);
       this.failure(session, error);
     }).finally(() => {
-      if (!this.closing) finishWork(session);
-      this.active.delete(session.id);
+      runs.delete(promise);
+      if (!runs.size) {
+        this.active.delete(session.id);
+        if (!this.closing) finishWork(session);
+      }
       this.store.save();
       changed();
     });
-    this.active.set(session.id, promise);
+    runs.add(promise);
     return promise;
   }
 
-  private async execute(session: Session, project: Project, changed: () => void): Promise<void> {
+  private async admit(session: Session, project: Project, input: PendingInput, changed: () => void): Promise<Submission | undefined> {
     if (this.closing || this.stopping.has(session.id)) return;
-    const input = session.pendingInput;
-    if (!input) return;
     if (!input.prepared) {
       input.prepared = await this.skills.prepare(project.path, input.prompt);
       this.store.save();
@@ -383,17 +461,13 @@ export class DurableEngine implements Engine {
     if (this.closing || this.stopping.has(session.id)) return;
     await this.observe(session, conversation, changed);
     if (this.closing || this.stopping.has(session.id)) return;
-    const submission = await conversation.submit({ type: "input", content: input.prepared.content, requestId: input.requestId,
+    return conversation.submit({ type: "input", content: input.prepared.content, requestId: input.requestId, whenBusy: input.whenBusy ?? "followUp",
       entry: input.prepared.skill ? { kind: "zz.skill", data: { prompt: input.prompt, skill: input.prepared.skill } } : undefined,
     }, ctx);
-    const result = await submission.wait(ctx);
-    await this.contextUpdates.get(session.id);
-    delete session.pendingInput;
-    if (result.status === "unanswered") throw new Error(`${result.reason}${result.detail ? `: ${JSON.stringify(result.detail)}` : ""}`);
-    this.store.save();
   }
 
   compact(session: Session, instructions: string | undefined, changed: () => void): Promise<CompactResult> {
+    if (this.undoProjects.has(session.projectId) || this.pendingUndo(session.projectId)) return Promise.reject(new Error("Finish /undo before compacting this session."));
     if (this.closing) return Promise.reject(new Error("zz is closing."));
     if (this.stopping.has(session.id)) return Promise.reject(new Error("This session is still stopping."));
     if (this.manualCompactions.has(session.id) || session.compactions?.length) {
@@ -439,7 +513,98 @@ export class DurableEngine implements Engine {
     }
   }
 
+  private pendingUndo(projectId: string): boolean {
+    return this.store.state.sessions.some((session) => session.projectId === projectId && this.undoPending.has(session.id));
+  }
+
+  async undoCheckpoints(session: Session): Promise<UndoCheckpoint[]> {
+    const conversation = this.handles.get(session.id);
+    return conversation ? this.undoHistory.checkpoints(conversation.id) : [];
+  }
+
+  undo(session: Session, checkpointId: string, changed: () => void): Promise<UndoResult> {
+    if (this.store.state.sessions.some((other) => other.projectId === session.projectId && other.id !== session.id && this.undoPending.has(other.id))) {
+      return Promise.reject(new Error("Finish the interrupted /undo in this project's other session first."));
+    }
+    if (this.closing) return Promise.reject(new Error("zz is closing."));
+    if (this.undoProjects.has(session.projectId)) return Promise.reject(new Error("This project is already being restored."));
+    this.undoProjects.add(session.projectId);
+    const promise = this.undoSession(session, checkpointId, changed).finally(() => {
+      this.undoProjects.delete(session.projectId);
+      this.undoing.delete(session.id);
+    });
+    this.undoing.set(session.id, promise);
+    return promise;
+  }
+
+  private async undoSession(session: Session, checkpointId: string, changed: () => void): Promise<UndoResult> {
+    const conversation = this.handles.get(session.id);
+    if (!conversation) throw new Error("Nothing to undo. Send a task first.");
+    for (const other of this.store.state.sessions.filter((item) => item.projectId === session.projectId)) {
+      const view = this.views.get(other.id)?.value;
+      const live = view?.docs["pi.live"] as LiveState | undefined;
+      if (this.active.has(other.id) || this.stopping.has(other.id) || live?.run || live?.compactions?.length
+        || other.pendingInput || other.followUps?.length || other.queuedInputs?.length || this.manualCompactions.has(other.id)) {
+        throw new Error("Wait for this project's sessions to finish, or /stop them, before /undo.");
+      }
+    }
+    const state = await this.harness.snapshot(UndoDoc, conversation.id, ctx);
+    const index = state?.points.findIndex((point) => point.id === checkpointId) ?? -1;
+    const point = state?.points[index];
+    if (!point) throw new Error("No undo checkpoint with that ID in this conversation. Reopen /undo and choose a checkpoint.");
+    const pendingId = state?.restoring ? state.restoreTo ?? state.points.at(-1)?.id : undefined;
+    if (pendingId && pendingId !== checkpointId) throw new Error("Finish restoring the previously selected checkpoint before choosing another.");
+    const points = state!.points.slice(index);
+    this.undoHistory.preflight(points);
+    // Persist the SELECTED target, not just the latest turn, for crash recovery.
+    await conversation.commit(async (tx) => {
+      const doc = await tx.doc(UndoDoc, conversation.id);
+      doc.restoring = true;
+      doc.restoreTo = checkpointId;
+    }, ctx);
+    this.undoPending.add(session.id);
+    const restored = this.undoHistory.restore(points);
+    const title = this.titles.get(session.id);
+    title?.abort.abort();
+    await title?.done;
+    await this.contextUpdates.get(session.id);
+    const config = await conversation.agent(ctx);
+    const priorUsage = session.usage && structuredClone(session.usage);
+    const options = {
+      ownership: { kind: "ownerless" as const },
+      agent: { cwd: config.cwd, ...this.configuration(session) },
+      init: async (tx: Tx, id: ConversationId) => {
+        // Atomic ownership migration lets restore() recover even if state.json wasn't saved.
+        (await tx.doc(SessionMeta, conversation.id)).sessionId = "";
+        const meta = await tx.doc(SessionMeta, id);
+        meta.sessionId = session.id;
+        if (priorUsage) meta.priorUsage = priorUsage;
+        const undo = await tx.doc(UndoDoc, id);
+        undo.points = structuredClone(state!.points.slice(0, index));
+        delete undo.restoring;
+        delete undo.restoreTo;
+      },
+    };
+    const fork = point.at === undefined ? await this.harness.createConversation(options, ctx)
+      : await conversation.fork(point.at as EntryId, options, ctx);
+    this.views.get(session.id)?.dispose();
+    this.views.delete(session.id);
+    this.handles.set(session.id, fork);
+    session.conversationId = fork.id;
+    delete session.stopped;
+    delete session.work;
+    session.status = "completed";
+    await this.observe(session, fork, changed);
+    this.undoPending.delete(session.id);
+    session.preview = "Undone. Edit or resend your prompt to continue.";
+    session.updatedAt = Date.now();
+    this.store.save();
+    changed();
+    return { ...restored, prompt: point.prompt };
+  }
+
   cancel(sessionId: string): Promise<void> {
+    if (this.undoing.has(sessionId)) return Promise.reject(new Error("Wait for /undo to finish first."));
     const existing = this.cancellations.get(sessionId);
     if (existing) return existing;
     const promise = this.cancelSession(sessionId).finally(() => { this.cancellations.delete(sessionId); });
@@ -452,7 +617,7 @@ export class DurableEngine implements Engine {
     try {
       const session = this.store.state.sessions.find((s) => s.id === sessionId);
       const running = this.active.get(sessionId);
-      if (session && (running || session.pendingInput || session.status === "working")) {
+      if (session && (running || session.pendingInput || session.followUps?.length || session.queuedInputs?.length || session.status === "working")) {
         // Persist stop intent before aborting so a restart never resubmits this input.
         session.stopped = true;
         session.preview = "Stopping...";
@@ -462,13 +627,14 @@ export class DurableEngine implements Engine {
       title?.abort.abort();
       const conversation = this.handles.get(sessionId) ?? (session?.conversationId !== undefined
         ? await this.harness.conversation(session.conversationId as ConversationId, ctx) : undefined);
-      await Promise.all([conversation?.abort(ctx, { background: true }), running, title?.done, this.manualCompactions.get(sessionId)?.catch(() => {})]);
+      await Promise.all([conversation?.abort(ctx, { background: true }), ...(running ?? []), title?.done, this.manualCompactions.get(sessionId)?.catch(() => {})]);
       await this.contextUpdates.get(sessionId);
       if (session?.stopped) { markStopped(session); this.store.save(); }
     } finally { this.stopping.delete(sessionId); }
   }
 
   async stop(sessionId: string): Promise<void> {
+    await this.undoing.get(sessionId);
     await this.cancel(sessionId);
     this.views.get(sessionId)?.dispose();
     this.views.delete(sessionId);
@@ -479,12 +645,15 @@ export class DurableEngine implements Engine {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
     for (const title of this.titles.values()) title.abort.abort();
-    // Seal admission and cancel durable invocations before joining any host-side work.
-    const durableClose = this.harness.close(ctx);
+    // Let an admitted filesystem restore finish its conversation commit before sealing storage.
+    const durableClose = Promise.allSettled([...this.undoing.values()]).then(() => this.harness.close(ctx));
     this.closePromise = (async () => {
       try {
         await durableClose;
-        await Promise.allSettled([...this.active.values(), ...this.manualCompactions.values(), ...this.contextUpdates.values()]);
+        await Promise.allSettled([
+          ...[...this.active.values()].flatMap((runs) => [...runs]),
+          ...this.manualCompactions.values(), ...this.contextUpdates.values(),
+        ]);
         await settleWithin(Promise.allSettled([...this.titles.values()].map((title) => title.done)), 250);
       } finally {
         for (const view of this.views.values()) view.dispose();

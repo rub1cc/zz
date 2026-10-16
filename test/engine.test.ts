@@ -1,19 +1,28 @@
 import assert from "node:assert/strict";
-import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createModels, type Provider } from "@earendil-works/pi-ai/models";
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
 import type { AssistantMessage, Context, SimpleStreamOptions, TextContent, ToolCall, Usage } from "@earendil-works/pi-ai";
-import type { ConversationId } from "@earendil-works/pi-durable";
+import { InboxDoc, type ConversationId } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
 import { DurableEngine } from "../src/engine.js";
 import type { Project, Session } from "../src/model.js";
 import { Store } from "../src/store.js";
 import { SkillCatalog } from "../src/skills.js";
-import { temporary } from "./helpers.js";
+import { UndoDoc } from "../src/undo.js";
+import { temporary, tick } from "./helpers.js";
+
+async function until(predicate: () => boolean): Promise<void> {
+  const deadline = Date.now() + 3000;
+  while (!predicate()) {
+    assert.ok(Date.now() < deadline, "Timed out waiting for durable state");
+    await tick();
+  }
+}
 
 function openEngine(...args: Parameters<typeof DurableEngine.open>) {
   args[5] ??= new SkillCatalog(async () => ({ skills: [], diagnostics: [] }));
@@ -24,8 +33,9 @@ function session(project: Project, id: string): Session {
   return { id, projectId: project.id, title: id, status: "working", preview: "Starting", createdAt: Date.now(), updatedAt: Date.now(), messages: [] };
 }
 
-function models(options: { pause?: boolean; finish?: (done: () => void) => void; overflow?: boolean; started?: () => void; context?: (context: Context) => void; request?: (id: string, reasoning: SimpleStreamOptions["reasoning"]) => void;
+function models(options: { pause?: boolean; finish?: (done: (failure?: string, content?: (TextContent | ToolCall)[]) => void) => void; overflow?: boolean; started?: () => void; context?: (context: Context) => void; request?: (id: string, reasoning: SimpleStreamOptions["reasoning"]) => void;
   usage?: Usage; titleUsage?: Usage; contextWindow?: number;
+  reply?: (context: Context) => (TextContent | ToolCall)[];
   compaction?: { fail?: boolean; pause?: boolean; started?: () => void; context?: (context: Context) => void; usage?: Usage };
   title?: { text?: string; fail?: boolean; pause?: boolean; ignoreAbort?: boolean; finish?: (done: () => void) => void; context?: (context: Context) => void } } = {}) {
   const models = createModels();
@@ -62,9 +72,15 @@ function models(options: { pause?: boolean; finish?: (done: () => void) => void;
           events.push({ type: "error", reason: "aborted", error: message });
         };
         if (request?.signal?.aborted) abort(); else request?.signal?.addEventListener("abort", abort, { once: true });
-        if (!isTitle && !isCompaction) options.finish?.(() => {
-          message.content = [{ type: "text", text: "Recovered answer" }];
-          events.push({ type: "done", reason: "stop", message });
+        if (!isTitle && !isCompaction) options.finish?.((failure, content) => {
+          message.content = content ?? [{ type: "text", text: "Recovered answer" }];
+          if (failure) {
+            message.stopReason = "error"; message.errorMessage = failure;
+            events.push({ type: "error", reason: "error", error: message });
+          } else {
+            message.stopReason = message.content.some((block) => block.type === "toolCall") ? "toolUse" : "stop";
+            events.push({ type: "done", reason: message.stopReason, message });
+          }
         });
         return;
       }
@@ -98,7 +114,7 @@ function models(options: { pause?: boolean; finish?: (done: () => void) => void;
         events.push({ type: "error", reason: "error", error: message });
         return;
       }
-      const content: (TextContent | ToolCall)[] = last?.role === "toolResult"
+      const content: (TextContent | ToolCall)[] = options.reply?.(context) ?? (last?.role === "toolResult"
         ? [{ type: "text", text: `Read: ${last.content.filter((b) => b.type === "text").map((b) => b.text).join("")}` }]
         : last?.content === "long-shell"
           ? [{ type: "toolCall", id: "sleep-call", name: "bash", arguments: { command: "printf 'SHELL_STARTED\\n'; sleep 30; printf 'SHOULD_NOT_FINISH\\n'" } }]
@@ -108,7 +124,7 @@ function models(options: { pause?: boolean; finish?: (done: () => void) => void;
           ? [{ type: "toolCall", id: `ask-${Date.now()}`, name: "ask_user", arguments: { question: "Retry or stop?" } }]
           : typeof last?.content === "string" && last.content.includes("read")
             ? [{ type: "toolCall", id: `read-${Date.now()}`, name: "read", arguments: { path: "marker.txt" } }]
-            : [{ type: "text", text: "Recovered answer" }];
+            : [{ type: "text", text: "Recovered answer" }]);
       message.content = content;
       message.stopReason = content.some((b) => b.type === "toolCall") ? "toolUse" : "stop";
       events.push({ type: "done", reason: message.stopReason, message });
@@ -871,4 +887,584 @@ test("failed blocking auto-compaction fails the run without sending an oversized
     assert.equal(s.compactionFailure?.reason, "threshold");
     assert.equal(s.usage!.totalTokens, spend + 2);
   } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("rapid replies use the native durable inbox and run one at a time after each answer", { timeout: 5000 }, async () => {
+  const temp = temporary();
+  const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "queue"); store.state.sessions.push(s);
+  const finish: (() => void)[] = [];
+  const contexts: Context[] = [];
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)), models({
+    pause: true, finish: (done) => finish.push(done), context: (context) => contexts.push(context),
+  }));
+  try {
+    // These arrive before authentication, skill preparation or conversation creation has completed.
+    const runs = ["initial", "then raise a PR", "then raise a PR"].map((prompt) => engine.run(s, project, prompt, () => {}));
+    await until(() => s.queuedInputs?.length === 2 && finish.length === 1);
+    const id = s.conversationId;
+    const startedAt = s.work!.startedAt;
+    const inbox = await engine.harness.snapshot(InboxDoc, id as ConversationId, BACKGROUND_CONTEXT);
+    assert.equal(inbox?.items.length, 2, "follow-ups must be admitted while the first request is still running");
+    assert.deepEqual(s.queuedInputs?.map((input) => input.text), ["then raise a PR", "then raise a PR"]);
+    assert.notEqual(s.queuedInputs?.[0]?.id, s.queuedInputs?.[1]?.id);
+    assert.deepEqual(s.messages.filter((m) => m.role === "user").map((m) => m.text), ["initial"]);
+    assert.equal(s.work?.finishedAt, undefined);
+    finish[0]!();
+    await until(() => finish.length === 2 && s.queuedInputs?.length === 1);
+    assert.equal(s.status, "working"); assert.equal(s.work?.finishedAt, undefined);
+    assert.equal(s.work?.startedAt, startedAt);
+    await assert.rejects(engine.configure({ model: { provider: "test", modelId: "reasoner" } }, s), /finish first/);
+    finish[1]!();
+    await until(() => finish.length === 3 && !s.queuedInputs?.length);
+    assert.equal(s.status, "working"); assert.equal(s.work?.finishedAt, undefined);
+    finish[2]!(); await Promise.all(runs);
+    assert.equal(s.conversationId, id); assert.equal(s.status, "completed");
+    assert.ok(s.work?.finishedAt); assert.equal(s.pendingInput, undefined); assert.equal(s.followUps, undefined);
+    assert.deepEqual(s.messages.map((m) => m.role), ["user", "assistant", "user", "assistant", "user", "assistant"]);
+    assert.equal(contexts.length, 3);
+    assert.deepEqual(contexts.map((context) => context.messages.filter((m) => m.role === "user").length), [1, 2, 3]);
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("queued replies and expanded skills survive restart without duplicate admissions", { timeout: 5000 }, async () => {
+  const temp = temporary();
+  const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "queue-restart"); store.state.sessions.push(s);
+  const dir = join(temp.root, "skill"); mkdirSync(dir);
+  const file = join(dir, "SKILL.md");
+  writeFileSync(file, "---\nname: fixture\ndescription: Summarize\n---\n\nQUEUED_SAVED_INSTRUCTIONS\n");
+  const skills = new SkillCatalog(async () => loadSkillsFromDir({ dir, source: "path" }));
+  let engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models({ pause: true }), "off", skills);
+  try {
+    const runs = ["initial", "/skill:fixture summarize", "last reply"].map((prompt) => engine.run(s, project, prompt, () => {}));
+    await until(() => s.queuedInputs?.length === 2);
+    assert.equal(s.queuedInputs?.[0]?.text, "/skill:fixture summarize", "show the user's prompt, not the expanded skill body");
+    await engine.close(); await Promise.all(runs);
+    assert.ok(s.pendingInput); assert.equal(s.followUps?.length, 2);
+    // Simulate an index checkpoint predating the queue's admission. Request IDs must deduplicate it.
+    delete s.followUps![1]!.prepared; store.save();
+    unlinkSync(file);
+    const restored = new Store(temp.root);
+    const contexts: Context[] = [];
+    engine = await openEngine(restored, undefined, (error) => assert.fail(String(error)), models({ context: (context) => contexts.push(context) }));
+    await engine.restore(() => {});
+    const recovered = restored.state.sessions[0]!;
+    await until(() => !recovered.pendingInput && !recovered.followUps?.length && recovered.status === "completed");
+    assert.deepEqual(recovered.messages.filter((m) => m.role === "user").map((m) => m.text), ["initial", "/skill:fixture summarize", "last reply"]);
+    assert.equal(recovered.queuedInputs, undefined);
+    assert.match(JSON.stringify(contexts), /QUEUED_SAVED_INSTRUCTIONS/);
+    assert.match(recovered.messages.find((m) => m.tool?.name === "load_skill")!.tool!.output, /QUEUED_SAVED_INSTRUCTIONS/);
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("stopping withdraws all queued inputs and restart never runs them", { timeout: 5000 }, async () => {
+  const temp = temporary();
+  let store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "queue-stop"); store.state.sessions.push(s);
+  let engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models({ pause: true }));
+  try {
+    const runs = ["initial", "queued one", "queued two"].map((prompt) => engine.run(s, project, prompt, () => {}));
+    await until(() => s.queuedInputs?.length === 2);
+    await engine.cancel(s.id); await Promise.all(runs);
+    assert.equal(s.status, "paused"); assert.equal(s.pendingInput, undefined); assert.equal(s.followUps, undefined);
+    assert.equal(s.queuedInputs, undefined);
+    await engine.close();
+    store = new Store(temp.root);
+    const contexts: Context[] = [];
+    engine = await openEngine(store, undefined, () => {}, models({ context: (context) => contexts.push(context) }));
+    await engine.restore(() => {}); await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+    assert.equal(contexts.length, 0);
+    const recovered = store.state.sessions[0]!;
+    await engine.run(recovered, project, "continue", () => {});
+    assert.deepEqual(recovered.messages.filter((m) => m.role === "user").map((m) => m.text), ["initial", "continue"]);
+    assert.equal(recovered.status, "completed");
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("cancelling during follow-up preparation prevents late admission", { timeout: 5000 }, async () => {
+  const temp = temporary();
+  const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "queue-preparing"); store.state.sessions.push(s);
+  let release!: () => void;
+  const preparing = new Promise<void>((resolve) => { release = resolve; });
+  const skills = new SkillCatalog(async () => ({ skills: [], diagnostics: [] }));
+  const prepare = skills.prepare.bind(skills);
+  skills.prepare = async (cwd, prompt) => { if (prompt === "queued") await preparing; return prepare(cwd, prompt); };
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models({ pause: true }), "off", skills);
+  try {
+    const running = engine.run(s, project, "initial", () => {});
+    await until(() => s.messages.some((m) => m.role === "user"));
+    const queued = engine.run(s, project, "queued", () => {});
+    const stopping = engine.cancel(s.id);
+    release(); await stopping; await Promise.all([running, queued]);
+    assert.equal(s.status, "paused"); assert.equal(s.pendingInput, undefined); assert.equal(s.followUps, undefined);
+    assert.deepEqual(s.messages.filter((m) => m.role === "user").map((m) => m.text), ["initial"]);
+  } finally { release(); await engine.close(); temp.cleanup(); }
+});
+
+test("a failed run retains its native queue and the next reply resumes it oldest first", { timeout: 5000 }, async () => {
+  const temp = temporary();
+  const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "queue-failure"); store.state.sessions.push(s);
+  let finish!: (failure?: string) => void;
+  const options = { pause: true, finish: (done: (failure?: string) => void) => { finish = done; } };
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models(options));
+  try {
+    const running = engine.run(s, project, "initial", () => {});
+    const queued = engine.run(s, project, "queued reply", () => {});
+    await until(() => s.queuedInputs?.length === 1 && !!finish);
+    finish("Simulated provider failure"); await running;
+    assert.equal(s.status, "failed"); assert.equal(s.queuedInputs?.length, 1);
+    options.pause = false;
+    const retry = engine.run(s, project, "resume", () => {});
+    await Promise.all([queued, retry]);
+    assert.equal(s.status, "completed"); assert.equal(s.pendingInput, undefined);
+    assert.deepEqual(s.messages.filter((m) => m.role === "user").map((m) => m.text), ["initial", "queued reply", "resume"]);
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("an invalid queued skill reports the error without failing or dropping the live request", { timeout: 5000 }, async () => {
+  const temp = temporary();
+  const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "queue-invalid"); store.state.sessions.push(s);
+  let finish!: () => void;
+  const errors: unknown[] = [];
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => errors.push(error), models({ pause: true, finish: (done) => { finish = done; } }));
+  try {
+    const running = engine.run(s, project, "initial", () => {});
+    await until(() => !!finish);
+    await engine.run(s, project, "/skill:missing", () => {});
+    assert.equal(s.status, "working"); assert.equal(s.followUps, undefined);
+    assert.match(String(errors[0]), /Unknown skill missing/);
+    finish(); await running;
+    assert.equal(s.status, "completed"); assert.equal(s.pendingInput, undefined);
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("replies checkpointed before conversation creation are admitted in order on reopen", { timeout: 5000 }, async () => {
+  const temp = temporary();
+  const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "queue-before-create"); store.state.sessions.push(s);
+  let engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models());
+  try {
+    const runs = ["initial", "second", "third"].map((prompt) => engine.run(s, project, prompt, () => {}));
+    // Closing synchronously seals admission before the first preparation microtask.
+    await engine.close(); await Promise.all(runs);
+    assert.equal(s.conversationId, undefined);
+    assert.equal(s.followUps?.length, 2);
+    const restored = new Store(temp.root);
+    engine = await openEngine(restored, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)), models());
+    await engine.restore(() => {});
+    const recovered = restored.state.sessions[0]!;
+    await until(() => !recovered.pendingInput && recovered.status === "completed");
+    assert.deepEqual(recovered.messages.filter((m) => m.role === "user").map((m) => m.text), ["initial", "second", "third"]);
+    assert.equal(recovered.followUps, undefined); assert.equal(recovered.queuedInputs, undefined);
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("configured steering joins the live run at a tool boundary ahead of queued follow-ups", { timeout: 5000 }, async () => {
+  const temp = temporary();
+  const store = new Store(temp.root); const project = store.addProject(temp.root);
+  writeFileSync(join(temp.root, "marker.txt"), "marker");
+  const s = session(project, "steering"); store.state.sessions.push(s);
+  const contexts: Context[] = [];
+  const finish: ((failure?: string, content?: (TextContent | ToolCall)[]) => void)[] = [];
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)), models({
+    pause: true, finish: (done) => finish.push(done), context: (context) => contexts.push(context),
+  }));
+  try {
+    let initialSettled = false;
+    const running = engine.run(s, project, "initial", () => {}).then(() => { initialSettled = true; });
+    await until(() => finish.length === 1);
+    const followUp = engine.run(s, project, "do this later", () => {});
+    await until(() => s.queuedInputs?.length === 1);
+    store.state.settings = { replyBehavior: "steer" }; store.save();
+    const steering = engine.run(s, project, "change course", () => {});
+    await until(() => s.queuedInputs?.length === 2);
+    assert.deepEqual(s.queuedInputs?.map((input) => input.mode), ["followUp", "steer"]);
+    assert.equal(s.pendingInput?.whenBusy, "followUp");
+    assert.deepEqual(s.followUps?.map((input) => input.whenBusy), ["followUp", "steer"]);
+    // The current response requests a real tool, not a final answer.
+    finish[0]!(undefined, [{ type: "toolCall", id: "steer-boundary", name: "read", arguments: { path: "marker.txt" } }]);
+    await until(() => finish.length === 2);
+    assert.equal(initialSettled, false, "steering must join the current run rather than waiting for its answer");
+    assert.deepEqual(s.queuedInputs?.map((input) => input.text), ["do this later"]);
+    assert.equal(contexts[1]?.messages.at(-1)?.content, "change course");
+    assert.ok(contexts[1]?.messages.some((message) => message.role === "toolResult"));
+    assert.deepEqual(s.messages.filter((message) => message.role === "user").map((message) => message.text), ["initial", "change course"]);
+    finish[1]!(); await until(() => finish.length === 3);
+    finish[2]!(); await Promise.all([running, followUp, steering]);
+    assert.equal(s.status, "completed"); assert.equal(s.pendingInput, undefined); assert.equal(s.followUps, undefined);
+    assert.deepEqual(s.messages.filter((message) => message.role === "user").map((message) => message.text), ["initial", "change course", "do this later"]);
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("delivery mode is captured before preparation and retained across settings changes and restart", { timeout: 5000 }, async () => {
+  const temp = temporary();
+  let store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "saved-mode"); store.state.sessions.push(s);
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const skills = new SkillCatalog(async () => ({ skills: [], diagnostics: [] }));
+  const prepare = skills.prepare.bind(skills);
+  skills.prepare = async (cwd, prompt) => { if (prompt === "correction") await blocked; return prepare(cwd, prompt); };
+  let started = false;
+  let engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models({ pause: true, started: () => { started = true; } }), "off", skills);
+  try {
+    const running = engine.run(s, project, "initial", () => {});
+    await until(() => started);
+    store.state.settings = { replyBehavior: "steer" };
+    const steering = engine.run(s, project, "correction", () => {});
+    store.state.settings = { replyBehavior: "followUp" }; store.save();
+    assert.equal(s.followUps?.[0]?.whenBusy, "steer");
+    release(); await until(() => s.queuedInputs?.length === 1);
+    assert.equal(s.queuedInputs?.[0]?.mode, "steer");
+    await engine.close(); await Promise.all([running, steering]);
+    store = new Store(temp.root);
+    assert.equal(store.settings.replyBehavior, "followUp");
+    started = false;
+    engine = await openEngine(store, undefined, () => {}, models({ pause: true, started: () => { started = true; } }));
+    await engine.restore(() => {});
+    const recovered = store.state.sessions[0]!;
+    await until(() => started);
+    assert.equal(recovered.queuedInputs?.[0]?.mode, "steer");
+    assert.equal(recovered.followUps?.[0]?.whenBusy, "steer");
+    const inbox = await engine.harness.snapshot(InboxDoc, recovered.conversationId as ConversationId, BACKGROUND_CONTEXT);
+    assert.equal(inbox?.items.length, 1); assert.equal(inbox?.items[0]?.mode, "steer");
+    await engine.cancel(recovered.id);
+  } finally { release(); await engine.close(); temp.cleanup(); }
+});
+
+function toolPrompt(...calls: ToolCall[]): string { return `tools:${JSON.stringify(calls)}`; }
+function writeCall(path: string, content: string): ToolCall {
+  return { type: "toolCall", id: `write-${path}`, name: "write", arguments: { path, content } };
+}
+function undoModels() {
+  return models({ reply: (context) => {
+    const last = context.messages.at(-1);
+    return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("tools:")
+      ? JSON.parse(last.content.slice(6)) as ToolCall[] : [{ type: "text", text: "Done" }];
+  } });
+}
+async function undoFixture(runtime = undoModels()) {
+  const temp = temporary();
+  const work = join(temp.root, "work"); mkdirSync(work);
+  const store = new Store(join(temp.root, "data"));
+  const project = store.addProject(work);
+  const s = session(project, "undo-session"); store.state.sessions.push(s);
+  const errors: unknown[] = [];
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => errors.push(error), runtime);
+  return { ...temp, work, store, project, s, errors, engine };
+}
+
+async function undoLatest(engine: DurableEngine, s: Session) {
+  const points = await engine.undoCheckpoints(s);
+  return engine.undo(s, points[0]?.id ?? "missing", () => {});
+}
+
+test("undo persists file backups, rewinds conversation, preserves spend, and supports repeated undo after restart", async () => {
+  const f = await undoFixture(); let engine = f.engine;
+  try {
+    const path = join(f.work, "existing.txt");
+    writeFileSync(path, "local uncommitted work\r\n"); chmodSync(path, 0o755);
+    const first = toolPrompt(writeCall("existing.txt", "first\r\n"), writeCall("created.txt", "new file"));
+    await engine.run(f.s, f.project, first, () => {});
+    assert.equal(readFileSync(path, "utf8"), "first\r\n");
+    assert.equal(f.s.messages.find((m) => m.tool?.name === "write")?.tool?.status, "done");
+    const firstId = f.s.conversationId;
+    const second = toolPrompt({ type: "toolCall", id: "edit-existing", name: "edit",
+      arguments: { path: "existing.txt", edits: [{ oldText: "first", newText: "second" }] } });
+    await engine.run(f.s, f.project, second, () => {});
+    assert.equal(readFileSync(path, "utf8"), "second\r\n");
+    const spent = structuredClone(f.s.usage);
+    await engine.close();
+    const store = new Store(f.store.root);
+    engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => f.errors.push(error), undoModels());
+    await engine.restore(() => {});
+    const s = store.state.sessions[0]!;
+    assert.deepEqual(await undoLatest(engine, s), { prompt: second, files: 1, shell: false });
+    assert.equal(readFileSync(path, "utf8"), "first\r\n");
+    assert.notEqual(s.conversationId, firstId);
+    assert.deepEqual(s.messages.filter((m) => m.role === "user").map((m) => m.text), [first]);
+    assert.deepEqual(s.usage, spent, "discarded turns still cost money");
+    assert.equal(existsSync(join(f.work, "created.txt")), true);
+    // Simulate a stale UI index saved before the fork. Durable ownership must win.
+    s.conversationId = firstId; store.save();
+    await engine.close();
+    const restored = new Store(store.root);
+    engine = await openEngine(restored, { provider: "test", modelId: "mock" }, (error) => f.errors.push(error), undoModels());
+    await engine.restore(() => {});
+    const again = restored.state.sessions[0]!;
+    assert.notEqual(again.conversationId, firstId);
+    assert.deepEqual(again.usage, spent);
+    assert.deepEqual(await undoLatest(engine, again), { prompt: first, files: 2, shell: false });
+    assert.equal(readFileSync(path, "utf8"), "local uncommitted work\r\n");
+    assert.equal(statSync(path).mode & 0o777, 0o755);
+    assert.equal(existsSync(join(f.work, "created.txt")), false);
+    assert.equal(again.messages.length, 0);
+    assert.deepEqual(again.usage, spent);
+    await assert.rejects(undoLatest(engine, again), /No undo checkpoint/);
+    await engine.run(again, f.project, "A different approach", () => {});
+    assert.deepEqual(again.messages.filter((m) => m.role === "user").map((m) => m.text), ["A different approach"]);
+    assert.deepEqual(f.errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("undo preflights every file and refuses external changes without rewinding or partially restoring", async () => {
+  const f = await undoFixture();
+  try {
+    writeFileSync(join(f.work, "a.txt"), "before a"); writeFileSync(join(f.work, "b.txt"), "before b");
+    await f.engine.run(f.s, f.project, toolPrompt(writeCall("a.txt", "after a"), writeCall("b.txt", "after b")), () => {});
+    const id = f.s.conversationId; const messages = structuredClone(f.s.messages);
+    writeFileSync(join(f.work, "b.txt"), "manual edit");
+    await assert.rejects(undoLatest(f.engine, f.s), /file changed since the agent edited it/);
+    assert.equal(readFileSync(join(f.work, "a.txt"), "utf8"), "after a");
+    assert.equal(readFileSync(join(f.work, "b.txt"), "utf8"), "manual edit");
+    assert.equal(f.s.conversationId, id); assert.deepEqual(f.s.messages, messages);
+    writeFileSync(join(f.work, "b.txt"), "after b");
+    await undoLatest(f.engine, f.s);
+    assert.equal(readFileSync(join(f.work, "a.txt"), "utf8"), "before a");
+    assert.equal(readFileSync(join(f.work, "b.txt"), "utf8"), "before b");
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("undo rejects symlinks, hard links, and swapped parent directories", async () => {
+  for (const kind of ["symlink", "hardlink", "parent"] as const) {
+    const f = await undoFixture();
+    try {
+      mkdirSync(join(f.work, "dir"));
+      const path = join(f.work, "dir", "a.txt"); writeFileSync(path, "before");
+      await f.engine.run(f.s, f.project, toolPrompt(writeCall("dir/a.txt", "after")), () => {});
+      const outside = join(f.work, "outside.txt"); writeFileSync(outside, "outside");
+      if (kind === "parent") {
+        renameSync(join(f.work, "dir"), join(f.work, "original-dir"));
+        mkdirSync(join(f.work, "replacement")); writeFileSync(join(f.work, "replacement", "a.txt"), "after");
+        symlinkSync(join(f.work, "replacement"), join(f.work, "dir"));
+      } else {
+        unlinkSync(path);
+        if (kind === "symlink") symlinkSync(outside, path); else linkSync(outside, path);
+      }
+      await assert.rejects(undoLatest(f.engine, f.s), /linked or non-regular/);
+      assert.equal(readFileSync(outside, "utf8"), "outside");
+      assert.equal(f.s.messages.filter((m) => m.role === "user").length, 1);
+    } finally { await f.engine.close(); f.cleanup(); }
+  }
+});
+
+test("undo recovery finishes an interrupted file restore and conversation fork on restart", async () => {
+  const f = await undoFixture(); let engine = f.engine;
+  try {
+    writeFileSync(join(f.work, "a.txt"), "before");
+    await engine.run(f.s, f.project, toolPrompt(writeCall("a.txt", "after"), writeCall("new.txt", "new")), () => {});
+    const id = f.s.conversationId as ConversationId;
+    const state = await engine.harness.snapshot(UndoDoc, id, BACKGROUND_CONTEXT);
+    await engine.harness.commit(async (tx) => { (await tx.doc(UndoDoc, id)).restoring = true; }, BACKGROUND_CONTEXT);
+    // Simulate a crash after only one of the files has been restored.
+    writeFileSync(join(f.work, "a.txt"), "before");
+    assert.ok(state?.points.length);
+    await engine.close();
+    const store = new Store(f.store.root);
+    engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => f.errors.push(error), undoModels());
+    await engine.restore(() => {});
+    const s = store.state.sessions[0]!;
+    assert.equal(readFileSync(join(f.work, "a.txt"), "utf8"), "before");
+    assert.equal(existsSync(join(f.work, "new.txt")), false);
+    assert.notEqual(s.conversationId, id);
+    assert.deepEqual(s.messages, []);
+    assert.deepEqual(f.errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("queued follow-up turns get separate undo checkpoints", async () => {
+  const f = await undoFixture();
+  try {
+    writeFileSync(join(f.work, "a.txt"), "before");
+    await Promise.all([
+      f.engine.run(f.s, f.project, toolPrompt(writeCall("a.txt", "first")), () => {}),
+      f.engine.run(f.s, f.project, toolPrompt(writeCall("a.txt", "second")), () => {}),
+    ]);
+    assert.equal(readFileSync(join(f.work, "a.txt"), "utf8"), "second");
+    await undoLatest(f.engine, f.s);
+    assert.equal(readFileSync(join(f.work, "a.txt"), "utf8"), "first");
+    assert.equal(f.s.messages.filter((m) => m.role === "user").length, 1);
+    await undoLatest(f.engine, f.s);
+    assert.equal(readFileSync(join(f.work, "a.txt"), "utf8"), "before");
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("undo rewinds a shell turn's conversation but reports shell effects as not restored", async () => {
+  const f = await undoFixture();
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt({ type: "toolCall", id: "shell", name: "bash",
+      arguments: { command: "printf 'shell effect' > shell.txt" } }), () => {});
+    const result = await undoLatest(f.engine, f.s);
+    assert.equal(result.shell, true); assert.equal(result.files, 0);
+    assert.deepEqual(f.s.messages, []);
+    assert.equal(readFileSync(join(f.work, "shell.txt"), "utf8"), "shell effect");
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("steering messages share the original turn's undo checkpoint", async () => {
+  const finishes: ((failure?: string, content?: (TextContent | ToolCall)[]) => void)[] = [];
+  const f = await undoFixture(models({ pause: true, finish: (done) => finishes.push(done) }));
+  try {
+    f.store.state.settings = { replyBehavior: "steer" };
+    writeFileSync(join(f.work, "a.txt"), "before");
+    const first = f.engine.run(f.s, f.project, "initial prompt", () => {});
+    await until(() => finishes.length === 1);
+    const steer = f.engine.run(f.s, f.project, "adjust the approach", () => {});
+    await until(() => !!f.s.queuedInputs?.length);
+    finishes[0]!(undefined, [writeCall("a.txt", "first")]);
+    await until(() => finishes.length === 2);
+    finishes[1]!(undefined, [writeCall("a.txt", "second")]);
+    await until(() => finishes.length === 3);
+    finishes[2]!(undefined, [{ type: "text", text: "Done" }]);
+    await Promise.all([first, steer]);
+    assert.equal(readFileSync(join(f.work, "a.txt"), "utf8"), "second");
+    const points = await f.engine.harness.snapshot(UndoDoc, f.s.conversationId as ConversationId, BACKGROUND_CONTEXT);
+    assert.equal(points?.points.length, 1);
+    const result = await undoLatest(f.engine, f.s);
+    assert.equal(result.prompt, "initial prompt");
+    assert.equal(readFileSync(join(f.work, "a.txt"), "utf8"), "before");
+    assert.equal(f.s.messages.length, 0);
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("undo refuses a running project and works after stopping the turn", async () => {
+  const f = await undoFixture();
+  try {
+    await f.engine.run(f.s, f.project, "Earlier turn", () => {});
+    const running = f.engine.run(f.s, f.project, toolPrompt({ type: "toolCall", id: "shell", name: "bash",
+      arguments: { command: "printf 'UNDO_BUSY_TEST\n'; sleep 30" } }), () => {});
+    await until(() => f.s.messages.some((message) => message.tool?.output.includes("UNDO_BUSY_TEST")));
+    await assert.rejects(undoLatest(f.engine, f.s), /Wait for this project's sessions/);
+    await f.engine.cancel(f.s.id); await running;
+    const result = await undoLatest(f.engine, f.s);
+    assert.equal(result.shell, true);
+    assert.equal(f.s.stopped, undefined);
+    assert.deepEqual(f.s.messages.filter((m) => m.role === "user").map((m) => m.text), ["Earlier turn"]);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("an interrupted undo blocks new work, survives a recovery conflict, and can be retried safely", async () => {
+  const f = await undoFixture(); let engine = f.engine;
+  try {
+    const path = join(f.work, "a.txt"); writeFileSync(path, "before");
+    await engine.run(f.s, f.project, toolPrompt(writeCall("a.txt", "after")), () => {});
+    const original = engine.undoHistory.restore.bind(engine.undoHistory);
+    engine.undoHistory.restore = () => { throw new Error("Simulated I/O failure"); };
+    await assert.rejects(undoLatest(engine, f.s), /Simulated I\/O failure/);
+    await assert.rejects(engine.run(f.s, f.project, "must not run", () => {}), /interrupted \/undo/);
+    engine.undoHistory.restore = original;
+    writeFileSync(path, "external edit during outage");
+    await engine.close();
+    const store = new Store(f.store.root);
+    engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => f.errors.push(error), undoModels());
+    await engine.restore(() => {});
+    const s = store.state.sessions[0]!;
+    assert.equal(s.status, "failed"); assert.match(s.preview, /Interrupted \/undo could not finish/);
+    await assert.rejects(engine.run(s, f.project, "still must not run", () => {}), /interrupted \/undo/);
+    assert.equal(readFileSync(path, "utf8"), "external edit during outage");
+    writeFileSync(path, "after");
+    await undoLatest(engine, s);
+    assert.equal(readFileSync(path, "utf8"), "before");
+    await engine.run(s, f.project, "now safe", () => {});
+    assert.equal(s.messages.filter((m) => m.role === "user").length, 1);
+    assert.deepEqual(f.errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("selecting an older checkpoint restores the whole suffix, merges repeated file edits, and retains earlier turns", async () => {
+  const f = await undoFixture();
+  try {
+    const shared = join(f.work, "shared.txt"); writeFileSync(shared, "original");
+    const earlierOnly = join(f.work, "earlier.txt"); writeFileSync(earlierOnly, "keep this local work");
+    const first = toolPrompt(writeCall("shared.txt", "first"));
+    const middle = toolPrompt(writeCall("shared.txt", "second"), writeCall("earlier.txt", "changed"));
+    const latest = toolPrompt(writeCall("shared.txt", "third"), writeCall("new.txt", "new"));
+    for (const prompt of [first, middle, latest]) await f.engine.run(f.s, f.project, prompt, () => {});
+    const spent = structuredClone(f.s.usage);
+    const originalId = f.s.conversationId;
+    const choices = await f.engine.undoCheckpoints(f.s);
+    assert.deepEqual(choices.map((point) => [point.turn, point.turns, point.files, point.prompt]), [
+      [3, 1, 2, latest], [2, 2, 3, middle], [1, 3, 3, first],
+    ]);
+    assert.ok(choices.every((point) => Number.isFinite(point.timestamp)));
+    assert.equal(f.s.conversationId, originalId, "listing checkpoints must be read-only");
+    assert.equal(readFileSync(shared, "utf8"), "third");
+    await assert.rejects(f.engine.undo(f.s, "missing-or-stale-id", () => {}), /No undo checkpoint/);
+    assert.equal(f.s.conversationId, originalId, "invalid IDs must not fall back to the latest checkpoint");
+    const result = await f.engine.undo(f.s, choices[1]!.id, () => {});
+    assert.deepEqual(result, { prompt: middle, files: 3, shell: false });
+    assert.equal(readFileSync(shared, "utf8"), "first");
+    assert.equal(readFileSync(earlierOnly, "utf8"), "keep this local work");
+    assert.equal(existsSync(join(f.work, "new.txt")), false);
+    assert.deepEqual(f.s.messages.filter((m) => m.role === "user").map((m) => m.text), [first]);
+    assert.deepEqual(f.s.usage, spent);
+    const remaining = await f.engine.undoCheckpoints(f.s);
+    assert.deepEqual(remaining.map((point) => point.id), [choices[2]!.id]);
+    await assert.rejects(f.engine.undo(f.s, choices[0]!.id, () => {}), /No undo checkpoint/);
+    assert.equal(readFileSync(shared, "utf8"), "first");
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("an older checkpoint preflights the full suffix and refuses manual changes between turns", async () => {
+  const f = await undoFixture();
+  try {
+    const path = join(f.work, "a.txt"); writeFileSync(path, "before");
+    await f.engine.run(f.s, f.project, toolPrompt(writeCall("a.txt", "first")), () => {});
+    writeFileSync(path, "manual work between turns");
+    await f.engine.run(f.s, f.project, toolPrompt(writeCall("a.txt", "second"), writeCall("new.txt", "new")), () => {});
+    const choices = await f.engine.undoCheckpoints(f.s);
+    const id = f.s.conversationId;
+    await assert.rejects(f.engine.undo(f.s, choices[1]!.id, () => {}), /file changed between checkpoints/);
+    assert.equal(readFileSync(path, "utf8"), "second");
+    assert.equal(readFileSync(join(f.work, "new.txt"), "utf8"), "new", "do not partially rewind newer turns");
+    assert.equal(f.s.conversationId, id);
+    const state = await f.engine.harness.snapshot(UndoDoc, id as ConversationId, BACKGROUND_CONTEXT);
+    assert.equal(state?.restoring, undefined);
+    await f.engine.undo(f.s, choices[0]!.id, () => {});
+    assert.equal(readFileSync(path, "utf8"), "manual work between turns");
+    assert.equal(existsSync(join(f.work, "new.txt")), false);
+    await assert.rejects(f.engine.undo(f.s, choices[1]!.id, () => {}), /file changed since the agent edited it/);
+    assert.equal(readFileSync(path, "utf8"), "manual work between turns");
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("crash recovery resumes the selected older checkpoint, not the latest, and cannot be retargeted midway", async () => {
+  const f = await undoFixture(); let engine = f.engine;
+  try {
+    const path = join(f.work, "a.txt"); writeFileSync(path, "before");
+    const first = toolPrompt(writeCall("a.txt", "first"));
+    const middle = toolPrompt(writeCall("a.txt", "second"));
+    const latest = toolPrompt(writeCall("a.txt", "third"), writeCall("new.txt", "new"));
+    for (const prompt of [first, middle, latest]) await engine.run(f.s, f.project, prompt, () => {});
+    const choices = await engine.undoCheckpoints(f.s);
+    const target = choices[1]!.id;
+    engine.undoHistory.restore = () => {
+      // Simulate an interruption after one file reaches the selected target's contents.
+      writeFileSync(path, "first");
+      throw new Error("Interrupted selected restore");
+    };
+    await assert.rejects(engine.undo(f.s, target, () => {}), /Interrupted selected restore/);
+    const state = await engine.harness.snapshot(UndoDoc, f.s.conversationId as ConversationId, BACKGROUND_CONTEXT);
+    assert.equal(state?.restoreTo, target);
+    const retryChoices = await engine.undoCheckpoints(f.s);
+    assert.deepEqual(retryChoices.map((point) => [point.id, point.pending, point.turns]), [[target, true, 2]]);
+    await assert.rejects(engine.undo(f.s, choices[0]!.id, () => {}), /previously selected checkpoint/);
+    await engine.close();
+    const store = new Store(f.store.root);
+    engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => f.errors.push(error), undoModels());
+    await engine.restore(() => {});
+    const restored = store.state.sessions[0]!;
+    assert.equal(readFileSync(path, "utf8"), "first", "must restore before the selected middle turn, not before the latest");
+    assert.equal(existsSync(join(f.work, "new.txt")), false);
+    assert.deepEqual(restored.messages.filter((m) => m.role === "user").map((m) => m.text), [first]);
+    assert.deepEqual((await engine.undoCheckpoints(restored)).map((point) => point.id), [choices[2]!.id]);
+    assert.deepEqual(f.errors, []);
+  } finally { await engine.close(); f.cleanup(); }
 });

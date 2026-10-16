@@ -4,11 +4,13 @@ import {
   type TuiAltScreen, type TuiMouseEvent, type TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
 import { Controller } from "./controller.js";
-import { age, lastReply, rowId, type Session, type Row } from "./model.js";
+import { age, lastReply, rowId, type ReplyBehavior, type Session, type Row } from "./model.js";
 import { displayPath } from "./store.js";
 import { accent, bold, dim, fit, green, markdown, oneLine, pad, red, warning, workingIcon } from "./format.js";
 import { Transcript } from "./transcript.js";
 import { SettingsDialog } from "./settings-dialog.js";
+import { SettingsPage } from "./settings-page.js";
+import { UndoDialog } from "./undo-dialog.js";
 import { Composer } from "./composer.js";
 import { composerCommands } from "./discovery.js";
 import { composerStatus, usageDetails } from "./usage.js";
@@ -17,6 +19,11 @@ export const scrollToEndIndicator = () => accent("[ Scroll to bottom / ctrl+end 
 
 function promptHistory(session: Session | undefined): string[] {
   return session?.messages.filter((message) => message.role === "user").map((message) => message.text) ?? [];
+}
+
+function queueHint(session: Session | undefined, behavior: ReplyBehavior): string | undefined {
+  if (session?.status !== "working" && !session?.queuedInputs?.length) return;
+  return `Enter queues ${behavior === "steer" ? "steering" : "a follow-up"}${session?.queuedInputs?.length ? ` / ${session.queuedInputs.length} queued` : ""}`;
 }
 
 class Dynamic implements Component {
@@ -147,9 +154,15 @@ export class Dashboard extends VStack implements Focusable {
       void this.controller.settings(command === "/model" ? "model" : "thinking").catch((error: unknown) => this.controller.fail(error));
       return true;
     }
+    if (command === "/settings" || command === "/config") { this.controller.showSettings(); return true; }
     if (command === "/session") { this.controller.showUsage(); return true; }
     if (/^\/compact(?:\s|$)/.test(command)) {
       void this.controller.compact(command.slice("/compact".length).trim() || undefined); return true;
+    }
+    if (/^\/undo(?:\s|$)/.test(command)) {
+      if (command !== "/undo") { this.controller.fail("Usage: /undo — open the checkpoint picker; nothing is restored until you select one."); return true; }
+      void this.controller.showUndo();
+      return true;
     }
     if (command === "/stop") { void this.controller.cancel(); return true; }
     if (command === "/help") {
@@ -188,8 +201,7 @@ export class Dashboard extends VStack implements Focusable {
     const c = this.controller;
     const rule = dim("-".repeat(Math.max(0, width - 4)));
     if (c.mode === "projects") return ["", `  ${rule}`, `  ${dim("a add / enter select / ctrl+x clear sessions / ctrl+o back")}`, `  ${c.notice ? warning(oneLine(c.notice)) : dim("Ctrl+x twice deletes all sessions in the selected project. Project and files are kept.")}`, ""];
-    const context = c.mode === "session" ? `Reply to ${oneLine(c.opened?.title ?? "session")}` : `New task in ${oneLine(displayPath(c.project?.path ?? "(select a project)"))}`;
-    return ["", `  ${dim(context)}`,
+    return ["",
       ...(c.notice ? [`  ${warning(oneLine(c.notice))}`] : []),
       ...this.composer.render(Math.max(1, width - 4)).map((line) => `  ${line}`),
       `  ${composerStatus(c.configuration, c.engine.stats(c.mode === "session" ? c.opened : undefined))}`, ""];
@@ -216,12 +228,17 @@ export class Dashboard extends VStack implements Focusable {
       this.overlay?.hide();
       this.overlay = undefined;
       this.activeDialog = c.dialog;
+      const undoSessionId = c.dialog?.kind === "undo" ? c.dialog.sessionId : undefined;
       if (c.dialog) this.overlay = this.tui.showOverlay(c.dialog.kind === "model" || c.dialog.kind === "thinking" || c.dialog.kind === "skills"
         ? new SettingsDialog(c, this.tui, c.dialog, (name) => {
           this.composer.setValue(`/skill:${name} ${this.composer.getValue()}`);
           this.composer.handleInput("\x05");
           c.dialog = undefined; c.changed();
-        }) : new DialogView(c, this.tui), {
+        }) : c.dialog.kind === "undo" ? new UndoDialog(c, this.tui, c.dialog, (result) => {
+          if (c.mode === "session" && c.openedSessionId === undoSessionId && !this.composer.getValue()) {
+            this.composer.setValue(result.prompt); c.changed();
+          }
+        }) : c.dialog.kind === "settings" ? new SettingsPage(c, this.tui, c.dialog) : new DialogView(c, this.tui), {
         width: "88%", maxHeight: "85%", margin: 1,
       });
     }
@@ -354,7 +371,7 @@ class DialogView implements Component, Focusable {
   render(width: number): string[] {
     const c = this.controller;
     const dialog = c.dialog;
-    if (!dialog || dialog.kind === "model" || dialog.kind === "thinking" || dialog.kind === "skills") return [];
+    if (!dialog || dialog.kind === "model" || dialog.kind === "thinking" || dialog.kind === "skills" || dialog.kind === "settings") return [];
     const inner = Math.max(1, width - 4);
     const frame = (lines: string[]) => [
       `+${"-".repeat(Math.max(0, width - 2))}+`,
@@ -375,11 +392,12 @@ class DialogView implements Component, Focusable {
       const view = session ? "Open session" : selectedSession ? "Dashboard (session selected)" : "Dashboard (project selected)";
       const help = [bold(`Commands: ${view}`),
         ...composerCommands(session, selectedSession).map(({ name, description }) => `/${name}  ${description}`),
-        ...(!session && !selectedSession ? [dim("Select a session for /session, /compact and /stop.")] : []),
+        ...(!session && !selectedSession ? [dim("Select a session for /session, /compact, /undo and /stop.")] : []),
         "", bold("Keyboard shortcuts"),
       "up / ctrl+p     select previous project or session",
       "down / ctrl+n   select next project or session",
       "enter           new task when composer has text", "enter           open session when composer is empty",
+      "enter           queue a busy-session reply (/settings chooses follow-up or steer)",
       "↑ / ↓           recall sent prompts in session / peek (empty draft or start of first line)",
       "↓               after newest recalled prompt, restore your unsent draft",
       "ctrl+j          insert a newline in the draft",
@@ -415,7 +433,11 @@ class DialogView implements Component, Focusable {
     const text = session ? lastReply(session) : "Session not found.";
     if (this.cache?.text !== text || this.cache.width !== inner) this.cache = { text, width: inner, lines: markdown(text, inner) };
     const inputLines = this.input.render(inner);
-    const belowComposer = [composerStatus(c.engine.configuration(session), c.engine.stats(session))];
+    const hint = queueHint(session, c.store.settings.replyBehavior);
+    const belowComposer = [
+      ...(hint ? [dim(hint)] : []),
+      composerStatus(c.engine.configuration(session), c.engine.stats(session)),
+    ];
     const available = Math.max(1, Math.floor(this.tui.terminal.rows * 0.85)
       - 6 - inputLines.length - belowComposer.length - (c.notice ? 1 : 0));
     const lines = this.cache.lines;

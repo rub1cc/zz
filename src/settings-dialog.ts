@@ -58,7 +58,11 @@ export class SettingsDialog implements Component, Focusable {
 
   handleInput(data: string): void {
     if (this.busy) return;
-    if (matchesKey(data, "escape")) { this.controller.dialog = undefined; this.controller.notice = ""; this.controller.changed(); return; }
+    if (matchesKey(data, "escape")) {
+      if (this.dialog.kind !== "skills" && this.dialog.returnToSettings) this.controller.showSettings(this.dialog.kind);
+      else { this.controller.dialog = undefined; this.controller.notice = ""; this.controller.changed(); }
+      return;
+    }
     if (matchesKey(data, "ctrl+n")) this.list.handleInput("\x1b[B");
     else if (matchesKey(data, "ctrl+p")) this.list.handleInput("\x1b[A");
     else if (matchesKey(data, "up") || matchesKey(data, "down") || matchesKey(data, "enter")) this.list.handleInput(data);
