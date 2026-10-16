@@ -4,7 +4,7 @@ import {
   type TuiAltScreen, type TuiMouseEvent, type TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
 import { Controller } from "./controller.js";
-import { age, lastReply, rowId, type Row } from "./model.js";
+import { age, lastReply, rowId, type Session, type Row } from "./model.js";
 import { displayPath } from "./store.js";
 import { accent, bold, dim, fit, green, markdown, oneLine, pad, red, warning, workingIcon } from "./format.js";
 import { Transcript } from "./transcript.js";
@@ -14,6 +14,10 @@ import { composerCommands } from "./discovery.js";
 import { composerStatus, usageDetails } from "./usage.js";
 
 export const scrollToEndIndicator = () => accent("[ Scroll to bottom / ctrl+end ]");
+
+function promptHistory(session: Session | undefined): string[] {
+  return session?.messages.filter((message) => message.role === "user").map((message) => message.text) ?? [];
+}
 
 class Dynamic implements Component {
   constructor(readonly draw: (width: number) => string[]) {}
@@ -193,6 +197,9 @@ export class Dashboard extends VStack implements Focusable {
 
   sync(): void {
     const c = this.controller;
+    if (c.mode !== this.previousMode || c.openedSessionId !== this.previousSessionId) {
+      this.composer.setHistory(promptHistory(c.mode === "session" ? c.opened : undefined));
+    }
     this.composer.setDiscovery(c.project && c.mode !== "projects"
       ? { cwd: c.project.path, commands: true, session: c.mode === "session", selectedSession: c.selected?.kind === "session" } : undefined);
     if (c.mode !== this.previousMode) {
@@ -316,6 +323,7 @@ class DialogView implements Component, Focusable {
       : new Input({ placeholder: "/path/to/project", placeholderStyle: dim });
     const dialog = controller.dialog;
     if (this.input instanceof Composer && dialog?.kind === "peek") {
+      this.input.setHistory(promptHistory(controller.session(dialog.sessionId)));
       const project = controller.store.state.projects.find((p) => p.id === controller.session(dialog.sessionId)?.projectId);
       if (project) this.input.setDiscovery({ cwd: project.path, commands: false, session: true });
     }
@@ -372,6 +380,8 @@ class DialogView implements Component, Focusable {
       "up / ctrl+p     select previous project or session",
       "down / ctrl+n   select next project or session",
       "enter           new task when composer has text", "enter           open session when composer is empty",
+      "↑ / ↓           recall sent prompts in session / peek (empty draft or start of first line)",
+      "↓               after newest recalled prompt, restore your unsent draft",
       "ctrl+j          insert a newline in the draft",
       "ctrl+g          edit draft in $VISUAL / $EDITOR (default vim)",
       "/               search commands available in this view",

@@ -249,6 +249,11 @@ and session lists never follow chat output.
   Space peeks at its latest agent reply in a dialog with a reply field.
 - In an open session or peek dialog, Enter sends a reply to that same session.
   A running session must finish before it can accept another reply.
+- In an open session or peek reply, ↑ recalls earlier sent prompts from that
+  session; ↓ moves forward and restores your unsent draft after the newest entry.
+  Start with an empty draft, or place the cursor at the start of its first line.
+  Arrows still move through multiline text; suggestions take priority when open.
+  Recalled prompts are editable and are not sent until you press Enter.
 - Ctrl+J inserts a newline in task and reply drafts (including peeks); Enter sends.
   Multiline text and pasted blocks are preserved.
 - Ctrl+G opens the draft in `$VISUAL`, then `$EDITOR`, falling back to `vim`.

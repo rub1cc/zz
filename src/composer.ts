@@ -5,7 +5,7 @@ import { ComposerDiscovery, type DiscoveryContext } from "./discovery.js";
 
 /** Multiline prompt editor with the same value API as the dashboard's old Input. */
 export class Composer implements Component, Focusable {
-  private readonly editor: Editor;
+  private editor: Editor;
   private readonly placeholder: Input;
   private beforeInput = "";
   private discovery?: ComposerDiscovery;
@@ -24,16 +24,33 @@ export class Composer implements Component, Focusable {
     private readonly edit: (text: string) => Promise<string> = (text) => editExternally(tui, text),
   ) {
     this.placeholder = new Input({ placeholder, placeholderStyle: dim });
-    this.editor = new Editor(tui, {
+    this.editor = this.createEditor();
+  }
+
+  private createEditor(): Editor {
+    const editor = new Editor(this.tui, {
       borderColor: dim,
       selectList: { selectedPrefix: accent, selectedText: accent, description: dim, scrollInfo: dim, noMatch: warning },
     });
-    this.editor.onSubmit = (text) => {
+    editor.onSubmit = (text) => {
       this.completionQueued = false;
       // Pi's Editor clears before invoking onSubmit. Restore the exact draft when
       // the controller rejects a reply (e.g. the session is still working).
       if (!this.onSubmit?.(text)) this.setValue(this.beforeInput);
+      else editor.addToHistory(text);
     };
+    return editor;
+  }
+
+  /** Replace history when switching sessions; never leak another session's prompts. */
+  setHistory(texts: readonly string[]): void {
+    const value = this.getValue();
+    const focused = this.focused;
+    this.editor = this.createEditor();
+    for (const text of texts) this.editor.addToHistory(text);
+    if (this.discovery) this.editor.setAutocompleteProvider(this.discovery);
+    this.setValue(value);
+    this.focused = focused;
   }
 
   getValue(): string { return this.editor.getExpandedText(); }

@@ -1097,3 +1097,38 @@ test("automatic compaction, retries, failures and summary cards render safely at
     assert.equal(f.c.canStop(session), true);
   } finally { await f.cleanup(); }
 });
+
+test("session and peek arrows recall saved prompts without sending or leaking sessions", async () => {
+  const f = setup();
+  try {
+    f.c.send("first session prompt"); await tick();
+    const first = f.store.state.sessions[0]!;
+    f.c.send("second session prompt"); await tick();
+    const second = f.store.state.sessions[1]!;
+    first.messages.push({ role: "assistant", text: "not a prompt", timestamp: 2 });
+    first.messages.push({ role: "user", text: "saved follow-up", timestamp: 3 });
+    f.c.select(`session:${first.id}`); f.c.open();
+    const calls = f.engine.calls.length;
+    f.terminal.onInput("\x1b[A");
+    assert.equal(f.app.composer.getValue(), "saved follow-up");
+    f.terminal.onInput("\x1b[A"); f.terminal.onInput("\x1b[A");
+    assert.equal(f.app.composer.getValue(), "first session prompt");
+    f.terminal.onInput("\x1b[B"); f.terminal.onInput("\x1b[B");
+    assert.equal(f.app.composer.getValue(), "");
+    assert.equal(f.engine.calls.length, calls, "Recalling must never send a prompt");
+    f.terminal.onInput("new reply"); f.terminal.onInput("\r"); await tick();
+    f.terminal.onInput("\x1b[A");
+    assert.equal(f.app.composer.getValue(), "new reply", "Accepted replies join history immediately");
+    f.c.back();
+    const before = f.c.selection;
+    f.terminal.onInput("\x1b[A");
+    assert.notEqual(f.c.selection, before, "Dashboard arrows still navigate rows");
+    f.c.select(`session:${second.id}`); f.c.open();
+    f.terminal.onInput("\x1b[A"); f.terminal.onInput("\x1b[A");
+    assert.equal(f.app.composer.getValue(), "second session prompt");
+    f.c.back(); f.c.select(`session:${first.id}`); f.c.peek();
+    f.terminal.onInput("\x1b[A"); f.terminal.onInput("\r"); await tick();
+    assert.equal(f.engine.calls.at(-1)?.session.id, first.id);
+    assert.equal(f.engine.calls.at(-1)?.prompt, "new reply", "Peek can recall and resend a saved prompt");
+  } finally { await f.cleanup(); }
+});

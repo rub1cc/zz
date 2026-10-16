@@ -191,3 +191,62 @@ test("Escape cancels a debounced @ query before it can open a late menu", async 
   assert.equal(input.getValue(), "@");
   assert.equal(input.handleDiscoveryInput("\x1b"), false, "A second Escape belongs to the parent view");
 });
+
+test("arrows recall accepted prompts, restore drafts, and exclude rejected submissions", () => {
+  const { input } = composer();
+  input.onSubmit = () => true;
+  for (const text of ["first prompt", "second prompt", "second prompt"]) {
+    input.setValue(text); input.handleInput("\r");
+  }
+  input.onSubmit = () => false;
+  input.setValue("rejected prompt"); input.handleInput("\r");
+  assert.equal(input.getValue(), "rejected prompt");
+  input.setValue("unsent draft"); input.handleInput("\x01"); // Start of line.
+  input.handleInput("\x1b[A");
+  assert.equal(input.getValue(), "second prompt");
+  input.handleInput("\x1b[A");
+  assert.equal(input.getValue(), "first prompt", "Consecutive duplicates are skipped");
+  input.handleInput("\x1b[A");
+  assert.equal(input.getValue(), "first prompt", "Oldest entry is a stable boundary");
+  input.handleInput("\x1b[B"); input.handleInput("\x1b[B");
+  assert.equal(input.getValue(), "unsent draft");
+  input.handleInput("!");
+  assert.equal(input.getValue(), "!unsent draft", "Draft cursor position is restored too");
+});
+
+test("history can be scoped, seeds saved prompts, and leaves multiline editing intact", () => {
+  const { input } = composer();
+  input.focused = true;
+  input.setValue("keep this draft");
+  input.setHistory(["saved older", "saved newer"]);
+  assert.equal(input.getValue(), "keep this draft");
+  assert.equal(input.focused, true);
+  input.setValue("first line\nsecond line"); input.render(80);
+  input.handleInput("\x1b[A"); input.handleInput("!");
+  assert.equal(input.getValue(), "first line!\nsecond line", "Up moves within multiline text");
+  input.setValue(""); input.handleInput("\x1b[A");
+  assert.equal(input.getValue(), "saved newer");
+  input.handleInput("\x1b[A");
+  assert.equal(input.getValue(), "saved older");
+  input.setHistory(["other session"]);
+  input.setValue(""); input.handleInput("\x1b[A"); input.handleInput("\x1b[A");
+  assert.equal(input.getValue(), "other session", "Prior session history is discarded");
+  input.handleInput("\x1b[B");
+  assert.equal(input.getValue(), "");
+});
+
+test("multiline history is editable and suggestion arrows take precedence over recall", async () => {
+  const { input } = composer();
+  input.setHistory(["first line\nsecond line 日本語 🧑‍💻"]);
+  input.handleInput("\x1b[A");
+  assert.equal(input.getValue(), "first line\nsecond line 日本語 🧑‍💻");
+  input.handleInput("\x1b[B"); input.handleInput("\x1b[B");
+  assert.equal(input.getValue(), "", "Down traverses multiline entries before restoring the draft");
+  input.handleInput("\x1b[A"); input.handleInput("edited ");
+  assert.equal(input.getValue(), "edited first line\nsecond line 日本語 🧑‍💻");
+  input.setDiscovery({ cwd: process.cwd(), commands: true, session: true });
+  input.setValue(""); input.handleInput("/"); await delay(20);
+  assert.equal(input.showingSuggestions, true);
+  input.handleInput("\x1b[A"); input.handleInput("\x1b[B");
+  assert.equal(input.getValue(), "/", "Menu navigation does not replace the draft with history");
+});
