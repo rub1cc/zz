@@ -1,9 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { finishWork, isReplyBehavior, markStopped, rowId, rows, type ReplyBehavior, type SettingsSelection, type AgentSettings, type CompactResult, type ModelOption, type Project, type Row, type Session, type SessionStats, type SkillOption, type UndoResult, type UndoCheckpoint } from "./model.js";
-import { Store } from "./store.js";
+import { copyToClipboard } from "@earendil-works/pi-coding-agent";
+import { finishWork, isReplyBehavior, markStopped, rowId, rows, transcriptMessages, type ShellResponse, type ImageAttachment, type ReplyBehavior, type SettingsSelection, type AgentSettings, type CompactResult, type ModelOption, type Project, type Row, type Session, type SessionStats, type SkillOption, type UndoResult, type UndoCheckpoint } from "./model.js";
+import { directory, isImages, Store } from "./store.js";
+import { ShellRun } from "./shell.js";
+import { AuthFlow, type AuthAccess, type AuthAction } from "./auth.js";
+import type { CompactionPolicy } from "@earendil-works/pi-durable";
+import { compactionPolicy, compactionSettingsError } from "./compaction-settings.js";
 
 export interface Engine {
-  run(session: Session, project: Project, prompt: string, changed: () => void): Promise<void>;
+  run(session: Session, project: Project, prompt: string, changed: () => void, images?: ImageAttachment[]): Promise<void>;
   compact(session: Session, instructions: string | undefined, changed: () => void): Promise<CompactResult>;
   undoCheckpoints(session: Session): Promise<UndoCheckpoint[]>;
   undo(session: Session, checkpointId: string, changed: () => void): Promise<UndoResult>;
@@ -12,6 +17,7 @@ export interface Engine {
   close(): Promise<void>;
   configuration(session?: Session): AgentSettings;
   stats(session?: Session): SessionStats;
+  supportsImages?(session?: Session): boolean;
   listModels(): Promise<ModelOption[]>;
   configure(change: Partial<AgentSettings>, session?: Session): Promise<void>;
   listSkills(project: Project): Promise<SkillOption[]>;
@@ -19,6 +25,7 @@ export interface Engine {
 
 export type Mode = "sessions" | "projects" | "session";
 export type Dialog =
+  | { kind: "auth"; flow: AuthFlow }
   | { kind: "peek"; sessionId: string }
   | { kind: "add-project" }
   | { kind: "settings"; sessionId?: string; selected: SettingsSelection }
@@ -48,9 +55,20 @@ export class Controller {
   private undoing = new Set<string>();
   private configuring = false;
   private thinkingQueue = Promise.resolve();
+  private clipboardQueue = Promise.resolve();
+  private activeShell?: { projectId: string; sessionId: string; run: ShellRun };
+  get shellRun(): ShellRun | undefined { return this.activeShell?.run; }
 
-  constructor(readonly store: Store, readonly engine: Engine) {
+  constructor(readonly store: Store, readonly engine: Engine, readonly auth?: AuthAccess,
+    private readonly writeClipboard: (text: string) => Promise<void> = copyToClipboard) {
     for (const session of store.state.sessions) {
+      for (const response of session.shellResponses ?? []) {
+        if (response.status === "running" || response.status === "stopping") {
+          response.status = "interrupted";
+          response.error = "Interrupted. This shell command was not restarted.";
+          response.updatedAt = Math.max(response.updatedAt, Date.now());
+        }
+      }
       if (session.status === "working") {
         session.status = "paused";
         session.preview = "Interrupted. Open and reply to continue.";
@@ -71,6 +89,32 @@ export class Controller {
   session(id: string): Session | undefined { return this.store.state.sessions.find((s) => s.id === id); }
   get configuration(): AgentSettings { return this.engine.configuration(this.mode === "session" ? this.opened : undefined); }
 
+  showAuth(action: AuthAction, provider?: string): void {
+    if (this.closing) return;
+    if (!this.auth) { this.fail("Authentication is unavailable in this runtime."); return; }
+    if (this.dialog?.kind === "auth") this.dialog.flow.dispose();
+    const flow = new AuthFlow(action, this.auth, () => this.changed(), async (providerId, operation) => {
+      if (this.closing || flow.disposed || operation !== "login" || this.engine.configuration().model) return;
+      const model = (await this.engine.listModels()).find((model) => model.provider === providerId);
+      if (this.closing || flow.disposed || this.engine.configuration().model) return;
+      if (!model) return "No models available yet for this provider; use /model after checking its configuration.";
+      await this.engine.configure({ model: { provider: model.provider, modelId: model.modelId } });
+      this.changed(true);
+      return `New tasks use ${model.provider}/${model.modelId}.`;
+    });
+    this.dialog = { kind: "auth", flow };
+    this.notice = "";
+    this.changed();
+    void flow.start(provider);
+  }
+
+  closeAuth(): void {
+    if (this.dialog?.kind !== "auth") return;
+    this.dialog.flow.dispose();
+    this.dialog = undefined;
+    this.changed();
+  }
+
   showUsage(): void {
     const session = this.mode === "session" ? this.opened : this.selected?.kind === "session" ? this.selected.session : undefined;
     if (!session) { this.fail("Open or select a session first to view /session usage."); return; }
@@ -79,11 +123,141 @@ export class Controller {
     this.changed();
   }
 
+  copyResponse(argument = ""): Promise<void> {
+    if (this.closing) return Promise.resolve();
+    const value = argument.trim() || "1";
+    const index = Number(value);
+    if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(index)) {
+      this.fail("Usage: /copy [N] — N must be a positive integer (1 = latest response).");
+      return Promise.resolve();
+    }
+    const session = this.mode === "session" ? this.opened : this.selected?.kind === "session" ? this.selected.session : undefined;
+    if (!session) { this.fail("Open or select a session first to copy a response."); return Promise.resolve(); }
+    const responses = transcriptMessages(session).filter((message) => (message.role === "assistant" || message.role === "shell") && message.text.trim());
+    const label = responses.every((message) => message.role === "assistant") ? "assistant response" : "response";
+    const response = responses[responses.length - index];
+    if (!response) {
+      this.fail(responses.length ? `Only ${responses.length} ${label}${responses.length === 1 ? " is" : "s are"} available; cannot copy response ${index}.`
+        : session.shellResponses?.length ? "No nonempty responses to copy yet." : "No assistant responses to copy yet.");
+      return Promise.resolve();
+    }
+    // Snapshot before awaiting: streaming and navigation must not change what this invocation copies.
+    const text = response.text;
+    const mode = this.mode;
+    const stillSelected = () => this.mode === mode && (mode === "session" ? this.openedSessionId === session.id
+      : this.selected?.kind === "session" && this.selected.session.id === session.id);
+    // Clipboard writes are serialized so rapid commands leave the last requested response on the clipboard.
+    this.clipboardQueue = this.clipboardQueue.then(async () => {
+      if (this.closing) return;
+      try {
+        await this.writeClipboard(text);
+        if (!this.closing && stillSelected()) { this.notice = `Copied ${response.role === "shell" ? "shell" : "assistant"} response ${index} to clipboard.`; this.changed(); }
+      } catch (error) {
+        if (!this.closing && stillSelected()) this.fail(`Could not copy response: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    });
+    return this.clipboardQueue;
+  }
+
+  runShell(command: string, replyTo?: string): boolean {
+    if (this.closing) return false;
+    if (!command.trim()) { this.fail("Usage: !command (for example, !pwd)."); return false; }
+    if (this.activeShell) { this.fail("A direct shell command is already running. Open its session and press Escape or /stop, or wait for it to finish."); return false; }
+    let session = replyTo ? this.session(replyTo) : this.mode === "session" ? this.opened : this.selected?.kind === "session" ? this.selected.session : undefined;
+    const project = session ? this.store.state.projects.find((project) => project.id === session!.projectId) : !replyTo ? this.project : undefined;
+    if (!project) { this.fail("Select a project or open a session before running a shell command."); return false; }
+    if (this.undoing.has(project.id)) { this.fail("Wait for this project's /undo to finish before running a shell command."); return false; }
+    if (project.id === this.deletingProjectId || session && this.deletingSessions.has(session.id)) {
+      this.fail("This session is being deleted. Wait before running a shell command."); return false;
+    }
+    let cwd: string;
+    try { cwd = directory(project.path); }
+    catch (error) { this.fail(error); return false; }
+    const created = !session;
+    const now = Date.now();
+    if (!session) {
+      session = { id: randomUUID(), projectId: project.id, title: `!${command.trim().replace(/\s+/g, " ")}`.slice(0, 80),
+        status: "completed", preview: "Running shell command...", createdAt: now, updatedAt: now, messages: [], agent: this.engine.configuration() };
+      this.store.state.sessions.push(session);
+    }
+    const timestamp = Math.max(now, session.messages.at(-1)?.timestamp ?? 0, session.shellResponses?.at(-1)?.timestamp ?? 0);
+    const response: ShellResponse = { id: randomUUID(), command, cwd, text: "", timestamp, updatedAt: timestamp,
+      status: "running", droppedBytes: 0, droppedLines: 0 };
+    const previous = session.shellResponses;
+    session.shellResponses = [...(previous ?? []), response];
+    try { this.store.save(); }
+    catch (error) {
+      session.shellResponses = previous;
+      if (created) this.store.state.sessions = this.store.state.sessions.filter((other) => other !== session);
+      this.fail(error); return false;
+    }
+    const publish = () => {
+      const output = run.output;
+      response.text = output.text;
+      response.status = run.phase;
+      response.exitCode = run.exitCode;
+      response.error = run.error;
+      response.droppedBytes = output.droppedBytes;
+      response.droppedLines = output.droppedLines;
+      response.updatedAt = Math.max(response.updatedAt, Date.now());
+      this.changed(true);
+    };
+    const run = new ShellRun(cwd, command, publish);
+    this.activeShell = { projectId: project.id, sessionId: session.id, run };
+    this.notice = "";
+    if (this.dialog?.kind !== "peek") {
+      this.dialog = undefined;
+      this.mode = "session";
+      this.openedSessionId = session.id;
+      this.selection = `session:${session.id}`;
+    }
+    this.changed();
+    void run.start().finally(() => {
+      if (this.activeShell?.run === run) this.activeShell = undefined;
+      try { this.store.save(); } catch (error) { this.fail(error); }
+      this.changed();
+    });
+    return true;
+  }
+
+  stopShell(sessionId?: string): boolean {
+    const active = this.activeShell;
+    if (!active || active.sessionId !== sessionId || !active.run.running) return false;
+    active.run.cancel();
+    return true;
+  }
+
   showSettings(selected: SettingsSelection = "replyBehavior"): void {
     if (this.closing) return;
     this.dialog = { kind: "settings", sessionId: this.mode === "session" ? this.openedSessionId : undefined, selected };
     this.notice = "";
     this.changed();
+  }
+
+  toggleThinking(): void {
+    if (this.closing) return;
+    const previous = this.store.state.settings;
+    this.store.state.settings = { ...this.store.settings, showThinking: this.store.settings.showThinking === false };
+    try { this.store.save(); }
+    catch (error) { this.store.state.settings = previous; this.fail(error); return; }
+    this.notice = this.store.settings.showThinking ? "Thinking blocks shown (when the provider returns them)." : "Thinking blocks hidden.";
+    this.changed();
+  }
+
+  setCompaction(change: Partial<CompactionPolicy>): boolean {
+    if (this.closing) return false;
+    const error = compactionSettingsError(change);
+    if (error) { this.fail(error); return false; }
+    const next = compactionPolicy({ ...this.store.compaction, ...change });
+    const combinedError = compactionSettingsError(next);
+    if (combinedError) { this.fail(combinedError); return false; }
+    const previous = this.store.state.settings;
+    this.store.state.settings = { ...this.store.settings, compaction: next };
+    try { this.store.save(); }
+    catch (error) { this.store.state.settings = previous; this.fail(error); return false; }
+    this.notice = "";
+    this.changed();
+    return true;
   }
 
   setReplyBehavior(value: ReplyBehavior): boolean {
@@ -224,6 +398,7 @@ export class Controller {
 
   escape(): void {
     if (this.mode === "session") {
+      if (this.stopShell(this.openedSessionId)) return;
       void this.cancel(this.openedSessionId); return;
     }
     this.back();
@@ -256,7 +431,7 @@ export class Controller {
     if (this.closing || this.undoing.has(session.projectId)) return false;
     const busy = this.store.state.sessions.some((other) => other.projectId === session.projectId
       && (this.canStop(other) || this.deletingSessions.has(other.id)));
-    if (busy || this.configuring) { this.fail("Wait for this project's sessions to finish, or /stop them, before /undo."); return false; }
+    if (busy || this.configuring || this.activeShell?.projectId === session.projectId) { this.fail("Wait for this project's sessions and direct shell command to finish before /undo. Use /stop for agent work."); return false; }
     return true;
   }
 
@@ -305,7 +480,7 @@ export class Controller {
   }
 
   canStop(session: Session): boolean {
-    return this.hasPendingRun(session) || !!session.compactions?.length || this.compacting.has(session.id)
+    return this.activeShell?.sessionId === session.id && this.activeShell.run.running || this.hasPendingRun(session) || !!session.compactions?.length || this.compacting.has(session.id)
       || this.cancelling.has(session.id);
   }
 
@@ -318,15 +493,18 @@ export class Controller {
       this.notice = session.stopped ? "Stopped. Reply to continue." : "This session is already idle."; this.changed(); return;
     }
     const stoppingRun = this.hasPendingRun(session);
+    const shell = this.activeShell?.sessionId === session.id ? this.activeShell.run : undefined;
+    const stopAgent = stoppingRun || !!session.compactions?.length || this.compacting.has(session.id);
+    shell?.cancel();
     this.cancelling.add(session.id);
     this.notice = "Stopping...";
     this.changed();
     try {
-      await this.engine.cancel(session.id);
+      await Promise.all([stopAgent ? this.engine.cancel(session.id) : undefined, shell?.done]);
       if (stoppingRun) markStopped(session);
       this.pending.delete(session.id);
       this.store.save();
-      this.notice = stoppingRun ? "Stopped. Reply to continue." : "Compaction cancelled.";
+      this.notice = stoppingRun ? "Stopped. Reply to continue." : shell ? "Shell command stopped." : "Compaction cancelled.";
     } catch (error) { this.fail(error); }
     finally { this.cancelling.delete(session.id); this.changed(); }
   }
@@ -366,7 +544,9 @@ export class Controller {
     this.deletingProjectId = selected.kind === "project" ? selected.project.id : undefined;
     try {
       for (const id of ids) this.deletingSessions.add(id);
-      const results = await Promise.allSettled(sessions.map((s) => this.engine.stop(s.id)));
+      const shell = this.activeShell && ids.has(this.activeShell.sessionId) ? this.activeShell.run : undefined;
+      shell?.cancel();
+      const results = await Promise.allSettled([...sessions.map((s) => this.engine.stop(s.id)), shell?.done]);
       const failure = results.find((result) => result.status === "rejected");
       if (failure?.status === "rejected") throw failure.reason;
       const index = this.currentRows.findIndex((row) => rowId(row) === this.selection);
@@ -402,8 +582,10 @@ export class Controller {
     } catch (error) { this.fail(error); return false; }
   }
 
-  send(text: string, replyTo?: string): boolean {
-    text = text.trim();
+  send(text: string, replyTo?: string, images: ImageAttachment[] = []): boolean {
+    if (text.trimStart().startsWith("!")) return this.runShell(text.trimStart().slice(1), replyTo);
+    if (!isImages(images)) { this.fail("Invalid image attachments. Paste an image or use an @image path."); return false; }
+    text = text.trim() || (images.length ? "Describe the attached image(s)." : "");
     if (!text || this.closing || this.configuring) return false;
     const target = replyTo ?? (this.mode === "session" ? this.openedSessionId : undefined);
     let session = target ? this.session(target) : undefined;
@@ -411,6 +593,9 @@ export class Controller {
       ? this.store.state.projects.find((p) => p.id === session?.projectId)
       : this.project;
     if (!project || (target && !session)) { this.fail("Select a project first. Use ctrl+o to add one."); return false; }
+    if (images.length && this.engine.supportsImages?.(session) === false) {
+      this.fail("This model does not accept images. Choose an image-capable model with /model."); return false;
+    }
     if (this.undoing.has(project.id)) { this.fail("This project is being restored. Wait for /undo to finish."); return false; }
     if (project.id === this.deletingProjectId) { this.fail("This project's sessions are being deleted."); return false; }
     if (target && (this.cancelling.has(target) || this.deletingSessions.has(target))) {
@@ -434,7 +619,7 @@ export class Controller {
       this.selection = `session:${session.id}`;
     }
     if (!busy) {
-      session.messages.push({ role: "user", text, timestamp: Date.now() });
+      session.messages.push({ role: "user", text, timestamp: Date.now(), ...(images.length ? { images } : {}) });
       delete session.stopped;
       session.status = "working";
       session.preview = "Starting...";
@@ -445,7 +630,7 @@ export class Controller {
     this.dialog = undefined;
     const active = session;
     this.pending.set(active.id, (this.pending.get(active.id) ?? 0) + 1);
-    void this.engine.run(active, project, text, () => this.changed(true))
+    void this.engine.run(active, project, text, () => this.changed(true), images)
       .catch((error: unknown) => {
         active.status = "failed";
         active.preview = error instanceof Error ? error.message : String(error);
@@ -463,9 +648,12 @@ export class Controller {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
+    const shell = this.activeShell?.run;
+    shell?.cancel();
+    if (this.dialog?.kind === "auth") this.dialog.flow.dispose();
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = undefined;
-    this.closePromise = this.engine.close().finally(() => this.store.save());
+    this.closePromise = Promise.all([this.engine.close(), shell?.done]).then(() => {}).finally(() => this.store.save());
     return this.closePromise;
   }
 }

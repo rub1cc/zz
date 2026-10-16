@@ -95,9 +95,10 @@ function externalFixture() {
   mkdirSync(directory);
   const report = join(directory, "report.json");
   const script = join(directory, "fake editor.mjs");
-  writeFileSync(script, `import {readFileSync, writeFileSync} from 'node:fs';
+  writeFileSync(script, `import {readFileSync, writeFileSync, renameSync} from 'node:fs';
 const [report, mode, file] = process.argv.slice(2);
-writeFileSync(report, JSON.stringify({file, content: readFileSync(file, 'utf8')}));
+writeFileSync(report + '.tmp', JSON.stringify({file, content: readFileSync(file, 'utf8')}));
+renameSync(report + '.tmp', report);
 if (mode === 'wait') setInterval(() => {}, 1000);
 else {
   writeFileSync(file, '\\uFEFFedited\\r\\n日本語\\r\\n');

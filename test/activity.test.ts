@@ -23,3 +23,21 @@ test("tool projection pairs calls/results, updates live output, and never labels
   applyView(session, snapshot([call]));
   assert.equal(session.messages[0]!.tool!.status, "interrupted");
 });
+
+test("streaming thinking remains separate from replies and never exposes redacted payloads or signatures", () => {
+  const session: Session = { id: "thinking", projectId: "/project", title: "Thinking", status: "working", preview: "", createdAt: 1, updatedAt: 1, messages: [] };
+  const snapshot = (text: string) => ({ entries: [], docs: { "pi.live": { run: { taskId: 1, inputs: [1] }, generation: { message: {
+    role: "assistant", timestamp: 2, content: [{ type: "thinking", thinking: text, thinkingSignature: "opaque-live-signature" },
+      { type: "thinking", thinking: "hidden-encrypted-data", redacted: true, thinkingSignature: "encrypted" }],
+  } } } } } as unknown as ConversationView);
+  applyView(session, snapshot("partial reasoning"));
+  assert.equal(session.messages[0]?.role, "thinking");
+  const id = session.messages[0]?.thinking?.id;
+  assert.equal(session.messages[0]?.text, "partial reasoning");
+  applyView(session, snapshot("partial reasoning expanded"));
+  assert.equal(session.messages[0]?.thinking?.id, id);
+  assert.match(session.messages[0]?.text ?? "", /expanded/);
+  assert.equal(session.messages[1]?.thinking?.redacted, true);
+  assert.doesNotMatch(JSON.stringify(session.messages), /hidden-encrypted-data|opaque-live-signature|"encrypted"/);
+  assert.equal(session.status, "working");
+});

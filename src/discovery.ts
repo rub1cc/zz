@@ -19,8 +19,11 @@ export function composerCommands(session: boolean, selectedSession = false): Sla
     { name: "model", description: session ? "Choose this session's model" : "Choose the model for new tasks" },
     { name: "thinking", description: session ? "Choose this session's thinking level" : "Choose the thinking level for new tasks" },
     { name: "skills", description: "Find and load a skill" },
-    { name: "settings", description: "Configure busy-session replies, model and thinking" },
+    { name: "settings", description: "Configure replies, model, reasoning and auto-compaction" },
+    { name: "login", description: "Sign in to a provider (credentials shared with Pi)" },
+    { name: "logout", description: "Remove stored provider credentials from zz and Pi" },
     ...(session || selectedSession ? [
+      { name: "copy", description: "Copy response text (/copy [N], 1 = latest)" },
       { name: "session", description: `Context, tokens, cache and estimated cost for the ${session ? "open" : "selected"} session` },
       { name: "compact", description: `Summarize older context in the ${session ? "open" : "selected"} session (optional instructions)` },
       { name: "undo", description: "Choose a checkpoint to restore conversation and tracked file edits" },

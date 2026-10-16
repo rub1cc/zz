@@ -11,10 +11,12 @@ import {
 } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { CodingTools } from "@earendil-works/pi-durable/tools";
+import { createCodingTools } from "@earendil-works/pi-durable/tools";
 import type { Engine } from "./controller.js";
-import { compactionLabel, finishWork, isThinkingLevel, lastReply, markStopped, type AgentSettings, type CompactResult, type Message, type ModelOption, type PendingInput, type PreparedInput, type Project, type Session, type SessionStats, type SkillOption, type UndoResult, type UndoCheckpoint } from "./model.js";
-import { directory, Store } from "./store.js";
+import { compactionLabel, finishWork, isThinkingLevel, lastReply, markStopped, type ImageAttachment, type AgentSettings, type CompactResult, type Message, type ModelOption, type PendingInput, type PreparedInput, type Project, type Session, type SessionStats, type SkillOption, type UndoResult, type UndoCheckpoint } from "./model.js";
+import { directory, isImages, Store } from "./store.js";
+import { InstructionCatalog, INTERACTION_POLICY } from "./instructions.js";
+import { getImageProcessor, prepareImageFile, referencedImages, MAX_ATTACHMENTS } from "./attachments.js";
 import { SkillCatalog } from "./skills.js";
 import { generateSessionTitle } from "./title.js";
 import { contextEstimate, conversationUsage, sessionStats, sumUsage } from "./usage.js";
@@ -39,6 +41,20 @@ function skillEntry(data: unknown): { prompt: string; skill: NonNullable<Prepare
     && typeof value.skill.filePath === "string" && typeof value.skill.text === "string") return { prompt: value.prompt, skill: value.skill };
 }
 
+function imagesOf(message: ModelMessage, names: string[] = []): ImageAttachment[] | undefined {
+  if (typeof message.content === "string") return;
+  const images = message.content.filter((block) => block.type === "image")
+    .map((block, index) => ({ type: "image" as const, data: block.data, mimeType: block.mimeType, ...(names[index] ? { name: names[index] } : {}) }));
+  return images.length ? images : undefined;
+}
+
+function thinkingMessages(message: ModelMessage, id: string): Message[] {
+  if (message.role !== "assistant") return [];
+  return message.content.flatMap((block, index) => block.type === "thinking" ? [{ role: "thinking" as const,
+    text: block.redacted ? "Thinking was redacted by the provider." : block.thinking,
+    timestamp: message.timestamp, thinking: { id: `thinking:${id}:${index}`, ...(block.redacted ? { redacted: true } : {}) } }] : []);
+}
+
 export function applyView(session: Session, view: ConversationView, priorUsage?: Usage): void {
   const messages: Message[] = [];
   const usage = conversationUsage(view.docs["pi.usage"] as UsageState | undefined);
@@ -49,7 +65,8 @@ export function applyView(session: Session, view: ConversationView, priorUsage?:
     const skill = item.entry?.kind === "zz.skill" ? skillEntry(item.entry.data) : undefined;
     const text = skill?.prompt ?? (typeof item.content === "string" ? item.content
       : item.content.filter((block) => block.type === "text").map((block) => block.text).join("\n"));
-    return [{ id: item.id, text, mode: item.mode }];
+    const imageCount = typeof item.content === "string" ? 0 : item.content.filter((block) => block.type === "image").length;
+    return [{ id: item.id, text, mode: item.mode, ...(imageCount ? { imageCount } : {}) }];
   });
   session.queuedInputs = queued.length ? queued : undefined;
   const live = view.docs["pi.live"] as LiveState | undefined;
@@ -88,6 +105,7 @@ export function applyView(session: Session, view: ConversationView, priorUsage?:
           messages.push(call);
         }
         const tool = call.tool!;
+        tool.images = imagesOf(message, typeof tool.arguments.path === "string" ? [tool.arguments.path] : []);
         tool.output = message.content.map((block) => block.type === "text" ? block.text : `[Image: ${block.mimeType}]`).join("\n");
         tool.durationMs = message.durationMs;
         const diagnostics = entry.data && typeof entry.data === "object" && !Array.isArray(entry.data) ? entry.data.diagnostics : undefined;
@@ -99,14 +117,18 @@ export function applyView(session: Session, view: ConversationView, priorUsage?:
         if (message.toolName === "ask_user" && text) messages.push({ role: "assistant", text, timestamp: message.timestamp });
         continue;
       }
+      messages.push(...thinkingMessages(message, String(entry.id)));
+      const data = entry.data as { imageNames?: unknown } | undefined;
+      const imageNames = data && Array.isArray(data.imageNames) ? data.imageNames.filter((name): name is string => typeof name === "string") : [];
+      const images = imagesOf(message, imageNames);
       const loadedSkill = message.role === "user" && entry.kind === "zz.skill" ? skillEntry(entry.data) : undefined;
       if (loadedSkill) {
-        messages.push({ role: "user", text: loadedSkill.prompt, timestamp: message.timestamp },
+        messages.push({ role: "user", text: loadedSkill.prompt, timestamp: message.timestamp, ...(images ? { images } : {}) },
           { role: "tool", text: "", timestamp: message.timestamp, tool: {
             id: `skill:${entry.id}`, name: "load_skill", arguments: { name: loadedSkill.skill.name, path: loadedSkill.skill.filePath },
             output: loadedSkill.skill.text, status: "done",
           } });
-      } else if (text) messages.push({ role: message.role, text, timestamp: message.timestamp });
+      } else if (text || images) messages.push({ role: message.role, text, timestamp: message.timestamp, ...(images ? { images } : {}) });
       if (message.role === "assistant") {
         for (const call of message.content.filter((block) => block.type === "toolCall")) {
           const card: Message = { role: "tool", text: "", timestamp: message.timestamp, tool: {
@@ -130,6 +152,7 @@ export function applyView(session: Session, view: ConversationView, priorUsage?:
   }
   const partial = live?.generation?.message;
   if (partial) {
+    messages.push(...thinkingMessages(partial as ModelMessage, `live:${live?.run?.taskId ?? "generation"}`));
     const text = partial.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
     if (text) messages.push({ role: "assistant", text, timestamp: partial.timestamp });
   }
@@ -178,16 +201,19 @@ export class DurableEngine implements Engine {
     readonly undoHistory: UndoHistory,
   ) {}
 
-  static async open(store: Store, model: ModelRef | undefined, report: (error: unknown) => void, models?: Models, thinkingLevel: ModelThinkingLevel = "off", skills = new SkillCatalog()): Promise<DurableEngine> {
+  static async open(store: Store, model: ModelRef | undefined, report: (error: unknown) => void, models?: Models, thinkingLevel: ModelThinkingLevel = "off", skills = new SkillCatalog(), instructions = new InstructionCatalog()): Promise<DurableEngine> {
     models ??= await ModelRuntime.create({ allowModelNetwork: false });
     const registry = createRegistry();
-    registry.install(CodingTools);
+    registry.install(createCodingTools({ images: await getImageProcessor() }));
     const undoHistory = new UndoHistory(store.root);
     registry.install(undoHistory.extension);
     registry.install(defineExtension({
       name: "zz",
       sections: [
-        section("preamble", () => "You are a coding assistant working in a project directory. Inspect before editing, preserve existing changes, and verify your work. Use ask_user whenever you ask the user a question and expect an answer, including conversational or random questions, clarification, decisions, and approval requests. Put the question in the tool call rather than only in ordinary response text so the session waits for input. Do not use ask_user for rhetorical questions, quoted questions, or examples that do not need an answer. Otherwise finish with a concise report.", { tag: false }),
+        section("preamble", ({ agent }) => agent.cwd ? instructions.preamble(agent.cwd) : undefined, { tag: false }),
+        section("zz_behavior", () => INTERACTION_POLICY, { tag: false }),
+        section("addendum", ({ agent }) => agent.cwd ? instructions.append(agent.cwd) : undefined),
+        section("project_context", ({ agent }) => agent.cwd ? instructions.context(agent.cwd) : undefined),
         section("cwd", ({ env }) => env?.cwd),
         section("skills", ({ agent }) => agent.cwd ? skills.prompt(agent.cwd) : undefined, { tag: false }),
       ],
@@ -198,7 +224,7 @@ export class DurableEngine implements Engine {
       })],
     }));
     const harness = await Harness.open(await openNodeSqliteStorage(join(store.root, "sessions.sqlite")), {
-      models, registry, env: ({ cwd }) => {
+      models, registry, settings: { get compaction() { return store.compaction; } }, env: ({ cwd }) => {
         if (!cwd) throw new Error("Session has no project directory.");
         return new NodeExecutionEnv({ cwd: directory(cwd) });
       }, onReport: report,
@@ -218,6 +244,11 @@ export class DurableEngine implements Engine {
     const ref = this.configuration(session).model;
     const model = ref && this.models.getModel(ref.provider, ref.modelId);
     return session ? sessionStats(session, model?.contextWindow) : { contextWindow: model?.contextWindow };
+  }
+
+  supportsImages(session?: Session): boolean {
+    const ref = this.configuration(session).model;
+    return !!(ref && this.models.getModel(ref.provider, ref.modelId)?.input.includes("image"));
   }
 
   async listModels(): Promise<ModelOption[]> {
@@ -240,7 +271,7 @@ export class DurableEngine implements Engine {
     if (!next.model) throw new Error("Choose a model first with /model.");
     const model = this.models.getModel(next.model.provider, next.model.modelId);
     if (!model) throw new Error("This model is no longer in Pi's catalog.");
-    if (!await this.models.checkAuth(model.provider)) throw new Error(`Run pi and /login for ${model.provider}, then restart zz.`);
+    if (!await this.models.checkAuth(model.provider)) throw new Error(`Use /login ${model.provider} to configure this provider.`);
     if (!thinkingOnly && session && (this.active.has(session.id) || session.compactions?.length || this.manualCompactions.has(session.id))) throw new Error("Wait for this session to finish first.");
     if (!isThinkingLevel(next.thinkingLevel)) throw new Error("Invalid thinking level.");
     if (change.thinkingLevel && !getSupportedThinkingLevels(model).includes(change.thinkingLevel)) {
@@ -380,7 +411,7 @@ export class DurableEngine implements Engine {
     this.titles.set(session.id, { abort, done });
   }
 
-  async run(session: Session, project: Project, prompt: string, changed: () => void): Promise<void> {
+  async run(session: Session, project: Project, prompt: string, changed: () => void, images: ImageAttachment[] = []): Promise<void> {
     if (this.closing) throw new Error("zz is closing.");
     if (this.undoProjects.has(session.projectId)) throw new Error("This project is being restored. Wait for /undo to finish.");
     if (this.pendingUndo(session.projectId)) throw new Error("An interrupted /undo in this project must finish before sending another prompt. Retry /undo.");
@@ -388,7 +419,8 @@ export class DurableEngine implements Engine {
     delete session.stopped;
     if (!session.pendingInput && session.work?.finishedAt !== undefined) session.work = undefined;
     session.work ??= { startedAt: Date.now() };
-    const input: PendingInput = { requestId: randomUUID(), prompt, whenBusy: this.store.settings.replyBehavior };
+    if (!isImages(images)) throw new Error("Invalid image attachments; paste an image or use an @image path.");
+    const input: PendingInput = { requestId: randomUUID(), prompt, ...(images.length ? { images: structuredClone(images) } : {}), whenBusy: this.store.settings.replyBehavior };
     if (!session.pendingInput) session.pendingInput = input;
     else (session.followUps ??= []).push(input);
     this.store.save();
@@ -435,16 +467,25 @@ export class DurableEngine implements Engine {
   private async admit(session: Session, project: Project, input: PendingInput, changed: () => void): Promise<Submission | undefined> {
     if (this.closing || this.stopping.has(session.id)) return;
     if (!input.prepared) {
-      input.prepared = await this.skills.prepare(project.path, input.prompt);
+      const references = referencedImages(input.prompt);
+      if ((input.images?.length ?? 0) + references.length > MAX_ATTACHMENTS) throw new Error(`Attach at most ${MAX_ATTACHMENTS} images per message.`);
+      const images = await Promise.all(references.map((path) => prepareImageFile(path, project.path)));
+      // Save bytes with the prepared input: queued work and crash recovery never reread mutable source files.
+      const prepared = await this.skills.prepare(project.path, input.prompt);
+      input.images = [...(input.images ?? []), ...images];
+      input.prepared = prepared;
       this.store.save();
+    }
+    if (input.images?.length) {
+      if (!this.supportsImages(session)) throw new Error("This model does not accept images. Choose an image-capable model with /model, then resend.");
     }
     let conversation = this.handles.get(session.id);
     if (!conversation) {
       const config = this.configuration(session);
-      if (!config.model) throw new Error("No Pi login found. Run pi, use /login, select a model with /model, then restart zz.");
+      if (!config.model) throw new Error("No model configured. Use /login to sign in, then /model to select a model.");
       const model = this.models.getModel(config.model.provider, config.model.modelId);
       if (!model) throw new Error(`Unknown model ${config.model.provider}/${config.model.modelId}. Choose one with --model.`);
-      if (!await this.models.checkAuth(config.model.provider)) throw new Error(`Not logged in to ${config.model.provider} in Pi. Run pi and /login, then restart zz.`);
+      if (!await this.models.checkAuth(config.model.provider)) throw new Error(`Not logged in to ${config.model.provider}. Use /login ${config.model.provider}.`);
       config.thinkingLevel = clampThinkingLevel(model, this.configuration(session).thinkingLevel);
       if (this.closing || this.stopping.has(session.id)) return;
       conversation = await this.harness.createConversation({
@@ -461,8 +502,8 @@ export class DurableEngine implements Engine {
     if (this.closing || this.stopping.has(session.id)) return;
     await this.observe(session, conversation, changed);
     if (this.closing || this.stopping.has(session.id)) return;
-    return conversation.submit({ type: "input", content: input.prepared.content, requestId: input.requestId, whenBusy: input.whenBusy ?? "followUp",
-      entry: input.prepared.skill ? { kind: "zz.skill", data: { prompt: input.prompt, skill: input.prepared.skill } } : undefined,
+    return conversation.submit({ type: "input", content: input.images?.length ? [{ type: "text", text: input.prepared.content }, ...input.images.map(({ data, mimeType }) => ({ type: "image" as const, data, mimeType }))] : input.prepared.content, requestId: input.requestId, whenBusy: input.whenBusy ?? "followUp",
+      entry: input.prepared.skill || input.images?.length ? { kind: input.prepared.skill ? "zz.skill" : "zz.input", data: { prompt: input.prompt, ...(input.prepared.skill ? { skill: input.prepared.skill } : {}), ...(input.images?.length ? { imageNames: input.images.map((image) => image.name ?? "image") } : {}) } } : undefined,
     }, ctx);
   }
 

@@ -1,7 +1,9 @@
 import { Markdown, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { renderShellResponse } from "./shell-response.js";
+import { ImageDisplay } from "./image-display.js";
 import type { Controller } from "./controller.js";
 import { accent, bold, dim, fit, green, markdownTheme, oneLine, plain, shimmer, warning, workingIcon } from "./format.js";
-import { compactionLabel, type Message, type Session, type ToolActivity } from "./model.js";
+import { transcriptMessages, lastReplyMessage, compactionLabel, type Message, type Session, type ToolActivity } from "./model.js";
 
 const userStyle = {
   color: (text: string) => `\x1b[38;2;32;32;32m${text}\x1b[39m`,
@@ -34,12 +36,14 @@ export class Transcript implements Component {
   private sessionId?: string;
   private cache: { text: string; role: Message["role"]; renderer: Markdown }[] = [];
   private expanded = new Set<string>();
+  private collapsedThinking = new Set<string>();
+  private readonly images: ImageDisplay;
   private ids: string[] = [];
   private hits = new Map<number, string>();
   readonly positions = new Map<string, number>();
   selected?: string;
 
-  constructor(readonly controller: Controller, readonly changed: () => void) {}
+  constructor(readonly controller: Controller, readonly changed: () => void) { this.images = new ImageDisplay(changed); }
 
   move(delta: number): void {
     if (!this.ids.length) return;
@@ -54,12 +58,17 @@ export class Transcript implements Component {
     const id = this.selected ?? this.ids.at(-1);
     if (!id) return;
     this.selected = id;
-    if (expand ?? !this.expanded.has(id)) this.expanded.add(id); else this.expanded.delete(id);
+    if (id.startsWith("thinking:")) {
+      if (expand ?? this.collapsedThinking.has(id)) this.collapsedThinking.delete(id); else this.collapsedThinking.add(id);
+    } else if (expand ?? !this.expanded.has(id)) this.expanded.add(id); else this.expanded.delete(id);
     this.changed();
   }
 
   toggleAll(expand: boolean): void {
-    for (const id of this.ids) { if (expand) this.expanded.add(id); else this.expanded.delete(id); }
+    for (const id of this.ids) {
+      if (id.startsWith("thinking:")) { if (expand) this.collapsedThinking.delete(id); else this.collapsedThinking.add(id); }
+      else { if (expand) this.expanded.add(id); else this.expanded.delete(id); }
+    }
     this.changed();
   }
 
@@ -67,12 +76,29 @@ export class Transcript implements Component {
     const session = this.controller.opened;
     if (!session) return [];
     if (this.sessionId !== session.id) {
-      this.sessionId = session.id; this.cache = []; this.expanded.clear(); this.selected = undefined;
+      this.sessionId = session.id; this.cache = []; this.expanded.clear(); this.collapsedThinking.clear(); this.images.clear(); this.selected = undefined;
     }
     this.ids = []; this.hits.clear(); this.positions.clear();
-    this.cache.length = session.messages.length;
+    const messages = transcriptMessages(session);
+    this.cache.length = messages.length;
     const lines: string[] = [];
-    for (const [index, message] of session.messages.entries()) {
+    for (const [index, message] of messages.entries()) {
+      if (message.role === "shell") {
+        lines.push(...renderShellResponse(message.shell, Math.max(1, width - 4)).map((line) => `  ${line}`), "");
+        continue;
+      }
+      if (message.role === "thinking") {
+        if (this.controller.store.settings.showThinking === false) continue;
+        const id = message.thinking?.id ?? `thinking:${index}:${message.timestamp}`;
+        this.ids.push(id); this.positions.set(id, lines.length); this.hits.set(lines.length, id);
+        const open = !this.collapsedThinking.has(id);
+        lines.push(`  ${this.selected === id ? accent(">") : " "} ${dim(open ? "[-]" : "[+]")} ${dim(message.thinking?.redacted ? "Thinking (redacted)" : "Thinking")}`);
+        if (open) {
+          const text = message.thinking?.redacted ? "Thinking was redacted by the provider." : message.text;
+          for (const source of plain(text).split("\n")) lines.push(...wrapTextWithAnsi(source.replaceAll("\t", "  "), Math.max(1, width - 6)).map((line) => `      ${dim(line)}`));
+        }
+        lines.push(""); continue;
+      }
       if (message.role === "tool") {
         const tool = message.tool ?? { id: `legacy:${index}:${message.timestamp}`, name: "Tool output", arguments: {}, output: message.text, status: "done" };
         const id = tool.id;
@@ -94,6 +120,7 @@ export class Transcript implements Component {
           };
           if (Object.keys(tool.arguments).length) section("Arguments", JSON.stringify(tool.arguments, null, 2));
           section("Output", tool.output || (tool.status === "running" || tool.status === "pending" ? "Waiting for output..." : "No text output."));
+          if (tool.images?.length) lines.push(...this.images.render(tool.images, `tool:${tool.id}`, Math.max(1, width - 2)));
           const details = JSON.stringify(tool.details, (_key, value) => value && typeof value === "object"
             && Object.keys(value).length === 0 ? undefined : value, 2);
           if (details && details !== "{}") section("Details", details);
@@ -109,7 +136,9 @@ export class Transcript implements Component {
         this.cache[index] = cached;
       }
       if (message.role === "error") lines.push(`  ${warning("Error")}`);
-      lines.push(...cached.renderer.render(Math.max(1, width - 4)).map((line) => `  ${line}`), "");
+      if (message.text) lines.push(...cached.renderer.render(Math.max(1, width - 4)).map((line) => `  ${line}`));
+      if (message.images?.length) lines.push(...this.images.render(message.images, `message:${index}:${message.timestamp}`, Math.max(1, width - 2)));
+      lines.push("");
     }
     if (this.selected && !this.ids.includes(this.selected)) this.selected = undefined;
     const compacting = compactionLabel(session);
@@ -121,14 +150,14 @@ export class Transcript implements Component {
       lines.push(`  ${accent(`${label} (${session.queuedInputs.length})`)}`);
       for (const [index, input] of session.queuedInputs.entries()) {
         const mode = modes.size > 1 ? `[${input.mode === "steer" ? "steer" : "follow-up"}] ` : "";
-        for (const [lineIndex, source] of plain(input.text).split("\n").entries()) {
+        for (const [lineIndex, source] of plain(`${input.text}${input.imageCount ? ` [${input.imageCount} image${input.imageCount === 1 ? "" : "s"}]` : ""}`).split("\n").entries()) {
           const prefix = lineIndex === 0 ? `${index + 1}. ${mode}` : "   ";
           lines.push(...wrapTextWithAnsi(`${prefix}${source}`, Math.max(1, width - 4)).map((line) => `  ${dim(line)}`));
         }
       }
       lines.push("");
     }
-    const status = workLabel(session);
+    const status = session.status !== "working" && lastReplyMessage(session)?.role === "shell" ? undefined : workLabel(session);
     if (status) lines.push(`  ${status}`, "");
     return lines.map((line) => fit(line, width));
   }
@@ -140,5 +169,5 @@ export class Transcript implements Component {
     return { handled: true, render: true };
   }
 
-  invalidate(): void { for (const cached of this.cache) cached?.renderer.invalidate(); }
+  invalidate(): void { for (const cached of this.cache) cached?.renderer.invalidate(); this.images.invalidate(); }
 }

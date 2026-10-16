@@ -84,7 +84,7 @@ export class SettingsDialog implements Component, Focusable {
       : dim(this.items.length ? "ctrl+n/p or arrows / enter select / esc cancel"
         : this.dialog.kind === "thinking" ? "Choose an available model with /model first. esc to close."
           : this.dialog.kind === "skills" ? "No skills found. Add a SKILL.md file to .pi/skills or ~/.agents/skills."
-          : "No available models. Run pi and /login, then restart zz."));
+          : "No available models. Close this picker and use /login."));
     return [`+${"-".repeat(Math.max(0, width - 2))}+`, ...lines.map((line) => `| ${pad(fit(line, inner), inner)} |`),
       `+${"-".repeat(Math.max(0, width - 2))}+`].map((line) => fit(line, width));
   }

@@ -1,5 +1,5 @@
-import type { ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
-import type { CompactionFailure, CompactionStatus, ModelRef } from "@earendil-works/pi-durable";
+import type { ImageContent, ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
+import type { CompactionFailure, CompactionStatus, CompactionPolicy, ModelRef } from "@earendil-works/pi-durable";
 
 export type CompactResult = "compacted" | "unchanged" | "stale" | "aborted";
 export interface UndoResult { prompt: string; files: number; shell: boolean }
@@ -30,7 +30,10 @@ export interface ModelOption extends ModelRef {
   thinkingLevels: ModelThinkingLevel[];
 }
 
+export interface ImageAttachment extends ImageContent { name?: string }
+
 export interface ToolActivity {
+  images?: ImageAttachment[];
   id: string;
   name: string;
   arguments: Record<string, unknown>;
@@ -58,11 +61,15 @@ export function isReplyBehavior(value: unknown): value is ReplyBehavior {
 
 export interface AppSettings {
   replyBehavior: ReplyBehavior;
+  showThinking?: boolean;
+  compaction?: Partial<CompactionPolicy>;
 }
 
-export type SettingsSelection = "replyBehavior" | "model" | "thinking";
+export type SettingsSelection = "replyBehavior" | "model" | "thinking" | "showThinking" | "autoCompaction"
+  | "reserveTokens" | "keepRecentTokens" | "backgroundTokens";
 
 export interface PendingInput {
+  images?: ImageAttachment[];
   requestId: string;
   prompt: string;
   prepared?: PreparedInput;
@@ -78,11 +85,29 @@ export interface Project {
 }
 
 export interface Message {
-  role: "user" | "assistant" | "tool" | "error";
+  role: "user" | "assistant" | "tool" | "error" | "thinking";
+  thinking?: { id: string; redacted?: boolean };
+  images?: ImageAttachment[];
   text: string;
   timestamp: number;
   tool?: ToolActivity;
 }
+
+export interface ShellResponse {
+  id: string;
+  command: string;
+  cwd: string;
+  text: string;
+  timestamp: number;
+  updatedAt: number;
+  status: "running" | "stopping" | "done" | "failed" | "cancelled" | "interrupted";
+  exitCode?: number;
+  error?: string;
+  droppedBytes: number;
+  droppedLines: number;
+}
+
+export type TranscriptMessage = Message | { role: "shell"; text: string; timestamp: number; shell: ShellResponse };
 
 export interface ContextEstimate {
   tokens: number;
@@ -97,6 +122,8 @@ export interface SessionStats {
 }
 
 export interface Session {
+  /** Local display history, never submitted to the model or replayed as commands. */
+  shellResponses?: ShellResponse[];
   /** Cached durable activity, refreshed from pi.live on restore. Independent of the agent run. */
   compactions?: CompactionStatus[];
   compactionFailure?: CompactionFailure;
@@ -111,7 +138,7 @@ export interface Session {
   /** Additional outstanding submissions, including inputs awaiting durable admission. */
   followUps?: PendingInput[];
   /** Presentation cache of native pi.inbox inputs, rebuilt from the durable view. */
-  queuedInputs?: { id: number; text: string; mode?: ReplyBehavior }[];
+  queuedInputs?: { id: number; text: string; mode?: ReplyBehavior; imageCount?: number }[];
   agent?: AgentSettings;
   projectId: string;
   title: string;
@@ -164,7 +191,7 @@ export function rows(state: State, projectsOnly = false): Row[] {
     { kind: "project", project },
     ...(projectsOnly ? [] : state.sessions
       .filter((session) => session.projectId === project.id)
-      .sort((a, b) => order[a.status] - order[b.status] || b.createdAt - a.createdAt)
+      .sort((a, b) => order[displayStatus(a)] - order[displayStatus(b)] || b.createdAt - a.createdAt)
       .map((session): Row => ({ kind: "session", project, session }))),
   ]);
 }
@@ -173,9 +200,54 @@ export function rowId(row: Row): string {
   return row.kind === "project" ? `project:${row.project.id}` : `session:${row.session.id}`;
 }
 
+function shellMessage(shell: ShellResponse): TranscriptMessage {
+  return { role: "shell", text: shell.text, timestamp: shell.timestamp, shell };
+}
+
+/** Merge local responses without changing the durable transcript's native message ordering. */
+export function transcriptMessages(session: Session): TranscriptMessage[] {
+  if (!session.shellResponses?.length) return session.messages;
+  const shells = [...session.shellResponses].sort((a, b) => a.timestamp - b.timestamp);
+  const merged: TranscriptMessage[] = [];
+  let next = 0;
+  for (const message of session.messages) {
+    while (next < shells.length && shells[next]!.timestamp < message.timestamp) merged.push(shellMessage(shells[next++]!));
+    merged.push(message);
+  }
+  while (next < shells.length) merged.push(shellMessage(shells[next++]!));
+  return merged;
+}
+
+export function lastReplyMessage(session: Session): TranscriptMessage | undefined {
+  const reply = session.messages.findLast((message) => message.role === "assistant" || message.role === "error");
+  const shell = session.shellResponses?.at(-1);
+  return shell && (!reply || shell.timestamp >= reply.timestamp) ? shellMessage(shell) : reply;
+}
+
 export function lastReply(session: Session): string {
-  return session.messages.findLast((message) => message.role === "assistant" || message.role === "error")?.text
-    || (session.status === "working" ? "The agent is working. No reply yet." : "No agent reply yet.");
+  const reply = lastReplyMessage(session);
+  if (reply?.role === "shell") return reply.text || reply.shell.error
+    || (reply.shell.status === "running" || reply.shell.status === "stopping" ? "Running shell command..."
+      : reply.shell.status === "interrupted" ? "Shell command interrupted; not restarted."
+      : reply.shell.status === "cancelled" ? "Shell command cancelled." : "No output.");
+  return reply?.text || (session.status === "working" ? "The agent is working. No reply yet." : "No agent reply yet.");
+}
+
+export function displayStatus(session: Session): SessionStatus {
+  if (session.status === "working" || session.shellResponses?.some((shell) => shell.status === "running" || shell.status === "stopping")) return "working";
+  const reply = lastReplyMessage(session);
+  if (reply?.role !== "shell") return session.status;
+  return reply.shell.status === "failed" ? "failed" : reply.shell.status === "cancelled" || reply.shell.status === "interrupted" ? "paused" : "completed";
+}
+
+export function activityTimestamp(session: Session): number {
+  return Math.max(session.updatedAt, session.shellResponses?.at(-1)?.updatedAt ?? 0);
+}
+
+export function sessionPreview(session: Session): string {
+  if (session.status === "working" || session.compactions?.length) return session.preview;
+  const reply = lastReplyMessage(session);
+  return reply?.role === "shell" ? `!${reply.shell.command.trim()} / ${lastReply(session)}`.replace(/\s+/g, " ").slice(0, 250) : session.preview;
 }
 
 export function age(timestamp: number, now = Date.now()): string {

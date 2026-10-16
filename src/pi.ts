@@ -3,6 +3,7 @@ import { getAgentDir, ModelRuntime, SettingsManager } from "@earendil-works/pi-c
 import type { Models } from "@earendil-works/pi-ai/models";
 import type { ModelRef } from "@earendil-works/pi-durable";
 import { clampThinkingLevel } from "@earendil-works/pi-ai/models";
+import type { AuthAccess } from "./auth.js";
 import { isThinkingLevel } from "./model.js";
 
 export async function selectPiModel(
@@ -45,5 +46,6 @@ export async function loadPi(cwd: string, override?: string, agentDir = getAgent
   if (!isThinkingLevel(preferred)) throw new Error("Thinking must be off, minimal, low, medium, high, xhigh, or max.");
   const catalogModel = model && models.getModel(model.provider, model.modelId);
   const thinkingLevel = catalogModel ? clampThinkingLevel(catalogModel, preferred) : preferred;
-  return { models, model, thinkingLevel };
+  const auth: AuthAccess = { runtime: models, options: { getDeviceId: () => settings.getOrCreateDeviceId(), agentName: "zz" } };
+  return { models, model, thinkingLevel, auth };
 }

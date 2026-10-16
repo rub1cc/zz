@@ -5,13 +5,18 @@ import { test } from "node:test";
 import { createModels, type Provider } from "@earendil-works/pi-ai/models";
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
-import type { AssistantMessage, Context, SimpleStreamOptions, TextContent, ToolCall, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Context, SimpleStreamOptions, ThinkingContent, TextContent, ToolCall, Usage } from "@earendil-works/pi-ai";
 import { InboxDoc, type ConversationId } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
+import { Controller } from "../src/controller.js";
+import { lastReply, transcriptMessages } from "../src/model.js";
 import { DurableEngine } from "../src/engine.js";
 import type { Project, Session } from "../src/model.js";
 import { Store } from "../src/store.js";
+import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
+import { InstructionCatalog } from "../src/instructions.js";
+import { image, png } from "./image-fixtures.js";
 import { SkillCatalog } from "../src/skills.js";
 import { UndoDoc } from "../src/undo.js";
 import { temporary, tick } from "./helpers.js";
@@ -33,19 +38,20 @@ function session(project: Project, id: string): Session {
   return { id, projectId: project.id, title: id, status: "working", preview: "Starting", createdAt: Date.now(), updatedAt: Date.now(), messages: [] };
 }
 
-function models(options: { pause?: boolean; finish?: (done: (failure?: string, content?: (TextContent | ToolCall)[]) => void) => void; overflow?: boolean; started?: () => void; context?: (context: Context) => void; request?: (id: string, reasoning: SimpleStreamOptions["reasoning"]) => void;
-  usage?: Usage; titleUsage?: Usage; contextWindow?: number;
-  reply?: (context: Context) => (TextContent | ToolCall)[];
-  compaction?: { fail?: boolean; pause?: boolean; started?: () => void; context?: (context: Context) => void; usage?: Usage };
+function models(options: { pause?: boolean; finish?: (done: (failure?: string, content?: (TextContent | ThinkingContent | ToolCall)[]) => void) => void; overflow?: boolean; started?: () => void; context?: (context: Context) => void; request?: (id: string, reasoning: SimpleStreamOptions["reasoning"]) => void;
+  usage?: Usage; titleUsage?: Usage; contextWindow?: number; imageInput?: boolean;
+  reply?: (context: Context) => (TextContent | ThinkingContent | ToolCall)[];
+  compaction?: { fail?: boolean; pause?: boolean; started?: () => void; context?: (context: Context) => void; request?: (options?: SimpleStreamOptions) => void; usage?: Usage };
   title?: { text?: string; fail?: boolean; pause?: boolean; ignoreAbort?: boolean; finish?: (done: () => void) => void; context?: (context: Context) => void } } = {}) {
   const models = createModels();
   const model = { ...getBuiltinModel("openai", "gpt-4.1"), provider: "test", id: "mock",
-    ...(options.contextWindow === undefined ? {} : { contextWindow: options.contextWindow }) };
+    ...(options.contextWindow === undefined ? {} : { contextWindow: options.contextWindow }),
+    ...(options.imageInput === false ? { input: ["text" as const] } : {}) };
   const stream = (_model: unknown, context: Context, request?: SimpleStreamOptions) => {
     const isTitle = context.messages.some((m) => m.role === "system" && typeof m.content === "string" && m.content.startsWith("Generate a short session title"));
     const isCompaction = context.messages.some((m) => m.role === "system" && typeof m.content === "string" && m.content.startsWith("You are a context summarization assistant"));
     if (isTitle) options.title?.context?.(context);
-    else if (isCompaction) options.compaction?.context?.(context);
+    else if (isCompaction) { options.compaction?.context?.(context); options.compaction?.request?.(request); }
     else {
       options.context?.(context);
       options.request?.((_model as { id: string }).id, request?.reasoning);
@@ -114,7 +120,7 @@ function models(options: { pause?: boolean; finish?: (done: (failure?: string, c
         events.push({ type: "error", reason: "error", error: message });
         return;
       }
-      const content: (TextContent | ToolCall)[] = options.reply?.(context) ?? (last?.role === "toolResult"
+      const content: (TextContent | ThinkingContent | ToolCall)[] = options.reply?.(context) ?? (last?.role === "toolResult"
         ? [{ type: "text", text: `Read: ${last.content.filter((b) => b.type === "text").map((b) => b.text).join("")}` }]
         : last?.content === "long-shell"
           ? [{ type: "toolCall", id: "sleep-call", name: "bash", arguments: { command: "printf 'SHELL_STARTED\\n'; sleep 30; printf 'SHOULD_NOT_FINISH\\n'" } }]
@@ -1069,7 +1075,7 @@ test("configured steering joins the live run at a tool boundary ahead of queued 
   writeFileSync(join(temp.root, "marker.txt"), "marker");
   const s = session(project, "steering"); store.state.sessions.push(s);
   const contexts: Context[] = [];
-  const finish: ((failure?: string, content?: (TextContent | ToolCall)[]) => void)[] = [];
+  const finish: ((failure?: string, content?: (TextContent | ThinkingContent | ToolCall)[]) => void)[] = [];
   const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)), models({
     pause: true, finish: (done) => finish.push(done), context: (context) => contexts.push(context),
   }));
@@ -1307,7 +1313,7 @@ test("undo rewinds a shell turn's conversation but reports shell effects as not 
 });
 
 test("steering messages share the original turn's undo checkpoint", async () => {
-  const finishes: ((failure?: string, content?: (TextContent | ToolCall)[]) => void)[] = [];
+  const finishes: ((failure?: string, content?: (TextContent | ThinkingContent | ToolCall)[]) => void)[] = [];
   const f = await undoFixture(models({ pause: true, finish: (done) => finishes.push(done) }));
   try {
     f.store.state.settings = { replyBehavior: "steer" };
@@ -1467,4 +1473,277 @@ test("crash recovery resumes the selected older checkpoint, not the latest, and 
     assert.deepEqual((await engine.undoCheckpoints(restored)).map((point) => point.id), [choices[2]!.id]);
     assert.deepEqual(f.errors, []);
   } finally { await engine.close(); f.cleanup(); }
+});
+
+test("durable requests load per-project instruction files, refresh edits/removals and reload correctly after restart", async () => {
+  const f = temporary(); const store = new Store(join(f.root, "data"));
+  const a = join(f.root, "a"); const b = join(f.root, "b"); const agent = join(f.root, "agent");
+  for (const path of [join(a, ".pi"), b, agent]) mkdirSync(path, { recursive: true });
+  writeFileSync(join(agent, "AGENTS.md"), "GLOBAL_CONTEXT");
+  writeFileSync(join(agent, "APPEND_SYSTEM.md"), "GLOBAL_APPEND");
+  writeFileSync(join(a, "AGENTS.md"), "CONTEXT_A_FIRST");
+  writeFileSync(join(b, "AGENTS.md"), "CONTEXT_B_ONLY");
+  writeFileSync(join(a, ".pi", "SYSTEM.md"), "CUSTOM_A_SYSTEM");
+  writeFileSync(join(a, ".pi", "APPEND_SYSTEM.md"), "CUSTOM_A_APPEND");
+  const projects = [store.addProject(a), store.addProject(b)];
+  const sessions = projects.map((p, i) => session(p, `instructions-${i}`)); store.state.sessions.push(...sessions);
+  const requests: string[] = []; const errors: unknown[] = [];
+  const makeModels = () => models({ context: (context) => requests.push(getCurrentSystemPrompt(context.messages)) });
+  let engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => errors.push(error), makeModels(), "off", undefined, new InstructionCatalog(agent));
+  try {
+    await engine.run(sessions[0]!, projects[0]!, "first", () => {});
+    assert.match(requests[0]!, /GLOBAL_CONTEXT/); assert.match(requests[0]!, /CONTEXT_A_FIRST/);
+    assert.match(requests[0]!, /CUSTOM_A_SYSTEM/); assert.match(requests[0]!, /CUSTOM_A_APPEND/);
+    assert.doesNotMatch(requests[0]!, /CONTEXT_B_ONLY|GLOBAL_APPEND|Inspect before editing/);
+    assert.match(requests[0]!, /Use ask_user whenever/);
+    await engine.run(sessions[1]!, projects[1]!, "second", () => {});
+    assert.match(requests[1]!, /CONTEXT_B_ONLY/); assert.match(requests[1]!, /GLOBAL_APPEND/);
+    assert.doesNotMatch(requests[1]!, /CONTEXT_A_FIRST|CUSTOM_A_SYSTEM/);
+    writeFileSync(join(a, "AGENTS.md"), "CONTEXT_A_UPDATED"); unlinkSync(join(a, ".pi", "APPEND_SYSTEM.md"));
+    await engine.run(sessions[0]!, projects[0]!, "next request", () => {});
+    assert.match(requests[2]!, /CONTEXT_A_UPDATED/); assert.match(requests[2]!, /GLOBAL_APPEND/);
+    assert.doesNotMatch(requests[2]!, /CONTEXT_A_FIRST|CUSTOM_A_APPEND/);
+    await engine.close();
+    const restored = new Store(store.root);
+    writeFileSync(join(a, ".pi", "SYSTEM.md"), "RESTARTED_SYSTEM");
+    engine = await openEngine(restored, { provider: "test", modelId: "mock" }, (error) => errors.push(error), makeModels(), "off", undefined, new InstructionCatalog(agent));
+    await engine.restore(() => {}); await engine.run(restored.state.sessions[0]!, projects[0]!, "after restart", () => {});
+    assert.match(requests[3]!, /RESTARTED_SYSTEM/); assert.doesNotMatch(requests[3]!, /CUSTOM_A_SYSTEM/);
+    assert.deepEqual(errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("image attachments and explicit image references reach the model and persist alongside returned thinking", async () => {
+  const f = temporary(); const store = new Store(join(f.root, "data")); const project = store.addProject(f.root);
+  const s = session(project, "images-and-thinking"); store.state.sessions.push(s);
+  writeFileSync(join(f.root, "photo with spaces.png"), png());
+  const requests: Context[] = [];
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models({
+    context: (context) => requests.push(context), reply: () => [{ type: "thinking", thinking: "Visible reasoning", thinkingSignature: "opaque-signature" },
+      { type: "thinking", thinking: "encrypted-sensitive-payload", redacted: true, thinkingSignature: "encrypted-signature" },
+      { type: "text", text: "Visible answer" }],
+  }));
+  try {
+    await engine.run(s, project, 'Compare @"photo with spaces.png"', () => {}, [image]);
+    const message = requests[0]!.messages.findLast((message) => message.role === "user")!;
+    assert.ok(Array.isArray(message.content));
+    assert.equal(message.content.filter((block) => block.type === "image").length, 2);
+    assert.deepEqual(s.messages.find((message) => message.role === "user")?.images?.map((image) => image.name), ["sample.png", "photo with spaces.png"]);
+    assert.match(s.messages.find((message) => message.role === "thinking")?.text ?? "", /Visible reasoning/);
+    assert.equal(s.messages.find((message) => message.thinking?.redacted)?.text, "Thinking was redacted by the provider.");
+    assert.equal(s.messages.at(-1)?.text, "Visible answer");
+    store.save();
+    assert.doesNotMatch(readFileSync(store.file, "utf8"), /encrypted-sensitive-payload|opaque-signature|encrypted-signature/);
+    assert.deepEqual(new Store(store.root).state.sessions[0]?.messages, s.messages);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("agent image reads use the image processor and retain viewable tool-result images", async () => {
+  const f = temporary(); const store = new Store(join(f.root, "data")); const project = store.addProject(f.root);
+  const s = session(project, "image-read"); store.state.sessions.push(s);
+  writeFileSync(join(f.root, "photo.png"), png(4000, 2));
+  const requests: Context[] = [];
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models({
+    context: (context) => requests.push(context), reply: (context) => context.messages.at(-1)?.role === "toolResult"
+      ? [{ type: "text", text: "I saw the image" }] : [{ type: "toolCall", id: "read-image", name: "read", arguments: { path: "photo.png" } }],
+  }));
+  try {
+    await engine.run(s, project, "inspect the picture", () => {});
+    assert.equal(s.messages.find((message) => message.tool?.name === "read")?.tool?.images?.length, 1);
+    const result = requests[1]!.messages.findLast((message) => message.role === "toolResult")!;
+    assert.ok(Array.isArray(result.content) && result.content.some((block) => block.type === "image"));
+    assert.equal(s.messages.at(-1)?.text, "I saw the image");
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("queued image snapshots survive restart and source deletion without duplicate inputs", { timeout: 10_000 }, async () => {
+  const f = temporary(); const store = new Store(join(f.root, "data")); const project = store.addProject(f.root);
+  const s = session(project, "queued-images"); store.state.sessions.push(s);
+  writeFileSync(join(f.root, "queued.png"), png());
+  let started = false; const requests: Context[] = [];
+  let engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models({ pause: true, started: () => { started = true; } }));
+  try {
+    const running = engine.run(s, project, "initial", () => {}); await until(() => started);
+    const queued = engine.run(s, project, "look @queued.png", () => {});
+    await until(() => s.queuedInputs?.[0]?.imageCount === 1);
+    assert.equal(s.followUps?.[0]?.images?.length, 1);
+    unlinkSync(join(f.root, "queued.png"));
+    await engine.close(); await Promise.all([running, queued]);
+    const restored = new Store(store.root); const recovered = restored.state.sessions[0]!;
+    assert.equal(recovered.followUps?.[0]?.images?.length, 1);
+    engine = await openEngine(restored, { provider: "test", modelId: "mock" }, () => {}, models({ context: (context) => requests.push(context) }));
+    await engine.restore(() => {}); await until(() => recovered.status === "completed" && !recovered.pendingInput);
+    assert.deepEqual(recovered.messages.filter((message) => message.role === "user").map((message) => message.text), ["initial", "look @queued.png"]);
+    assert.equal(recovered.messages.find((message) => message.role === "user" && message.images?.length)?.images?.[0]?.data, image.data);
+    assert.ok(requests.some((context) => context.messages.some((message) => message.role === "user" && Array.isArray(message.content) && message.content.some((block) => block.type === "image"))));
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("text-only models reject attachments explicitly instead of silently dropping them", async () => {
+  const f = temporary(); const store = new Store(join(f.root, "data")); const project = store.addProject(f.root);
+  const s = session(project, "no-vision"); store.state.sessions.push(s);
+  let requests = 0;
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models({ imageInput: false, context: () => { requests++; } }));
+  try {
+    await engine.run(s, project, "look", () => {}, [image]);
+    assert.equal(s.status, "failed"); assert.match(s.preview, /does not accept images/);
+    assert.equal(requests, 0); assert.equal(s.conversationId, undefined);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("local shell responses survive durable projections and restart without entering model context", async () => {
+  const f = temporary(); const store = new Store(join(f.root, "data")); const project = store.addProject(f.root);
+  const requests: Context[] = []; const errors: unknown[] = [];
+  let engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => errors.push(error), models({ context: (context) => requests.push(context) }));
+  let controller = new Controller(store, engine);
+  try {
+    assert.equal(controller.send("!printf 'LOCAL_SHELL_RESPONSE_9123\\n'"), true);
+    await controller.shellRun!.done;
+    const shellSession = controller.opened!;
+    assert.equal(requests.length, 0); assert.equal(shellSession.conversationId, undefined);
+    assert.equal(lastReply(shellSession), "LOCAL_SHELL_RESPONSE_9123\n");
+    await engine.run(shellSession, project, "model question", () => {});
+    assert.ok(requests.length > 0); assert.equal(shellSession.shellResponses?.length, 1);
+    assert.equal(shellSession.messages.some((message) => message.text.includes("LOCAL_SHELL_RESPONSE_9123")), false);
+    assert.equal(transcriptMessages(shellSession).filter((message) => message.role === "shell").length, 1);
+    assert.doesNotMatch(JSON.stringify(requests), /LOCAL_SHELL_RESPONSE_9123/);
+    await controller.close();
+    const restored = new Store(store.root);
+    engine = await openEngine(restored, { provider: "test", modelId: "mock" }, (error) => errors.push(error), models({ context: (context) => requests.push(context) }));
+    controller = new Controller(restored, engine); await engine.restore(() => {});
+    const session = restored.state.sessions[0]!;
+    assert.equal(session.shellResponses?.[0]?.text, "LOCAL_SHELL_RESPONSE_9123\n");
+    await engine.run(session, project, "another model question", () => {});
+    assert.equal(transcriptMessages(session).filter((message) => message.role === "shell").length, 1);
+    assert.doesNotMatch(JSON.stringify(requests), /LOCAL_SHELL_RESPONSE_9123/);
+    assert.deepEqual(errors, []);
+  } finally { await controller.close(); await engine.close(); f.cleanup(); }
+});
+
+test("saved auto-compaction policy applies live, survives engine restart and can be re-enabled", async () => {
+  const temp = temporary(); let store = new Store(temp.root); const project = store.addProject(temp.root);
+  let s = session(project, "configured-auto"); store.state.sessions.push(s);
+  const usage: Usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  let summaries = 0;
+  const fixture = models({ contextWindow: 100_000, usage, compaction: { started: () => { summaries++; } } });
+  let engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)), fixture);
+  let c = new Controller(store, engine);
+  try {
+    await seedCompactableHistory(engine, s, project);
+    assert.equal(c.setCompaction({ enabled: false }), true);
+    usage.input = 90_000; usage.totalTokens = 90_001;
+    await engine.run(s, project, "report usage", () => {});
+    await engine.run(s, project, "continue without compacting", () => {});
+    assert.equal(summaries, 0); assert.equal(s.status, "completed");
+    await c.close();
+    store = new Store(temp.root); s = store.state.sessions[0]!;
+    engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)), fixture);
+    await engine.restore(() => {}); c = new Controller(store, engine);
+    assert.equal(store.compaction.enabled, false);
+    await engine.run(s, project, "still disabled after restart", () => {});
+    assert.equal(summaries, 0);
+    assert.equal(c.setCompaction({ enabled: true }), true);
+    usage.input = 1; usage.totalTokens = 2;
+    await engine.run(s, project, "now compact", () => {});
+    assert.equal(summaries, 1); assert.equal(s.status, "completed");
+    assert.equal(s.messages.find((m) => m.tool?.name === "compact")?.tool?.arguments.reason, "threshold");
+  } finally { await c.close(); await engine.close(); temp.cleanup(); }
+});
+
+for (const [reserveTokens, backgroundTokens, below, above, blocking] of [
+  [30_000, 10_000, 55_000, 65_000, false], [16_384, 0, 60_000, 90_000, true],
+] as const) {
+  test(`configured ${backgroundTokens ? "background lead changes the threshold" : "zero background lead keeps blocking compaction"}`, async () => {
+    const temp = temporary(); const store = new Store(temp.root); const project = store.addProject(temp.root);
+    const s = session(project, `custom-${backgroundTokens}`); store.state.sessions.push(s);
+    const usage: Usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+    let summaries = 0; const seen: boolean[] = [];
+    const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)),
+      models({ contextWindow: 100_000, usage, compaction: { started: () => {
+        summaries++; seen.push(...(s.compactions ?? []).map((item) => item.blocking));
+      } } }));
+    const c = new Controller(store, engine);
+    try {
+      await seedCompactableHistory(engine, s, project);
+      assert.equal(c.setCompaction({ reserveTokens, backgroundTokens }), true);
+      usage.input = below; usage.totalTokens = below + 1;
+      await engine.run(s, project, "report below threshold", () => {});
+      usage.input = 1; usage.totalTokens = 2;
+      await engine.run(s, project, "do not compact", () => {});
+      assert.equal(summaries, 0);
+      usage.input = above; usage.totalTokens = above + 1;
+      await engine.run(s, project, "report above threshold", () => {});
+      usage.input = 1; usage.totalTokens = 2;
+      await engine.run(s, project, "compact now", () => {});
+      await until(() => s.messages.some((m) => m.tool?.name === "compact"));
+      assert.equal(summaries, 1); assert.ok(seen.includes(blocking), JSON.stringify(seen));
+      assert.equal(s.status, "completed");
+    } finally { await c.close(); temp.cleanup(); }
+  });
+}
+
+test("disabled auto-compaction skips overflow recovery; enabling it restores recovery", async () => {
+  const temp = temporary(); const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "configured-overflow"); store.state.sessions.push(s);
+  let requests = 0; let summaries = 0;
+  const options = { overflow: false, context: () => { requests++; }, compaction: { started: () => { summaries++; } } };
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)), models(options));
+  const c = new Controller(store, engine);
+  try {
+    await seedCompactableHistory(engine, s, project);
+    c.setCompaction({ enabled: false });
+    let count = requests; options.overflow = true;
+    await engine.run(s, project, "overflow without recovery", () => {});
+    assert.equal(requests, count + 1); assert.equal(summaries, 0); assert.equal(s.status, "failed");
+    assert.match(s.messages.at(-1)!.text, /maximum context length exceeded/);
+    c.setCompaction({ enabled: true });
+    count = requests; options.overflow = true;
+    await engine.run(s, project, "overflow with recovery", () => {});
+    assert.equal(requests, count + 2); assert.equal(summaries, 1); assert.equal(s.status, "completed");
+    assert.equal(s.messages.find((m) => m.tool?.name === "compact")?.tool?.arguments.reason, "overflow");
+  } finally { await c.close(); temp.cleanup(); }
+});
+
+test("changing auto-compaction during a model request affects its next overflow check without aborting the request", async () => {
+  const temp = temporary(); const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "live-policy"); store.state.sessions.push(s);
+  let finish!: (failure?: string) => void;
+  const options = { pause: false, finish: (done: typeof finish) => { finish = done; },
+    compaction: { started: () => assert.fail("Disabled overflow recovery must not summarize") } };
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)), models(options));
+  const c = new Controller(store, engine);
+  try {
+    await seedCompactableHistory(engine, s, project);
+    options.pause = true;
+    const running = engine.run(s, project, "wait for provider", () => {});
+    await until(() => !!finish);
+    assert.equal(c.setCompaction({ enabled: false }), true);
+    assert.equal(s.status, "working"); assert.equal(s.stopped, undefined);
+    finish("maximum context length exceeded"); await running;
+    assert.equal(s.status, "failed"); assert.equal(s.stopped, undefined);
+    assert.match(s.messages.at(-1)!.text, /maximum context length exceeded/);
+  } finally { await c.close(); temp.cleanup(); }
+});
+
+test("manual compaction still runs when Off and uses configured recent-context and summary budgets", async () => {
+  const temp = temporary(); const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "configured-manual"); store.state.sessions.push(s);
+  const budgets: (number | undefined)[] = [];
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)),
+    models({ compaction: { request: (request) => { budgets.push(request?.maxTokens); } } }));
+  const c = new Controller(store, engine);
+  try {
+    c.setCompaction({ enabled: false });
+    await engine.run(s, project, "first short turn", () => {});
+    await engine.run(s, project, "second short turn", () => {});
+    assert.equal(await engine.compact(s, undefined, () => {}), "unchanged");
+    assert.equal(budgets.length, 0);
+    assert.equal(c.setCompaction({ keepRecentTokens: 0, reserveTokens: 1000 }), true);
+    assert.equal(await engine.compact(s, undefined, () => {}), "compacted");
+    assert.deepEqual(budgets, [800]); assert.equal(store.compaction.enabled, false);
+    assert.equal(s.messages.find((m) => m.tool?.name === "compact")?.tool?.arguments.reason, "manual");
+    assert.equal(s.status, "completed");
+  } finally { await c.close(); temp.cleanup(); }
 });

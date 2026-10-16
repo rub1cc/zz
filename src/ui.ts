@@ -4,12 +4,14 @@ import {
   type TuiAltScreen, type TuiMouseEvent, type TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
 import { Controller } from "./controller.js";
-import { age, lastReply, rowId, type ReplyBehavior, type Session, type Row } from "./model.js";
+import { activityTimestamp, displayStatus, sessionPreview, transcriptMessages, lastReplyMessage, age, lastReply, rowId, type ImageAttachment, type ReplyBehavior, type Session, type Row } from "./model.js";
 import { displayPath } from "./store.js";
 import { accent, bold, dim, fit, green, markdown, oneLine, pad, red, warning, workingIcon } from "./format.js";
 import { Transcript } from "./transcript.js";
 import { SettingsDialog } from "./settings-dialog.js";
 import { SettingsPage } from "./settings-page.js";
+import { renderShellResponse } from "./shell-response.js";
+import { AuthDialog } from "./auth-dialog.js";
 import { UndoDialog } from "./undo-dialog.js";
 import { Composer } from "./composer.js";
 import { composerCommands } from "./discovery.js";
@@ -18,7 +20,8 @@ import { composerStatus, usageDetails } from "./usage.js";
 export const scrollToEndIndicator = () => accent("[ Scroll to bottom / ctrl+end ]");
 
 function promptHistory(session: Session | undefined): string[] {
-  return session?.messages.filter((message) => message.role === "user").map((message) => message.text) ?? [];
+  return session ? transcriptMessages(session).flatMap((message) => message.role === "user" ? [message.text]
+    : message.role === "shell" ? [`!${message.shell.command}`] : []) : [];
 }
 
 function queueHint(session: Session | undefined, behavior: ReplyBehavior): string | undefined {
@@ -50,7 +53,13 @@ class SessionList extends Dynamic {
       return this.transcript.render(width);
     }
     const lines: string[] = [];
-    for (const row of c.currentRows) {
+    const rows = c.currentRows;
+    const titleWidths = new Map<string, number>();
+    for (const row of rows) {
+      if (row.kind === "session") titleWidths.set(row.project.id,
+        Math.max(titleWidths.get(row.project.id) ?? 0, visibleWidth(oneLine(row.session.title))));
+    }
+    for (const row of rows) {
       if (row.kind === "project" && lines.length) lines.push("");
       const id = rowId(row);
       this.positions.set(id, lines.length);
@@ -64,17 +73,22 @@ class SessionList extends Dynamic {
         rowLines = [`${heading}${dim(`  ${count} session${count === 1 ? "" : "s"}`)}`];
       } else {
         const { session } = row;
-        const symbol = session.status === "working" ? accent(workingIcon()) : session.status === "needs-input" ? warning("?")
-          : session.status === "failed" ? warning("!") : session.status === "paused" ? dim("-") : green("∙");
-        const time = age(session.updatedAt);
+        const status = displayStatus(session);
+        const symbol = status === "working" ? accent(workingIcon()) : status === "needs-input" ? warning("?")
+          : status === "failed" ? warning("!") : status === "paused" ? dim("-") : green("∙");
+        const time = age(activityTimestamp(session));
         const title = oneLine(session.title);
-        const titleWidth = Math.max(visibleWidth(title), Math.min(28, Math.max(8, Math.floor(width * 0.3))));
-        const previewWidth = Math.max(0, width - titleWidth - time.length - 10);
+        const titleWidth = titleWidths.get(row.project.id)!;
+        const label = status === "completed" ? "Done" : status === "needs-input" ? "Needs input"
+          : status === "working" ? "Working" : status === "failed" ? "Failed" : "Paused";
+        const state = status === "completed" ? green(label) : status === "working" ? label
+          : status === "paused" ? dim(label) : warning(label);
+        const previewWidth = Math.max(0, width - titleWidth - label.length - time.length - 13);
         if (previewWidth > 8 && (!confirmation || previewWidth >= confirmation.length)) {
           const preview = confirmation
             ? red(pad(confirmation, previewWidth))
-            : dim(pad(fit(oneLine(session.preview), previewWidth), previewWidth));
-          rowLines = [`  ${symbol} ${pad(title, titleWidth)}  ${preview}  ${dim(time)}`];
+            : dim(pad(fit(oneLine(sessionPreview(session)), previewWidth), previewWidth));
+          rowLines = [`  ${symbol} ${pad(title, titleWidth)}  ${state}${dim(" · ")}${preview}  ${dim(time)}`];
         } else {
           const indent = width >= 6 ? "    " : "";
           rowLines = wrapTextWithAnsi(title, Math.max(1, width - indent.length))
@@ -144,18 +158,27 @@ export class Dashboard extends VStack implements Focusable {
     this.addChild(new Dynamic((width) => this.header(width)), { basis: "auto", shrink: 0 });
     this.addChild(this.bodyHost, { basis: 0, grow: 1, minSize: 1 });
     this.addChild(new Dynamic((width) => this.footer(width)), { basis: "auto", shrink: 0 });
-    this.composer.onSubmit = (text) => this.command(text) || controller.send(text);
+    this.composer.onSubmit = (text, images) => this.command(text) ? "command" : controller.send(text, undefined, images);
     controller.onChange = () => this.sync();
   }
 
   private command(text: string): boolean {
+    if (text.trimStart().startsWith("!")) { this.controller.runShell(text.trimStart().slice(1)); return true; }
     const command = text.trim();
+    const auth = /^\/(login|logout)(?:\s+([\s\S]*))?$/.exec(command);
+    if (auth) {
+      this.controller.showAuth(auth[1] as "login" | "logout", auth[2]?.trim() || undefined);
+      return true;
+    }
     if (command === "/model" || command === "/thinking") {
       void this.controller.settings(command === "/model" ? "model" : "thinking").catch((error: unknown) => this.controller.fail(error));
       return true;
     }
     if (command === "/settings" || command === "/config") { this.controller.showSettings(); return true; }
     if (command === "/session") { this.controller.showUsage(); return true; }
+    if (/^\/copy(?:\s|$)/.test(command)) {
+      void this.controller.copyResponse(command.slice("/copy".length)); return true;
+    }
     if (/^\/compact(?:\s|$)/.test(command)) {
       void this.controller.compact(command.slice("/compact".length).trim() || undefined); return true;
     }
@@ -190,9 +213,9 @@ export class Dashboard extends VStack implements Focusable {
   private header(_width: number): string[] {
     const c = this.controller;
     if (c.mode === "projects") return ["", `  ${bold("Projects")}  ${dim("add and remove directories")}`, ""];
-    if (c.mode === "session" && c.opened) return ["", `  ${bold(oneLine(c.opened.title))}`, `  ${dim(oneLine(displayPath(c.project?.path ?? "")))}  ${dim(c.opened.status)}`, ""];
+    if (c.mode === "session" && c.opened) return ["", `  ${bold(oneLine(c.opened.title))}`, `  ${dim(oneLine(displayPath(c.project?.path ?? "")))}  ${dim(displayStatus(c.opened))}`, ""];
     const visible = c.store.state.sessions.filter((s) => c.store.state.projects.some((p) => p.id === s.projectId));
-    const count = (status: string) => visible.filter((s) => s.status === status).length;
+    const count = (status: string) => visible.filter((s) => displayStatus(s) === status).length;
     const extra = count("failed") + count("paused");
     return ["", `  ${dim(`${count("needs-input")} awaiting input / ${count("working")} working / ${count("completed")} completed${extra ? ` / ${extra} interrupted or failed` : ""}`)}`, ""];
   }
@@ -212,6 +235,7 @@ export class Dashboard extends VStack implements Focusable {
     if (c.mode !== this.previousMode || c.openedSessionId !== this.previousSessionId) {
       this.composer.setHistory(promptHistory(c.mode === "session" ? c.opened : undefined));
     }
+    this.composer.setAttachmentScope(c.mode === "session" ? `session:${c.openedSessionId}` : `new:${c.project?.path}`);
     this.composer.setDiscovery(c.project && c.mode !== "projects"
       ? { cwd: c.project.path, commands: true, session: c.mode === "session", selectedSession: c.selected?.kind === "session" } : undefined);
     if (c.mode !== this.previousMode) {
@@ -225,17 +249,20 @@ export class Dashboard extends VStack implements Focusable {
     if (c.mode === "session" && c.openedSessionId !== this.previousSessionId) this.chatScroll.scrollToEnd();
     this.previousSessionId = c.openedSessionId;
     if (c.dialog !== this.activeDialog) {
+      const previousDialog = this.activeDialog;
+      this.activeDialog = c.dialog;
+      if (previousDialog?.kind === "auth") previousDialog.flow.dispose();
       this.overlay?.hide();
       this.overlay = undefined;
-      this.activeDialog = c.dialog;
       const undoSessionId = c.dialog?.kind === "undo" ? c.dialog.sessionId : undefined;
-      if (c.dialog) this.overlay = this.tui.showOverlay(c.dialog.kind === "model" || c.dialog.kind === "thinking" || c.dialog.kind === "skills"
+      if (c.dialog) this.overlay = this.tui.showOverlay(c.dialog.kind === "auth"
+        ? new AuthDialog(c.dialog.flow, this.tui, () => c.closeAuth()) : c.dialog.kind === "model" || c.dialog.kind === "thinking" || c.dialog.kind === "skills"
         ? new SettingsDialog(c, this.tui, c.dialog, (name) => {
           this.composer.setValue(`/skill:${name} ${this.composer.getValue()}`);
           this.composer.handleInput("\x05");
           c.dialog = undefined; c.changed();
         }) : c.dialog.kind === "undo" ? new UndoDialog(c, this.tui, c.dialog, (result) => {
-          if (c.mode === "session" && c.openedSessionId === undoSessionId && !this.composer.getValue()) {
+          if (c.mode === "session" && c.openedSessionId === undoSessionId && !this.composer.hasContent) {
             this.composer.setValue(result.prompt); c.changed();
           }
         }) : c.dialog.kind === "settings" ? new SettingsPage(c, this.tui, c.dialog) : new DialogView(c, this.tui), {
@@ -281,6 +308,7 @@ export class Dashboard extends VStack implements Focusable {
       this.composer.handleInput(data); this.tui.requestRender(); return;
     }
     if (matchesKey(data, "ctrl+c")) { this.quit(); return; }
+    if (c.mode !== "projects" && matchesKey(data, "ctrl+v")) { this.composer.handleInput(data); return; }
     if (c.mode !== "projects" && this.composer.handleDiscoveryInput(data)) { this.tui.requestRender(); return; }
     if (matchesKey(data, "shift+tab")) { void c.cycleThinking(); return; }
     if (matchesKey(data, "ctrl+l") || matchesKey(data, "ctrl+t")) {
@@ -291,13 +319,13 @@ export class Dashboard extends VStack implements Focusable {
     if (matchesKey(data, Key.pageUp)) { this.scroll.scrollBy(-Math.max(1, this.scroll.viewportHeight - 2)); this.tui.requestRender(); return; }
     if (matchesKey(data, Key.pageDown)) { this.scroll.scrollBy(Math.max(1, this.scroll.viewportHeight - 2)); this.tui.requestRender(); return; }
     if (c.mode === "session") {
-      if (!this.composer.getValue() && (matchesKey(data, "left") || matchesKey(data, "ctrl+h"))) { c.back(); return; }
+      if (!this.composer.hasContent && (matchesKey(data, "left") || matchesKey(data, "ctrl+h"))) { c.back(); return; }
       if (matchesKey(data, "tab") || matchesKey(data, "ctrl+n") || matchesKey(data, "ctrl+p")) {
         this.body.render(this.tui.terminal.columns);
         this.body.transcript.move(matchesKey(data, "ctrl+p") ? -1 : 1);
         this.revealTool(); return;
       }
-      if (!this.composer.getValue() && (matchesKey(data, "space") || matchesKey(data, "enter") || matchesKey(data, "right"))) {
+      if (!this.composer.hasContent && (matchesKey(data, "space") || matchesKey(data, "enter") || matchesKey(data, "right"))) {
         this.body.render(this.tui.terminal.columns);
         this.body.transcript.toggle(matchesKey(data, "right") ? true : undefined);
         this.revealTool(); return;
@@ -316,7 +344,7 @@ export class Dashboard extends VStack implements Focusable {
         else if (matchesKey(data, "enter")) { c.mode = "sessions"; c.changed(); }
         return;
       }
-      if (!this.composer.getValue()) {
+      if (!this.composer.hasContent) {
         if (matchesKey(data, "space")) { c.peek(); return; }
         if (matchesKey(data, "enter")) { c.open(); return; }
       }
@@ -344,10 +372,13 @@ class DialogView implements Component, Focusable {
       const project = controller.store.state.projects.find((p) => p.id === controller.session(dialog.sessionId)?.projectId);
       if (project) this.input.setDiscovery({ cwd: project.path, commands: false, session: true });
     }
-    this.input.onSubmit = (text) => {
+    this.input.onSubmit = (text: string, images: ImageAttachment[] = []): boolean | "command" => {
       const dialog = controller.dialog;
       if (dialog?.kind === "add-project") return controller.addProject(text.trim());
-      if (dialog?.kind === "peek") return controller.send(text, dialog.sessionId);
+      if (dialog?.kind === "peek") {
+        if (text.trimStart().startsWith("!")) { controller.runShell(text.trimStart().slice(1), dialog.sessionId); return "command"; }
+        return controller.send(text, dialog.sessionId, images);
+      }
       return false;
     };
   }
@@ -356,7 +387,10 @@ class DialogView implements Component, Focusable {
     const c = this.controller;
     const dialog = c.dialog;
     if (this.input instanceof Composer && this.input.handleDiscoveryInput(data)) { this.tui.requestRender(); return; }
-    if (matchesKey(data, "escape")) { c.dialog = undefined; c.notice = ""; c.changed(); return; }
+    if (matchesKey(data, "escape")) {
+      if (dialog?.kind === "peek" && c.stopShell(dialog.sessionId)) return;
+      c.dialog = undefined; c.notice = ""; c.changed(); return;
+    }
     if (dialog?.kind === "help" || dialog?.kind === "usage") {
       if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.pageDown)) {
         this.offset = Math.max(0, this.offset + (matchesKey(data, Key.pageDown) ? 8 : -8));
@@ -392,7 +426,7 @@ class DialogView implements Component, Focusable {
       const view = session ? "Open session" : selectedSession ? "Dashboard (session selected)" : "Dashboard (project selected)";
       const help = [bold(`Commands: ${view}`),
         ...composerCommands(session, selectedSession).map(({ name, description }) => `/${name}  ${description}`),
-        ...(!session && !selectedSession ? [dim("Select a session for /session, /compact, /undo and /stop.")] : []),
+        ...(!session && !selectedSession ? [dim("Select a session for /copy, /session, /compact, /undo and /stop.")] : []),
         "", bold("Keyboard shortcuts"),
       "up / ctrl+p     select previous project or session",
       "down / ctrl+n   select next project or session",
@@ -403,7 +437,12 @@ class DialogView implements Component, Focusable {
       "ctrl+j          insert a newline in the draft",
       "ctrl+g          edit draft in $VISUAL / $EDITOR (default vim)",
       "/               search commands available in this view",
-      "@               search project files (fd); browse paths without fd",
+      "@               search files; @image.png attaches on send",
+      "ctrl+v          paste a clipboard image, copied files or text",
+      "!command        run a local shell command in this project's directory",
+      "esc             stop this session's direct shell command before agent work",
+      "backspace       remove last image when the draft text is empty",
+      "/settings       replies, model, reasoning display and auto-compaction",
       "tab             complete a path at the cursor",
       "↑↓ / ctrl+n/p   select suggestion; tab / enter fills without sending",
       "esc             dismiss suggestions before stopping work",
@@ -416,8 +455,8 @@ class DialogView implements Component, Focusable {
       "shift+tab       cycle supported thinking levels",
       "/skill:name [task] load a skill in a task or reply",
       "ctrl+end        scroll to bottom and follow new output",
-      "tab / ctrl+n/p  select tools in session",
-      "space / enter   expand or collapse selected tool (empty composer)",
+      "tab / ctrl+n/p  select tool or thinking blocks in session",
+      "space / enter   expand or collapse selected block (empty composer)",
       "ctrl+c          quit (running sessions pause)", "", dim("New tasks always run in the selected row's project.")]
         .flatMap((line) => wrapTextWithAnsi(line, inner));
       const height = Math.max(1, Math.floor(this.tui.terminal.rows * 0.85) - 6);
@@ -431,7 +470,9 @@ class DialogView implements Component, Focusable {
     if (dialog.kind !== "peek") return [];
     const session = c.session(dialog.sessionId);
     const text = session ? lastReply(session) : "Session not found.";
+    const reply = session && lastReplyMessage(session);
     if (this.cache?.text !== text || this.cache.width !== inner) this.cache = { text, width: inner, lines: markdown(text, inner) };
+    const replyLines = reply?.role === "shell" ? renderShellResponse(reply.shell, inner) : this.cache.lines;
     const inputLines = this.input.render(inner);
     const hint = queueHint(session, c.store.settings.replyBehavior);
     const belowComposer = [
@@ -440,7 +481,7 @@ class DialogView implements Component, Focusable {
     ];
     const available = Math.max(1, Math.floor(this.tui.terminal.rows * 0.85)
       - 6 - inputLines.length - belowComposer.length - (c.notice ? 1 : 0));
-    const lines = this.cache.lines;
+    const lines = replyLines;
     this.offset = Math.min(this.offset, Math.max(0, lines.length - available));
     const end = Math.max(available, lines.length - this.offset);
     const body = lines.slice(Math.max(0, end - available), end);

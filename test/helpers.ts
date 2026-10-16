@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { ProgramStatus, Terminal } from "@earendil-works/pi-tui";
 import type { Engine } from "../src/controller.js";
 import { sessionStats } from "../src/usage.js";
-import type { AgentSettings, CompactResult, ModelOption, Project, Session, SkillOption } from "../src/model.js";
+import type { ImageAttachment, AgentSettings, CompactResult, ModelOption, Project, Session, SkillOption } from "../src/model.js";
 
 export function temporary(): { root: string; cleanup(): void } {
   const root = mkdtempSync(join(process.cwd(), ".zz-test-"));
@@ -23,7 +23,7 @@ export class FakeEngine implements Engine {
     const next = { ...this.configuration(session), ...change };
     if (session) session.agent = next; else this.defaults = next;
   }
-  calls: { session: Session; project: Project; prompt: string }[] = [];
+  calls: { session: Session; project: Project; prompt: string; images?: ImageAttachment[] }[] = [];
   compactions: { session: Session; instructions?: string }[] = [];
   async compact(session: Session, instructions?: string): Promise<CompactResult> {
     this.compactions.push({ session, instructions });
@@ -41,8 +41,8 @@ export class FakeEngine implements Engine {
   }
   stopped: string[] = [];
   cancelled: string[] = [];
-  async run(session: Session, project: Project, prompt: string): Promise<void> {
-    this.calls.push({ session, project, prompt });
+  async run(session: Session, project: Project, prompt: string, _changed?: () => void, images: ImageAttachment[] = []): Promise<void> {
+    this.calls.push({ session, project, prompt, ...(images.length ? { images } : {}) });
     session.status = "completed";
     session.preview = "Done";
     session.messages.push({ role: "assistant", text: `Reply to ${prompt}`, timestamp: Date.now() });

@@ -17,19 +17,25 @@ function provider(cwd: string, session = false, commands = true, selectedSession
 test("slash discovery filters available commands and excludes later draft lines and peek commands", async () => {
   const p = provider(process.cwd());
   const all = await suggestions(p, "/");
-  assert.deepEqual(all?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "help"]);
+  assert.deepEqual(all?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "login", "logout", "help"]);
   assert.equal((await suggestions(p, "/th"))?.items[0]?.value, "thinking");
+  assert.equal(await suggestions(p, "/copy"), null);
+  assert.equal((await suggestions(provider(process.cwd(), true), "/copy"))?.items[0]?.value, "copy");
+  assert.equal(await suggestions(provider(process.cwd(), true, false), "/copy"), null);
   assert.equal(await suggestions(p, "/does-not-exist"), null);
   assert.equal(await suggestions(p, "draft\n/mo"), null);
   assert.equal(await suggestions(provider(process.cwd(), true, false), "/mo"), null);
   const selected = await suggestions(provider(process.cwd(), false, true, true), "/");
-  assert.deepEqual(selected?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "session", "compact", "undo", "stop", "help"]);
+  assert.deepEqual(selected?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "login", "logout", "copy", "session", "compact", "undo", "stop", "help"]);
   const open = await suggestions(provider(process.cwd(), true), "/");
   assert.deepEqual(open?.items.map((i) => i.value), [...selected!.items.map((i) => i.value), "bottom", "expand", "collapse"]);
   assert.deepEqual(composerCommands(true).filter((c) => !composerCommands(false, true).some((base) => base.name === c.name)).map((c) => c.name), ["bottom", "expand", "collapse"]);
   assert.match(composerCommands(false, true).find((c) => c.name === "model")!.description!, /new tasks/);
   assert.match(composerCommands(false, true).find((c) => c.name === "stop")!.description!, /selected session/);
   assert.match(composerCommands(true).find((c) => c.name === "stop")!.description!, /open session/);
+  for (const commands of [composerCommands(false), composerCommands(false, true), composerCommands(true)]) {
+    assert.ok(commands.every(({ name }) => !["attach", "detach", "reasoning"].includes(name)));
+  }
 });
 
 test("file completion is project scoped, quotes spaces, preserves cursor suffix and browses without fd", async () => {

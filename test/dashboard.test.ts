@@ -12,14 +12,14 @@ import { Dashboard, scrollToEndIndicator } from "../src/ui.js";
 import { UndoDialog } from "../src/undo-dialog.js";
 import { FakeEngine, FakeTerminal, temporary, tick } from "./helpers.js";
 
-function setup() {
+function setup(writeClipboard?: (text: string) => Promise<void>) {
   const temp = temporary();
   const a = join(temp.root, "alpha"); const b = join(temp.root, "beta");
   mkdirSync(a); mkdirSync(b);
   const store = new Store(join(temp.root, "data"));
   const pa = store.addProject(a); const pb = store.addProject(b);
   const engine = new FakeEngine();
-  const c = new Controller(store, engine);
+  const c = new Controller(store, engine, undefined, writeClipboard);
   const terminal = new FakeTerminal();
   const tui = new TuiAltScreen(terminal, false, undefined, { scrollToEndIndicator });
   const app = new Dashboard(c, tui, () => {});
@@ -67,6 +67,58 @@ test("session titles stay complete and selected rows stay highlighted through wr
         }
       }
     }
+  } finally { await f.cleanup(); }
+});
+
+test("session title columns align within each project using terminal cell widths and update after renames", async () => {
+  const f = setup();
+  try {
+    const titles = ["short", "a much longer title", "\u754c\u9762 \ud83d\ude00 ".repeat(4)];
+    for (const title of titles) { f.c.select(`project:${f.pa.id}`); f.c.send(title); await tick(); }
+    for (const title of ["one", "two"]) { f.c.select(`project:${f.pb.id}`); f.c.send(title); await tick(); }
+    const sessions = f.store.state.sessions;
+    const alpha = sessions.filter((s) => s.projectId === f.pa.id);
+    const beta = sessions.filter((s) => s.projectId === f.pb.id);
+    for (const session of sessions) session.preview = "latest message ".repeat(30);
+    const check = (width: number) => {
+      const lines = f.app.body.render(width);
+      const stateColumn = (session: typeof sessions[number]) => {
+        const line = lines[f.app.body.positions.get(`session:${session.id}`)!]!;
+        const text = stripTerminalSequences(line);
+        assert.match(text, /Done \u00b7 latest message/);
+        assert.match(text, /  now\s*$/);
+        assert.ok(visibleWidth(line) <= width);
+        return visibleWidth(text.slice(0, text.indexOf("Done \u00b7")));
+      };
+      const alphaColumn = 6 + Math.max(...alpha.map((s) => visibleWidth(s.title)));
+      for (const session of alpha) assert.equal(stateColumn(session), alphaColumn);
+      for (const session of beta) assert.equal(stateColumn(session), 9, "Other projects use their own longest title");
+    };
+    for (const width of [100, 180]) check(width);
+    alpha[2]!.title = "renamed";
+    check(100);
+    alpha[0]!.title = "An even longer title after renaming the shortest session";
+    check(100);
+  } finally { await f.cleanup(); }
+});
+
+test("session rows show a readable state followed by a middot and the latest preview", async () => {
+  const f = setup();
+  try {
+    f.c.send("task"); await tick();
+    const session = f.store.state.sessions[0]!;
+    session.preview = "Latest reply\ncontinued";
+    for (const [status, label] of [["completed", "Done"], ["working", "Working"], ["needs-input", "Needs input"],
+      ["failed", "Failed"], ["paused", "Paused"]] as const) {
+      session.status = status;
+      const lines = f.app.body.render(100);
+      const line = lines[f.app.body.positions.get(`session:${session.id}`)!]!;
+      assert.ok(stripTerminalSequences(line).includes(`${label} \u00b7 Latest reply continued`));
+      assertFullyHighlighted(line, 100);
+    }
+    f.c.pendingDelete = `session:${session.id}`;
+    const lines = f.app.body.render(100);
+    assert.match(stripTerminalSequences(lines[f.app.body.positions.get(`session:${session.id}`)!]!), /Paused \u00b7 ctrl\+x again to delete/);
   } finally { await f.cleanup(); }
 });
 
@@ -236,7 +288,7 @@ test("/stop cancels the selected task without starting a new session or deleting
   try {
     f.c.send("running task"); await tick();
     const session = f.store.state.sessions[0]!; session.status = "working";
-    assert.equal(f.app.composer.onSubmit?.("/stop"), true); await tick();
+    assert.equal(f.app.composer.onSubmit?.("/stop"), "command"); await tick();
     assert.deepEqual(f.engine.cancelled, [session.id]);
     assert.equal(f.store.state.sessions.length, 1); assert.equal(f.engine.calls.length, 1);
     assert.equal(session.status, "paused");
@@ -514,6 +566,7 @@ test("ctrl+x requires a second ctrl+x; any other key cancels without deleting fi
     f.c.send("delete me"); await tick();
     const id = f.store.state.sessions[0]!.id;
     const session = f.store.state.sessions[0]!;
+    session.preview = "Preview replaced by delete confirmation";
     const preview = session.preview;
     f.terminal.onInput("\x18"); f.tui.renderNow();
     assert.equal(f.c.dialog, undefined);
@@ -1027,7 +1080,7 @@ test("peek replies always show session-scoped status and accept question marks a
 test("/compact targets the open or selected session, passes instructions, and never sends a prompt", async () => {
   const f = setup();
   try {
-    assert.equal(f.app.composer.onSubmit?.("/compact"), true);
+    assert.equal(f.app.composer.onSubmit?.("/compact"), "command");
     assert.match(f.c.notice, /Open or select a session/);
     assert.equal(f.engine.compactions.length, 0);
     f.c.send("first task"); await tick();
@@ -1036,14 +1089,14 @@ test("/compact targets the open or selected session, passes instructions, and ne
     const second = f.store.state.sessions[1]!;
     const calls = f.engine.calls.length;
     f.c.select(`session:${first.id}`);
-    assert.equal(f.app.composer.onSubmit?.("/compact keep exact paths\nand pending tests"), true);
+    assert.equal(f.app.composer.onSubmit?.("/compact keep exact paths\nand pending tests"), "command");
     await tick();
     assert.equal(f.engine.compactions[0]?.session.id, first.id);
     assert.equal(f.engine.compactions[0]?.instructions, "keep exact paths\nand pending tests");
     assert.match(f.c.notice, /Context compacted/);
     f.c.open();
     f.c.selection = `session:${second.id}`;
-    assert.equal(f.app.composer.onSubmit?.("/compact"), true); await tick();
+    assert.equal(f.app.composer.onSubmit?.("/compact"), "command"); await tick();
     assert.equal(f.engine.compactions[1]?.session.id, first.id, "open session takes precedence over list selection");
     assert.equal(f.engine.compactions[1]?.instructions, undefined);
     assert.equal(f.engine.calls.length, calls);
@@ -1445,5 +1498,240 @@ test("session and peek arrows recall saved prompts without sending or leaking se
     f.terminal.onInput("\x1b[A"); f.terminal.onInput("\r"); await tick();
     assert.equal(f.engine.calls.at(-1)?.session.id, first.id);
     assert.equal(f.engine.calls.at(-1)?.prompt, "new reply", "Peek can recall and resend a saved prompt");
+  } finally { await f.cleanup(); }
+});
+
+test("settings shows and toggles reasoning independently of the model thinking level", async () => {
+  const f = setup();
+  try {
+    f.c.send("task"); await tick(); f.c.open();
+    const session = f.c.opened!;
+    session.messages.unshift({ role: "thinking", text: "A provider-visible explanation\nwith several reasoning lines\x1b[2J", timestamp: 1, thinking: { id: "thinking:one" } });
+    session.messages.push({ role: "thinking", text: "should not be shown", timestamp: 2, thinking: { id: "thinking:redacted", redacted: true } });
+    const render = (width = 80) => f.app.body.transcript.render(width).map(stripTerminalSequences).join("\n");
+    assert.match(render(), /A provider-visible explanation/);
+    assert.match(render(), /Thinking \(redacted\)/); assert.doesNotMatch(render(), /should not be shown/);
+    for (const width of [1, 8, 24, 80]) assert.ok(f.app.body.transcript.render(width).every((line) => visibleWidth(line) <= width));
+    render(); f.app.body.transcript.move(1); f.app.body.transcript.toggle();
+    assert.doesNotMatch(render(), /provider-visible/);
+    f.app.body.transcript.toggleAll(true); assert.match(render(), /provider-visible/);
+    const configuration = f.c.configuration;
+    const calls = f.engine.calls.length;
+    f.c.showSettings("showThinking"); f.tui.renderNow();
+    assert.match(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Show reasoning\s+On/);
+    f.terminal.onInput("\r"); f.tui.renderNow();
+    assert.equal(f.c.dialog?.kind, "settings");
+    assert.match(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Show reasoning\s+Off/);
+    assert.doesNotMatch(render(), /provider-visible|Thinking \(redacted\)/);
+    assert.deepEqual(f.c.configuration, configuration); assert.equal(f.engine.calls.length, calls);
+    assert.equal(new Store(f.store.root).settings.showThinking, false);
+    f.terminal.onInput("\x1b");
+    f.c.showSettings("showThinking"); f.terminal.onInput("\r");
+    assert.match(render(), /provider-visible/);
+  } finally { await f.cleanup(); }
+});
+
+test("reasoning visibility is a global saved settings row with keyboard navigation, rollback and draft preservation", async (t) => {
+  const f = setup();
+  try {
+    f.app.composer.setValue("keep this draft");
+    const configuration = f.c.configuration;
+    let lookups = 0;
+    f.engine.listModels = async () => { lookups++; return []; };
+    f.c.showSettings();
+    for (let i = 0; i < 3; i++) f.terminal.onInput("\x0e");
+    f.tui.renderNow();
+    const screen = () => f.tui.getScreenLines().map(stripTerminalSequences).join("\n");
+    assert.match(screen(), /Show reasoning\s+On/);
+    assert.match(screen(), /Display only/);
+    assert.match(screen(), /all sessions/);
+    const save = t.mock.method(f.store, "save", () => { throw new Error("Disk full"); });
+    f.terminal.onInput("\r");
+    assert.equal(f.store.settings.showThinking, undefined, "A failed save must preserve the default visible state");
+    assert.match(f.c.notice, /Disk full/);
+    save.mock.restore();
+    f.terminal.onInput("\r"); f.tui.renderNow();
+    assert.match(screen(), /Show reasoning\s+Off/);
+    assert.equal(new Store(f.store.root).settings.showThinking, false);
+    assert.equal(f.c.dialog?.kind, "settings");
+    assert.deepEqual(f.c.configuration, configuration);
+    assert.equal(lookups, 0); assert.equal(f.engine.calls.length, 0);
+    f.terminal.onInput("\x1b");
+    assert.equal(f.app.composer.getValue(), "keep this draft");
+    f.c.showSettings("showThinking"); f.terminal.onInput(" ");
+    assert.equal(new Store(f.store.root).settings.showThinking, true);
+  } finally { await f.cleanup(); }
+});
+
+test("/copy and /copy N copy exact assistant text from the selected or open session without running an agent", async () => {
+  const copied: string[] = [];
+  const f = setup(async (text) => { copied.push(text); });
+  try {
+    f.c.send("first task"); await tick();
+    const first = f.store.state.sessions[0]!;
+    const older = "  **Older response**\n\n```ts\nconst answer = 42;\n```\n";
+    const latest = "Latest response 日本語\nwith a second line  ";
+    first.messages = [
+      { role: "assistant", text: older, timestamp: 1 },
+      { role: "user", text: "not an answer", timestamp: 2 },
+      { role: "thinking", text: "private reasoning", timestamp: 3 },
+      { role: "tool", text: "tool output", timestamp: 4 },
+      { role: "assistant", text: latest, timestamp: 5 },
+      { role: "assistant", text: " \n ", timestamp: 6 },
+      { role: "error", text: "not an answer either", timestamp: 7 },
+    ];
+    const calls = f.engine.calls.length;
+    f.app.composer.setValue("/copy"); f.terminal.onInput("\r"); await tick();
+    assert.deepEqual(copied, [latest]);
+    assert.match(f.c.notice, /Copied assistant response 1/);
+    assert.equal(f.app.composer.getValue(), "");
+    f.app.composer.setValue("/copy 2"); f.terminal.onInput("\r"); await tick();
+    assert.deepEqual(copied, [latest, older]);
+    f.c.open();
+    f.c.selection = `project:${f.pb.id}`;
+    f.app.composer.setValue("/copy 1"); f.terminal.onInput("\r"); await tick();
+    assert.deepEqual(copied, [latest, older, latest], "The open session takes precedence over dashboard selection");
+    assert.equal(f.engine.calls.length, calls); assert.equal(f.store.state.sessions.length, 1);
+    assert.equal(first.messages.length, 7); assert.equal(first.status, "completed");
+  } finally { await f.cleanup(); }
+});
+
+test("copy validates its index and target, reports missing responses and never falls through to a task", async () => {
+  const copied: string[] = [];
+  const f = setup(async (text) => { copied.push(text); });
+  try {
+    f.app.composer.setValue("/copy"); f.terminal.onInput("\r"); await tick();
+    assert.match(f.c.notice, /Open or select a session/);
+    assert.equal(f.engine.calls.length, 0); assert.equal(f.store.state.sessions.length, 0);
+    f.c.send("task"); await tick();
+    const session = f.store.state.sessions[0]!;
+    for (const argument of ["0", "-1", "1.5", "1e1", "0x1", "NaN", "Infinity", "2 extra", "9007199254740992"]) {
+      f.app.composer.setValue(`/copy ${argument}`); f.terminal.onInput("\r"); await tick();
+      assert.match(f.c.notice, /Usage: \/copy \[N\]/, argument);
+    }
+    f.app.composer.setValue("/copy 2"); f.terminal.onInput("\r"); await tick();
+    assert.match(f.c.notice, /Only 1 assistant response is available/);
+    session.messages = [{ role: "user", text: "prompt", timestamp: 1 }, { role: "thinking", text: "thought", timestamp: 2 }];
+    await f.c.copyResponse(); assert.match(f.c.notice, /No assistant responses/);
+    assert.deepEqual(copied, []); assert.equal(f.engine.calls.length, 1);
+  } finally { await f.cleanup(); }
+});
+
+test("clipboard failures are visible and a subsequent copy can succeed", async () => {
+  let available = false;
+  const copied: string[] = [];
+  const f = setup(async (text) => {
+    if (!available) throw new Error("Clipboard unavailable");
+    copied.push(text);
+  });
+  try {
+    f.c.send("task"); await tick();
+    await f.c.copyResponse();
+    assert.match(f.c.notice, /Could not copy response: Clipboard unavailable/);
+    assert.doesNotMatch(f.c.notice, /Copied assistant/);
+    available = true;
+    await f.c.copyResponse();
+    assert.deepEqual(copied, ["Reply to task"]); assert.match(f.c.notice, /Copied assistant response 1/);
+  } finally { await f.cleanup(); }
+});
+
+test("copy snapshots streaming text, serializes clipboard writes and suppresses stale feedback after navigation", async () => {
+  let finish!: () => void;
+  const copied: string[] = [];
+  const f = setup(async (text) => { copied.push(text); if (copied.length === 1) await new Promise<void>((resolve) => { finish = resolve; }); });
+  try {
+    f.c.send("task"); await tick(); f.c.open();
+    const session = f.c.opened!;
+    session.messages = [{ role: "assistant", text: "older", timestamp: 1 }, { role: "assistant", text: "partial", timestamp: 2 }];
+    session.status = "working";
+    const latest = f.c.copyResponse();
+    session.messages[1]!.text = "later streamed text";
+    await tick(); assert.deepEqual(copied, ["partial"]);
+    const older = f.c.copyResponse("2"); await tick(); assert.equal(copied.length, 1);
+    f.c.back(); f.c.select(`project:${f.pb.id}`);
+    f.c.notice = "keep navigation notice";
+    finish(); await Promise.all([latest, older]);
+    assert.deepEqual(copied, ["partial", "older"]);
+    assert.equal(f.c.notice, "keep navigation notice");
+    assert.equal(session.status, "working"); assert.equal(f.engine.cancelled.length, 0);
+  } finally { finish?.(); await f.cleanup(); }
+});
+
+test("copy works with saved response history after reopening without changing stored content", async () => {
+  const f = setup(async () => {});
+  let restored: Controller | undefined;
+  try {
+    f.c.send("persisted task"); await tick();
+    const session = f.store.state.sessions[0]!;
+    f.store.save();
+    const copied: string[] = [];
+    const store = new Store(f.store.root);
+    restored = new Controller(store, new FakeEngine(), undefined, async (text) => { copied.push(text); });
+    restored.select(`session:${session.id}`);
+    const original = readFileSync(store.file, "utf8");
+    await restored.copyResponse();
+    assert.deepEqual(copied, ["Reply to persisted task"]);
+    assert.equal(readFileSync(store.file, "utf8"), original);
+  } finally { await restored?.close(); await f.cleanup(); }
+});
+
+test("/settings toggles global auto-compaction without model calls or losing the draft", async () => {
+  const f = setup();
+  try {
+    f.app.composer.setValue("preserve this draft");
+    const configuration = f.c.configuration;
+    f.engine.listModels = async () => assert.fail("Compaction settings need no model catalog");
+    f.c.showSettings();
+    for (let i = 0; i < 4; i++) f.terminal.onInput("\x0e");
+    const screen = () => { f.tui.renderNow(); return f.tui.getScreenLines().map(stripTerminalSequences).join("\n"); };
+    assert.match(screen(), /Auto-compaction\s+On/);
+    assert.match(screen(), /all current and future sessions/);
+    assert.match(screen(), /Off still allows \/compact/);
+    f.terminal.onInput(" ");
+    assert.match(screen(), /Auto-compaction\s+Off/);
+    assert.equal(new Store(f.store.root).compaction.enabled, false);
+    f.terminal.onInput("\r");
+    assert.match(screen(), /Auto-compaction\s+On/);
+    assert.equal(new Store(f.store.root).compaction.enabled, true);
+    assert.deepEqual(f.c.configuration, configuration); assert.equal(f.engine.calls.length, 0);
+    f.terminal.onInput("\x1b");
+    assert.equal(f.app.composer.getValue(), "preserve this draft");
+  } finally { await f.cleanup(); }
+});
+
+test("/settings edits compaction budgets inline, validates counts, and cancels unsaved edits", async () => {
+  const f = setup();
+  try {
+    f.c.send("task"); await tick(); f.c.open();
+    const configuration = f.c.configuration; const calls = f.engine.calls.length;
+    f.app.composer.setValue("keep session draft");
+    f.c.showSettings("reserveTokens");
+    const screen = () => { f.tui.renderNow(); return f.tui.getScreenLines().map(stripTerminalSequences).join("\n"); };
+    assert.match(screen(), /Compaction reserve\s+16,384/);
+    assert.match(screen(), /83,616 estimated tokens/);
+    f.terminal.onInput("\r"); f.terminal.onInput("\x15"); f.terminal.onInput("0"); f.terminal.onInput("\r");
+    assert.equal(f.store.compaction.reserveTokens, 16384);
+    assert.match(screen(), /at least 2 tokens/);
+    f.terminal.onInput("\x15"); f.terminal.onInput("30000");
+    assert.equal(f.store.compaction.reserveTokens, 16384, "Editing does not save until Enter");
+    f.terminal.onInput("\r");
+    assert.match(screen(), /Compaction reserve\s+30,000/);
+    assert.match(screen(), /70,000 estimated tokens/);
+    f.terminal.onInput("\x0e"); f.terminal.onInput("\r"); f.terminal.onInput("\x15"); f.terminal.onInput("0"); f.terminal.onInput("\r");
+    assert.equal(f.store.compaction.keepRecentTokens, 0);
+    f.terminal.onInput("\x0e"); f.terminal.onInput("\r"); f.terminal.onInput("\x15"); f.terminal.onInput("0"); f.terminal.onInput("\r");
+    assert.equal(f.store.compaction.backgroundTokens, 0);
+    assert.match(screen(), /0 disables background compaction only/);
+    const saved = { ...f.store.compaction };
+    assert.deepEqual(new Store(f.store.root).compaction, saved);
+    f.terminal.onInput("\r"); f.terminal.onInput("\x15"); f.terminal.onInput("1e4"); f.terminal.onInput("\r");
+    assert.match(screen(), /whole token count/);
+    assert.deepEqual(f.store.compaction, saved);
+    f.terminal.onInput("\x15"); f.terminal.onInput("5000"); f.terminal.onInput("\x1b");
+    assert.equal(f.c.dialog?.kind, "settings"); assert.deepEqual(f.store.compaction, saved);
+    f.terminal.onInput("\x1b");
+    assert.equal(f.c.dialog, undefined);
+    assert.equal(f.app.composer.getValue(), "keep session draft");
+    assert.deepEqual(f.c.configuration, configuration); assert.equal(f.engine.calls.length, calls);
   } finally { await f.cleanup(); }
 });

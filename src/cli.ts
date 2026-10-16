@@ -9,6 +9,7 @@ import { Controller } from "./controller.js";
 import { DurableEngine } from "./engine.js";
 import { Store } from "./store.js";
 import { Dashboard, scrollToEndIndicator } from "./ui.js";
+import { displayStatus } from "./model.js";
 import { loadPi } from "./pi.js";
 import { cancelExternalEditor, isExternalEditorOpen } from "./external-editor.js";
 import { motionEnabled } from "./format.js";
@@ -31,9 +32,12 @@ ctrl+o manages projects. ctrl+x twice deletes a session or all sessions in the s
 If shutdown stalls, press ctrl+c again to force exit (automatic after 5 seconds).
 Inside a session, Escape stops running work and stays in the session.
 Left Arrow returns to the dashboard when the composer is empty; work continues.
-/settings (or /config) opens saved settings, including follow-up vs steer for busy replies.
+/settings (or /config) configures busy replies, reasoning display and auto-compaction token budgets.
 /stop cancels the open or selected session without deleting its history.
-/compact [instructions] summarizes its older context; automatic compaction is enabled.
+/copy [N] copies the Nth-latest assistant or shell response from the open or selected session (default 1).
+!command runs a local shell in this project (e.g. !pwd), without sending it to the model.
+Shell output streams inline as a saved response. Escape stops the shell; /stop stops all work in that session.
+/compact [instructions] summarizes older context, even with auto-compaction Off in /settings.
 /undo opens a checkpoint picker; Enter restores the selection, Escape cancels (not shell effects).
 
 Uses your existing Pi login and saved default model. No separate API key needed.
@@ -43,7 +47,10 @@ In the UI: /model (ctrl+l), /thinking (ctrl+t). Open a session to change it;
 on the dashboard these controls change defaults for new sessions.
 Shift+Tab cycles thinking. /skills lists skills; /skill:name [task] loads one.
 Ctrl+End or /bottom jumps to the newest chat output and resumes following it.
-If not logged in, run pi and use /login first.
+/login [provider] signs in; /logout [provider] removes credentials shared with Pi.
+Ctrl+V or dragged paths stage images; @image.png attaches on send.
+Backspace with empty draft text removes the last staged image.
+/settings controls reasoning visibility. Project instruction Markdown loads automatically.
 Data: --data-dir, ZZ_DATA_DIR, or $XDG_DATA_HOME/zz (~/.local/share/zz).
 Agents can edit files and run commands. Project directories are not sandboxes.`);
 } else {
@@ -92,7 +99,7 @@ async function main(): Promise<void> {
     const store = new Store(root);
     const project = store.addProject(positionals[0] ?? process.cwd());
     const saved = store.state.defaults;
-    const { models, model, thinkingLevel } = await loadPi(project.path,
+    const { models, model, thinkingLevel, auth } = await loadPi(project.path,
       values.model ?? process.env.ZZ_MODEL ?? (saved?.model && `${saved.model.provider}/${saved.model.modelId}`),
       undefined, values.thinking ?? process.env.ZZ_THINKING ?? saved?.thinkingLevel);
     if (shutdown.isClosing) return;
@@ -101,8 +108,8 @@ async function main(): Promise<void> {
     const reports: unknown[] = [];
     engine = await DurableEngine.open(store, model,
       (error) => { if (controller) controller.fail(error); else reports.push(error); }, models, thinkingLevel);
-    controller = new Controller(store, engine);
-    if (!model) controller.notice = "No Pi login found. Run pi and /login, then restart zz.";
+    controller = new Controller(store, engine, auth);
+    if (!model) controller.notice = "No Pi login found. Use /login, then /model to choose a provider and model.";
     tui = new TuiAltScreen(new ProcessTerminal(), false, root, { mouse: true, scrollToEndIndicator });
     const app = new Dashboard(controller, tui, () => shutdown.request());
     tui.setLayoutRoot(app);
@@ -122,8 +129,8 @@ async function main(): Promise<void> {
     timer = setInterval(() => {
       const now = Date.now();
       const animating = motionEnabled() && (controller?.mode === "session"
-        ? controller.opened?.status === "working"
-        : controller?.currentRows.some((row) => row.kind === "session" && row.session.status === "working"));
+        ? !!controller.opened && displayStatus(controller.opened) === "working"
+        : controller?.currentRows.some((row) => row.kind === "session" && displayStatus(row.session) === "working"));
       if (animating || now - lastRefresh >= 30_000) {
         tui?.requestRender();
         lastRefresh = now;
