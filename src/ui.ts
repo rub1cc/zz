@@ -6,7 +6,7 @@ import {
 import { Controller } from "./controller.js";
 import { age, lastReply, rowId, type Row } from "./model.js";
 import { displayPath } from "./store.js";
-import { accent, bold, dim, fit, green, markdown, oneLine, pad, warning } from "./format.js";
+import { accent, bold, dim, fit, green, markdown, oneLine, pad, warning, workingIcon } from "./format.js";
 import { Transcript } from "./transcript.js";
 import { SettingsDialog } from "./settings-dialog.js";
 import { Composer } from "./composer.js";
@@ -50,8 +50,8 @@ class SessionList extends Dynamic {
         rowLines = [`${heading}${dim(`  ${count} session${count === 1 ? "" : "s"}`)}`];
       } else {
         const { session } = row;
-        const symbol = session.status === "working" ? accent("*") : session.status === "needs-input" ? warning("?")
-          : session.status === "failed" ? warning("!") : session.status === "paused" ? dim("-") : green(".");
+        const symbol = session.status === "working" ? accent(workingIcon()) : session.status === "needs-input" ? warning("?")
+          : session.status === "failed" ? warning("!") : session.status === "paused" ? dim("-") : green("∙");
         const time = age(session.updatedAt);
         const title = oneLine(session.title);
         const titleWidth = Math.max(visibleWidth(title), Math.min(28, Math.max(8, Math.floor(width * 0.3))));

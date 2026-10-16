@@ -118,7 +118,9 @@ async function main(): Promise<void> {
     let lastRefresh = Date.now();
     timer = setInterval(() => {
       const now = Date.now();
-      const animating = controller?.mode === "session" && controller.opened?.status === "working" && motionEnabled();
+      const animating = motionEnabled() && (controller?.mode === "session"
+        ? controller.opened?.status === "working"
+        : controller?.currentRows.some((row) => row.kind === "session" && row.session.status === "working"));
       if (animating || now - lastRefresh >= 30_000) {
         tui?.requestRender();
         lastRefresh = now;

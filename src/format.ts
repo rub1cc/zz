@@ -12,6 +12,11 @@ export const pad = (s: string, width: number) => s + " ".repeat(Math.max(0, widt
 
 export const motionEnabled = () => process.env.ZZ_REDUCED_MOTION !== "1" && process.env.NO_COLOR === undefined;
 
+const workingFrames = ["✽", "✻", "✢", "∙", "✢", "✻", "✽"] as const;
+export function workingIcon(now = Date.now()): string {
+  return workingFrames[motionEnabled() ? Math.floor(now / 160) % workingFrames.length : 0]!;
+}
+
 // Terminal equivalent of a linear, two-second highlight sweep over muted text.
 export function shimmer(text: string, now = Date.now()): string {
   if (!motionEnabled()) return dim(text);

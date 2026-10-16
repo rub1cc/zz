@@ -1,6 +1,6 @@
 import { Markdown, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import type { Controller } from "./controller.js";
-import { accent, bold, dim, fit, green, markdownTheme, oneLine, plain, shimmer, warning } from "./format.js";
+import { accent, bold, dim, fit, green, markdownTheme, oneLine, plain, shimmer, warning, workingIcon } from "./format.js";
 import type { Message, Session, ToolActivity } from "./model.js";
 
 const userStyle = {
@@ -19,7 +19,7 @@ export function activityLabel(tool: ToolActivity): string {
 }
 
 export function workLabel(session: Session): string | undefined {
-  if (session.status === "working") return shimmer("✻ Working");
+  if (session.status === "working") return shimmer(`${workingIcon()} Working`);
   const work = session.work;
   if (!work || work.finishedAt === undefined || session.status === "paused") return;
   const seconds = Math.max(0, Math.round((work.finishedAt - work.startedAt) / 1000));

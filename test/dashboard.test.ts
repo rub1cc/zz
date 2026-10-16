@@ -94,6 +94,46 @@ test("wrapped unselected titles keep following row positions and continuation-li
   } finally { await f.cleanup(); }
 });
 
+test("dashboard loops working icons, keeps completed dots static, and respects reduced motion", async (t) => {
+  const oldMotion = process.env.ZZ_REDUCED_MOTION;
+  const oldColor = process.env.NO_COLOR;
+  t.after(() => {
+    if (oldMotion === undefined) delete process.env.ZZ_REDUCED_MOTION; else process.env.ZZ_REDUCED_MOTION = oldMotion;
+    if (oldColor === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = oldColor;
+  });
+  delete process.env.ZZ_REDUCED_MOTION;
+  delete process.env.NO_COLOR;
+  const f = setup();
+  try {
+    f.c.send("task"); await tick();
+    const session = f.store.state.sessions[0]!;
+    let now = 0;
+    t.mock.method(Date, "now", () => now);
+    const line = (width = 120) => {
+      const lines = f.app.body.render(width);
+      return lines[f.app.body.positions.get(`session:${session.id}`)!]!;
+    };
+    session.status = "working";
+    for (const [index, icon] of ["✽", "✻", "✢", "∙", "✢", "✻", "✽", "✽"].entries()) {
+      now = index * 160;
+      for (const width of [18, 40, 120]) {
+        const rendered = line(width);
+        assert.match(stripTerminalSequences(rendered), new RegExp(`^  ${icon} `));
+        assertFullyHighlighted(rendered, width);
+      }
+    }
+    for (const env of ["ZZ_REDUCED_MOTION", "NO_COLOR"]) {
+      process.env[env] = "1";
+      for (now of [0, 160, 480, 1120]) assert.match(stripTerminalSequences(line()), /^  ✽ /);
+      delete process.env[env];
+    }
+    for (const [status, icon] of [["completed", "∙"], ["needs-input", "?"], ["failed", "!"], ["paused", "-"]] as const) {
+      session.status = status;
+      for (now of [0, 160, 320]) assert.equal(stripTerminalSequences(line()).slice(2, 3), icon);
+    }
+  } finally { await f.cleanup(); }
+});
+
 test("selected project headings stay highlighted when clipped", async () => {
   const f = setup();
   try {
@@ -536,7 +576,7 @@ test("session shows working status until completion and resets timing on the nex
     const session = f.c.opened!;
     session.work!.startedAt = Date.now() - 3000;
     const render = () => f.app.body.render(120).map(stripTerminalSequences).join("\n");
-    assert.match(render(), /✻ Working/);
+    assert.match(render(), /[✽✻✢∙] Working/);
     for (const width of [1, 4, 10, 24, 50, 120]) {
       assert.ok(f.app.body.render(width).every((line) => visibleWidth(line) <= width));
     }
@@ -550,7 +590,7 @@ test("session shows working status until completion and resets timing on the nex
     f.c.send("follow up");
     assert.equal(session.work!.finishedAt, undefined);
     assert.ok(session.work!.startedAt >= finishedAt!);
-    assert.match(render(), /✻ Working/);
+    assert.match(render(), /[✽✻✢∙] Working/);
     assert.doesNotMatch(render(), /Worked for/);
     complete(); await tick();
   } finally { await f.cleanup(); }
