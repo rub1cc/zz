@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { ProgramStatus, Terminal } from "@earendil-works/pi-tui";
 import type { Engine } from "../src/controller.js";
 import { sessionStats } from "../src/usage.js";
-import type { AgentSettings, ModelOption, Project, Session, SkillOption } from "../src/model.js";
+import type { AgentSettings, CompactResult, ModelOption, Project, Session, SkillOption } from "../src/model.js";
 
 export function temporary(): { root: string; cleanup(): void } {
   const root = mkdtempSync(join(process.cwd(), ".zz-test-"));
@@ -24,6 +24,11 @@ export class FakeEngine implements Engine {
     if (session) session.agent = next; else this.defaults = next;
   }
   calls: { session: Session; project: Project; prompt: string }[] = [];
+  compactions: { session: Session; instructions?: string }[] = [];
+  async compact(session: Session, instructions?: string): Promise<CompactResult> {
+    this.compactions.push({ session, instructions });
+    return "compacted" as const;
+  }
   stopped: string[] = [];
   cancelled: string[] = [];
   async run(session: Session, project: Project, prompt: string): Promise<void> {

@@ -1,5 +1,7 @@
 import type { ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
-import type { ModelRef } from "@earendil-works/pi-durable";
+import type { CompactionFailure, CompactionStatus, ModelRef } from "@earendil-works/pi-durable";
+
+export type CompactResult = "compacted" | "unchanged" | "stale" | "aborted";
 
 export const thinkingLevels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export function isThinkingLevel(value: unknown): value is ModelThinkingLevel {
@@ -64,6 +66,9 @@ export interface SessionStats {
 }
 
 export interface Session {
+  /** Cached durable activity, refreshed from pi.live on restore. Independent of the agent run. */
+  compactions?: CompactionStatus[];
+  compactionFailure?: CompactionFailure;
   /** Cached presentation of the durable usage ledger, separate from title overhead. */
   usage?: Usage;
   titleUsage?: Usage;
@@ -138,4 +143,13 @@ export function age(timestamp: number, now = Date.now()): string {
   const minutes = Math.max(0, Math.floor((now - timestamp) / 60_000));
   return minutes < 1 ? "now" : minutes < 60 ? `${minutes}m`
     : minutes < 1440 ? `${Math.floor(minutes / 60)}h` : `${Math.floor(minutes / 1440)}d`;
+}
+
+/** Shared by dashboard previews and the transcript; compaction is not an agent reply. */
+export function compactionLabel(session: Session): string | undefined {
+  const current = session.compactions?.[0];
+  if (!current) return;
+  const reason = current.reason === "manual" ? "manual" : current.reason === "overflow" ? "auto / overflow" : "auto";
+  return `Compacting context (${reason}${current.blocking ? " / blocking" : ""})${current.retry
+    ? ` / retry ${current.attempt}: ${current.retry.error}` : "..."}`;
 }

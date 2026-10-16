@@ -3,7 +3,7 @@ import { writeFileSync } from "node:fs";
 import { test } from "node:test";
 import type { Message, Usage } from "@earendil-works/pi-ai";
 import { estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
-import type { ContextView, ConversationView } from "@earendil-works/pi-durable";
+import type { CompactionStatus, ContextView, ConversationView } from "@earendil-works/pi-durable";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { applyView } from "../src/engine.js";
 import type { Session } from "../src/model.js";
@@ -102,6 +102,28 @@ test("cached usage is backwards compatible, validated and persists without chang
     ]) {
       const state = structuredClone(store.state); change(state.sessions[0]!);
       const json = JSON.stringify(state); writeFileSync(store.file, json);
+      assert.throws(() => new Store(temp.root), /Invalid zz state/);
+    }
+  } finally { temp.cleanup(); }
+});
+
+test("cached compaction activity is validated and round-trips with session metadata", () => {
+  const temp = temporary();
+  try {
+    const store = new Store(temp.root); const s = session(); store.state.sessions.push(s);
+    s.compactions = [{ taskId: 12 as CompactionStatus["taskId"], reason: "threshold", blocking: false, attempt: 2,
+      retry: { at: 123, error: "Provider busy" } }];
+    s.compactionFailure = { taskId: s.compactions[0]!.taskId, reason: "overflow", error: "Summary failed" };
+    store.save();
+    assert.deepEqual(new Store(temp.root).state.sessions[0], s);
+    for (const change of [
+      (value: Session) => { value.compactions![0]!.attempt = 0; },
+      (value: Session) => { value.compactions![0]!.taskId = -1 as CompactionStatus["taskId"]; },
+      (value: Session) => { value.compactions![0]!.retry!.at = -1; },
+      (value: Session) => { value.compactionFailure!.reason = "unknown" as "manual"; },
+    ]) {
+      const state = structuredClone(store.state); change(state.sessions[0]!);
+      writeFileSync(store.file, JSON.stringify(state));
       assert.throws(() => new Store(temp.root), /Invalid zz state/);
     }
   } finally { temp.cleanup(); }

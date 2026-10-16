@@ -1,3 +1,4 @@
+import type { CompactionFailure, CompactionStatus } from "@earendil-works/pi-durable";
 import type { Usage } from "@earendil-works/pi-ai";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
@@ -30,6 +31,8 @@ function isState(value: unknown): value is State {
       && typeof s.title === "string" && typeof s.preview === "string"
       && (s.stopped === undefined || typeof s.stopped === "boolean")
       && (s.agent === undefined || isAgentSettings(s.agent))
+      && (s.compactions === undefined || Array.isArray(s.compactions) && s.compactions.every(isCompaction))
+      && (s.compactionFailure === undefined || isCompactionIdentity(s.compactionFailure) && typeof s.compactionFailure.error === "string")
       && (s.usage === undefined || isUsage(s.usage))
       && (s.titleUsage === undefined || isUsage(s.titleUsage))
       && (s.context === undefined || !!s.context && nonnegative(s.context.tokens)
@@ -41,6 +44,16 @@ function isState(value: unknown): value is State {
       && Array.isArray(s.messages) && s.messages.every((m) => typeof m.text === "string"
         && ["user", "assistant", "tool", "error"].includes(m.role) && Number.isFinite(m.timestamp)
         && (m.tool === undefined || isToolActivity(m.tool))));
+}
+
+function isCompactionIdentity(value: CompactionStatus | CompactionFailure): boolean {
+  return !!value && Number.isSafeInteger(value.taskId) && value.taskId >= 0
+    && ["manual", "threshold", "overflow"].includes(value.reason);
+}
+
+function isCompaction(value: CompactionStatus): boolean {
+  return isCompactionIdentity(value) && typeof value.blocking === "boolean" && Number.isSafeInteger(value.attempt) && value.attempt > 0
+    && (value.retry === undefined || !!value.retry && nonnegative(value.retry.at) && typeof value.retry.error === "string");
 }
 
 function nonnegative(value: unknown): value is number {

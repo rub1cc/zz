@@ -17,7 +17,7 @@ function provider(cwd: string, session = false, commands = true) {
 test("slash discovery filters available commands and excludes later draft lines and peek commands", async () => {
   const p = provider(process.cwd());
   const all = await suggestions(p, "/");
-  assert.deepEqual(all?.items.map((i) => i.value), ["model", "thinking", "skills", "session", "stop", "help"]);
+  assert.deepEqual(all?.items.map((i) => i.value), ["model", "thinking", "skills", "session", "compact", "stop", "help"]);
   assert.equal((await suggestions(p, "/th"))?.items[0]?.value, "thinking");
   assert.equal(await suggestions(p, "/does-not-exist"), null);
   assert.equal(await suggestions(p, "draft\n/mo"), null);

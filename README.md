@@ -96,8 +96,38 @@ Conversation totals come from Pi durable's usage ledger, including recorded tool
 usage, failed/retried responses, and summarization. Reopening, changing models, or
 shrinking the active context does not reset the totals. Title usage and display
 caches are saved with zz's session metadata. Context warnings start above 70%.
-This adds visibility only: it does not add `/compact` or change the durable
-harness's existing compaction behavior.
+
+## Context Compaction
+
+- `/compact [instructions]` summarizes older context in the open session, or the
+  selected session on the dashboard. For example: `/compact Keep exact paths and
+  the failing test names`. It calls Pi durable's built-in summarizer, not a new
+  agent prompt. Short conversations may report "Nothing to compact" because the
+  recent context is kept verbatim.
+- Manual compaction can run alongside a response. The summary is applied at the
+  next safe turn boundary; zz reports success only after it is applied. Duplicate
+  requests are rejected while that session is compacting.
+- Automatic compaction is already enabled by the durable SDK. zz keeps its defaults:
+  start in the background when estimated context exceeds `contextWindow - 49,152`
+  tokens; block the next model request above `contextWindow - 16,384` tokens; retain
+  roughly 20,000 recent tokens verbatim. Provider context-overflow errors trigger
+  compaction and one retry. These are token estimates, not fixed percentages.
+- Running compactions show their manual/automatic reason, blocking status, and
+  retry errors in the transcript and dashboard preview. Failures remain visible
+  until a later summary succeeds. A failed blocking automatic compaction fails the
+  response rather than sending a request the engine considers too large.
+- Applied summaries appear as expandable **Context compacted** activity cards,
+  followed by the retained recent messages. Older messages remain in SQLite's
+  audit history; they are no longer part of the active transcript/model context.
+  Compaction never resets usage/cost totals, and summarization usage is included.
+- Escape in an open session, or `/stop` for an open/selected session, cancels active
+  summarization as well as any running response. Cancelling only a compaction does
+  not mark an otherwise idle conversation stopped. Already committed summaries
+  are not undone. Closing zz checkpoints unfinished compactions for restart.
+
+No separate model, dependency, or hand-written summarization pipeline is used.
+Automatic thresholds remain the SDK defaults; zz does not yet expose a toggle or
+threshold editor.
 
 ## Compact Activity
 
@@ -291,4 +321,7 @@ double-confirm deletion, narrow and wide-character rendering, real durable
 storage and tools with an offline test provider, interrupted-run recovery, skill
 discovery/loading, thinking cycling, follow-end/jump-to-bottom scrolling, and
 context/usage accounting, title overhead, restore, and narrow usage dialogs.
+Compaction tests cover manual instructions, no-ops, concurrent responses, history
+and spend retention, cancellation, restart, background/blocking thresholds, overflow
+recovery, failures, and narrow activity rendering.
 They do not call a paid model provider.

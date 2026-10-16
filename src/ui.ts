@@ -143,6 +143,9 @@ export class Dashboard extends VStack implements Focusable {
       return true;
     }
     if (command === "/session") { this.controller.showUsage(); return true; }
+    if (/^\/compact(?:\s|$)/.test(command)) {
+      void this.controller.compact(command.slice("/compact".length).trim() || undefined); return true;
+    }
     if (command === "/stop") { void this.controller.cancel(); return true; }
     if (command === "/help") {
       this.controller.dialog = { kind: "help" }; this.controller.changed(); return true;
@@ -373,6 +376,7 @@ class DialogView implements Component, Focusable {
       "shift+tab       cycle supported thinking levels",
       "/skills         choose a skill; /skill:name [task] loads it",
       "/session        context, tokens, cache and estimated cost",
+      "/compact [instructions] summarize older context in open/selected session",
       "ctrl+end /bottom scroll to bottom and follow new output",
       "tab / ctrl+n/p  select tools in session",
       "space / enter   expand or collapse selected tool (empty composer)",

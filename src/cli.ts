@@ -32,6 +32,7 @@ If shutdown stalls, press ctrl+c again to force exit (automatic after 5 seconds)
 Inside a session, Escape stops running work and stays in the session.
 Left Arrow returns to the dashboard when the composer is empty; work continues.
 /stop cancels the open or selected session without deleting its history.
+/compact [instructions] summarizes its older context; automatic compaction is enabled.
 
 Uses your existing Pi login and saved default model. No separate API key needed.
 Model override: --model or ZZ_MODEL (provider/model-id).

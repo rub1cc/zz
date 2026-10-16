@@ -1,7 +1,7 @@
 import { Markdown, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import type { Controller } from "./controller.js";
 import { accent, bold, dim, fit, green, markdownTheme, oneLine, plain, shimmer, warning, workingIcon } from "./format.js";
-import type { Message, Session, ToolActivity } from "./model.js";
+import { compactionLabel, type Message, type Session, type ToolActivity } from "./model.js";
 
 const userStyle = {
   color: (text: string) => `\x1b[38;2;32;32;32m${text}\x1b[39m`,
@@ -9,6 +9,7 @@ const userStyle = {
 };
 
 export function activityLabel(tool: ToolActivity): string {
+  if (tool.name === "compact") return `Context compacted (${tool.arguments.reason ?? "manual"})`;
   if (tool.name === "load_skill" && typeof tool.arguments.name === "string") return `Skill ${tool.arguments.name}`;
   const path = typeof tool.arguments.path === "string" ? tool.arguments.path.replaceAll("\\", "/") : "";
   if (tool.name === "read" && /(^|\/)SKILL\.md$/i.test(path)) {
@@ -111,6 +112,9 @@ export class Transcript implements Component {
       lines.push(...cached.renderer.render(Math.max(1, width - 4)).map((line) => `  ${line}`), "");
     }
     if (this.selected && !this.ids.includes(this.selected)) this.selected = undefined;
+    const compacting = compactionLabel(session);
+    if (compacting) lines.push(`  ${accent(oneLine(compacting))}`, "");
+    if (session.compactionFailure) lines.push(`  ${warning(oneLine(`Compaction failed (${session.compactionFailure.reason}): ${session.compactionFailure.error}`))}`, "");
     const status = workLabel(session);
     if (status) lines.push(`  ${status}`, "");
     return lines.map((line) => fit(line, width));

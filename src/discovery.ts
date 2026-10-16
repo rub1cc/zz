@@ -18,6 +18,7 @@ export function composerCommands(session: boolean): SlashCommand[] {
     { name: "thinking", description: "Choose a thinking level" },
     { name: "skills", description: "Find and load a skill" },
     { name: "session", description: "Context, tokens, cache and estimated cost" },
+    { name: "compact", description: "Summarize older context in the open or selected session (optional instructions)" },
     { name: "stop", description: "Stop the open or selected session without deleting it" },
     { name: "help", description: "Show keyboard shortcuts" },
     ...(session ? [

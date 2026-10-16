@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { finishWork, markStopped, rowId, rows, type AgentSettings, type ModelOption, type Project, type Row, type Session, type SessionStats, type SkillOption } from "./model.js";
+import { finishWork, markStopped, rowId, rows, type AgentSettings, type CompactResult, type ModelOption, type Project, type Row, type Session, type SessionStats, type SkillOption } from "./model.js";
 import { Store } from "./store.js";
 
 export interface Engine {
   run(session: Session, project: Project, prompt: string, changed: () => void): Promise<void>;
+  compact(session: Session, instructions: string | undefined, changed: () => void): Promise<CompactResult>;
   stop(sessionId: string): Promise<void>;
   cancel(sessionId: string): Promise<void>;
   close(): Promise<void>;
@@ -38,6 +39,7 @@ export class Controller {
   private saveTimer?: ReturnType<typeof setTimeout>;
   private pending = new Set<string>();
   private cancelling = new Set<string>();
+  private compacting = new Set<string>();
   private configuring = false;
   private thinkingQueue = Promise.resolve();
 
@@ -119,7 +121,8 @@ export class Controller {
     if (this.closing || this.configuring) return false;
     if (sessionId && !session) { this.fail("Session no longer exists."); return false; }
     const thinkingOnly = change.thinkingLevel !== undefined && change.model === undefined;
-    if (!thinkingOnly && session && (session.status === "working" || this.pending.has(session.id))) {
+    if (!thinkingOnly && session && (session.status === "working" || this.pending.has(session.id)
+      || session.compactions?.length || this.compacting.has(session.id))) {
       this.fail("Wait for this session to finish before changing its model or thinking."); return false;
     }
     this.configuring = true;
@@ -198,8 +201,28 @@ export class Controller {
     this.back();
   }
 
+  async compact(instructions?: string): Promise<void> {
+    const session = this.mode === "session" ? this.opened : this.selected?.kind === "session" ? this.selected.session : undefined;
+    if (!session) { this.fail("Open or select a session first to compact it."); return; }
+    if (this.closing || this.cancelling.has(session.id)) return;
+    if (this.compacting.has(session.id) || session.compactions?.length) {
+      this.fail("This session is already compacting."); return;
+    }
+    this.compacting.add(session.id);
+    this.notice = "Compacting context...";
+    this.changed();
+    try {
+      const result = await this.engine.compact(session, instructions, () => this.changed(true));
+      if (!this.closing) this.notice = result === "compacted" ? "Context compacted. History and usage totals are retained."
+        : result === "unchanged" ? "Nothing to compact yet; recent context is kept verbatim."
+        : result === "stale" ? "Summary superseded by a newer context; not applied." : "Compaction cancelled.";
+    } catch (error) { if (!this.closing) this.fail(error); }
+    finally { this.compacting.delete(session.id); this.changed(true); }
+  }
+
   canStop(session: Session): boolean {
-    return session.status === "working" || this.pending.has(session.id) || this.cancelling.has(session.id);
+    return session.status === "working" || !!session.compactions?.length || this.compacting.has(session.id)
+      || this.pending.has(session.id) || this.cancelling.has(session.id);
   }
 
   async cancel(sessionId?: string): Promise<void> {
@@ -210,15 +233,16 @@ export class Controller {
     if (!this.canStop(session)) {
       this.notice = session.stopped ? "Stopped. Reply to continue." : "This session is already idle."; this.changed(); return;
     }
+    const stoppingRun = session.status === "working" || this.pending.has(session.id);
     this.cancelling.add(session.id);
     this.notice = "Stopping...";
     this.changed();
     try {
       await this.engine.cancel(session.id);
-      markStopped(session);
+      if (stoppingRun) markStopped(session);
       this.pending.delete(session.id);
       this.store.save();
-      this.notice = "Stopped. Reply to continue.";
+      this.notice = stoppingRun ? "Stopped. Reply to continue." : "Compaction cancelled.";
     } catch (error) { this.fail(error); }
     finally { this.cancelling.delete(session.id); this.changed(); }
   }

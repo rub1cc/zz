@@ -6,6 +6,7 @@ import { createModels, type Provider } from "@earendil-works/pi-ai/models";
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
 import type { AssistantMessage, Context, SimpleStreamOptions, TextContent, ToolCall, Usage } from "@earendil-works/pi-ai";
+import type { ConversationId } from "@earendil-works/pi-durable";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
 import { DurableEngine } from "../src/engine.js";
@@ -23,14 +24,18 @@ function session(project: Project, id: string): Session {
   return { id, projectId: project.id, title: id, status: "working", preview: "Starting", createdAt: Date.now(), updatedAt: Date.now(), messages: [] };
 }
 
-function models(options: { pause?: boolean; started?: () => void; context?: (context: Context) => void; request?: (id: string, reasoning: SimpleStreamOptions["reasoning"]) => void;
-  usage?: Usage; titleUsage?: Usage;
+function models(options: { pause?: boolean; finish?: (done: () => void) => void; overflow?: boolean; started?: () => void; context?: (context: Context) => void; request?: (id: string, reasoning: SimpleStreamOptions["reasoning"]) => void;
+  usage?: Usage; titleUsage?: Usage; contextWindow?: number;
+  compaction?: { fail?: boolean; pause?: boolean; started?: () => void; context?: (context: Context) => void; usage?: Usage };
   title?: { text?: string; fail?: boolean; pause?: boolean; ignoreAbort?: boolean; finish?: (done: () => void) => void; context?: (context: Context) => void } } = {}) {
   const models = createModels();
-  const model = { ...getBuiltinModel("openai", "gpt-4.1"), provider: "test", id: "mock" };
+  const model = { ...getBuiltinModel("openai", "gpt-4.1"), provider: "test", id: "mock",
+    ...(options.contextWindow === undefined ? {} : { contextWindow: options.contextWindow }) };
   const stream = (_model: unknown, context: Context, request?: SimpleStreamOptions) => {
     const isTitle = context.messages.some((m) => m.role === "system" && typeof m.content === "string" && m.content.startsWith("Generate a short session title"));
+    const isCompaction = context.messages.some((m) => m.role === "system" && typeof m.content === "string" && m.content.startsWith("You are a context summarization assistant"));
     if (isTitle) options.title?.context?.(context);
+    else if (isCompaction) options.compaction?.context?.(context);
     else {
       options.context?.(context);
       options.request?.((_model as { id: string }).id, request?.reasoning);
@@ -42,8 +47,9 @@ function models(options: { pause?: boolean; started?: () => void; context?: (con
       stopReason: "stop", timestamp: Date.now(),
     };
     queueMicrotask(() => {
-      if (!isTitle) options.started?.();
-      if (isTitle ? options.title?.pause : options.pause) {
+      if (isCompaction) options.compaction?.started?.();
+      else if (!isTitle) options.started?.();
+      if (isTitle ? options.title?.pause : isCompaction ? options.compaction?.pause : options.pause) {
         if (isTitle && options.title?.ignoreAbort) {
           options.title.finish?.(() => {
             message.content = [{ type: "text", text: "Late session title" }];
@@ -56,6 +62,19 @@ function models(options: { pause?: boolean; started?: () => void; context?: (con
           events.push({ type: "error", reason: "aborted", error: message });
         };
         if (request?.signal?.aborted) abort(); else request?.signal?.addEventListener("abort", abort, { once: true });
+        if (!isTitle && !isCompaction) options.finish?.(() => {
+          message.content = [{ type: "text", text: "Recovered answer" }];
+          events.push({ type: "done", reason: "stop", message });
+        });
+        return;
+      }
+      if (isCompaction) {
+        message.content = [{ type: "text", text: "Checkpoint: preserve the implementation plan and pending tests." }];
+        if (options.compaction?.usage) message.usage = structuredClone(options.compaction.usage);
+        if (options.compaction?.fail) {
+          message.stopReason = "error"; message.errorMessage = "Summary unavailable";
+          events.push({ type: "error", reason: "error", error: message });
+        } else events.push({ type: "done", reason: "stop", message });
         return;
       }
       if (isTitle ? options.titleUsage : options.usage) message.usage = structuredClone((isTitle ? options.titleUsage : options.usage)!);
@@ -68,6 +87,12 @@ function models(options: { pause?: boolean; started?: () => void; context?: (con
         return;
       }
       const last = context.messages.at(-1);
+      if (options.overflow) {
+        options.overflow = false;
+        message.stopReason = "error"; message.errorMessage = "maximum context length exceeded";
+        events.push({ type: "error", reason: "error", error: message });
+        return;
+      }
       if (typeof last?.content === "string" && last.content === "fail") {
         message.stopReason = "error"; message.errorMessage = "Simulated provider failure";
         events.push({ type: "error", reason: "error", error: message });
@@ -603,5 +628,247 @@ test("provider failures and invalid title responses retain reported spend", asyn
     assert.ok(engine.stats(s).context!.tokens > 0, "failed response is excluded; system and user input are estimated");
     await engine.run(s, project, "retry", () => {});
     assert.equal(engine.stats(s).usage?.totalTokens, 6);
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+async function seedCompactableHistory(engine: DurableEngine, s: Session, project: Project) {
+  // Enough actual text for the SDK to select a prefix while retaining ~20k recent tokens.
+  for (const name of ["oldest", "middle", "recent"]) {
+    await engine.run(s, project, `${name} detail `.repeat(6000), () => {});
+  }
+}
+
+test("manual compaction uses the durable summarizer, retains audit history and spend, and restores the checkpoint", async () => {
+  const temp = temporary(); const store = new Store(join(temp.root, "data")); const project = store.addProject(temp.root);
+  const s = session(project, "compact"); store.state.sessions.push(s);
+  const summaries: Context[] = []; const requests: Context[] = [];
+  let engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)),
+    models({ context: (c) => requests.push(c), compaction: { context: (c) => summaries.push(c) } }));
+  try {
+    await assert.rejects(engine.compact(s, undefined, () => {}), /No conversation/);
+    await seedCompactableHistory(engine, s, project);
+    const id = s.conversationId!;
+    const conversation = (await engine.harness.conversation(id as ConversationId, BACKGROUND_CONTEXT))!;
+    const before = await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT);
+    const spend = s.usage!.totalTokens;
+    const tokens = JSON.stringify((await conversation.context(BACKGROUND_CONTEXT)).messages).length;
+    const work = structuredClone(s.work);
+    assert.equal(await engine.compact(s, "Keep pending tests and exact paths", () => {}), "compacted");
+    assert.equal(s.conversationId, id);
+    assert.deepEqual(s.work, work, "summarization is not a new agent run");
+    assert.equal(s.status, "completed");
+    assert.equal(s.compactions, undefined);
+    assert.equal(s.compactionFailure, undefined);
+    assert.equal(summaries.length, 1);
+    assert.match(JSON.stringify(summaries[0]), /Keep pending tests and exact paths/);
+    assert.equal(s.usage!.totalTokens, spend + 2);
+    assert.ok(JSON.stringify((await conversation.context(BACKGROUND_CONTEXT)).messages).length < tokens);
+    const card = s.messages.find((m) => m.tool?.name === "compact")!;
+    assert.match(card.tool!.output, /Checkpoint:/);
+    assert.equal(card.tool!.arguments.reason, "manual");
+    assert.ok(!s.messages.some((m) => m.role === "user" && m.text.includes("<summary>")));
+    const after = await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT);
+    assert.equal(after.items.length, before.items.length + 1);
+    assert.deepEqual(after.items.slice(0, before.items.length), before.items);
+    await engine.run(s, project, "continue from checkpoint", () => {});
+    assert.match(JSON.stringify(requests.at(-1)), /Checkpoint:/);
+    assert.doesNotMatch(JSON.stringify(requests.at(-1)), /oldest detail/);
+    const total = s.usage!.totalTokens;
+    await engine.close();
+    const restored = new Store(store.root);
+    engine = await openEngine(restored, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)), models());
+    await engine.restore(() => {});
+    const resumed = restored.state.sessions[0]!;
+    assert.equal(resumed.usage!.totalTokens, total);
+    assert.ok(resumed.messages.some((m) => m.tool?.name === "compact"));
+    await engine.run(resumed, project, "continue", () => {});
+    assert.equal(resumed.conversationId, id);
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("short context compaction is a no-op without a summarization request", async () => {
+  const temp = temporary(); const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "short"); store.state.sessions.push(s);
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)),
+    models({ compaction: { started: () => assert.fail("Nothing should be summarized") } }));
+  try {
+    await engine.run(s, project, "hello", () => {});
+    const total = s.usage!.totalTokens;
+    assert.equal(await engine.compact(s, undefined, () => {}), "unchanged");
+    assert.equal(s.usage!.totalTokens, total);
+    assert.equal(s.status, "completed");
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("manual compaction deduplicates admission and can be cancelled without stopping an idle conversation", async () => {
+  const temp = temporary(); const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "cancel-compact"); store.state.sessions.push(s);
+  let started!: () => void; const begin = new Promise<void>((resolve) => { started = resolve; });
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)),
+    models({ compaction: { pause: true, started } }));
+  try {
+    await seedCompactableHistory(engine, s, project);
+    const compacting = engine.compact(s, undefined, () => {});
+    await begin;
+    assert.equal(s.compactions?.[0]?.reason, "manual");
+    await assert.rejects(engine.compact(s, undefined, () => {}), /already compacting/);
+    await engine.cancel(s.id);
+    assert.equal(await compacting, "aborted");
+    assert.equal(s.compactions, undefined);
+    assert.equal(s.stopped, undefined);
+    assert.equal(s.status, "completed");
+    await engine.run(s, project, "continue", () => {});
+    assert.equal(s.status, "completed");
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("failed manual compaction exposes its failure without corrupting context or resetting usage", async () => {
+  const temp = temporary(); const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "failed-compact"); store.state.sessions.push(s);
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)),
+    models({ compaction: { fail: true } }));
+  try {
+    await seedCompactableHistory(engine, s, project);
+    const messages = structuredClone(s.messages); const spend = s.usage!.totalTokens;
+    await assert.rejects(engine.compact(s, undefined, () => {}), /Summary unavailable/);
+    assert.deepEqual(s.messages, messages);
+    assert.equal(s.status, "completed");
+    assert.equal(s.usage!.totalTokens, spend + 2);
+    assert.match(s.compactionFailure!.error, /Summary unavailable/);
+    assert.match(s.preview, /Compaction failed/);
+    await engine.run(s, project, "continue", () => {});
+    assert.equal(s.status, "completed");
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+for (const [input, blocking] of [[60_000, false], [90_000, true]] as const) {
+  test(`automatic compaction uses the SDK's ${blocking ? "blocking" : "background"} threshold and surfaces activity`, async () => {
+    const temp = temporary(); const store = new Store(temp.root); const project = store.addProject(temp.root);
+    const s = session(project, `auto-${input}`); store.state.sessions.push(s);
+    const usage: Usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+    const seen: boolean[] = []; let summaries = 0;
+    const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)),
+      models({ contextWindow: 100_000, usage, compaction: { started: () => {
+        summaries++;
+        for (const item of s.compactions ?? []) { assert.equal(item.reason, "threshold"); seen.push(item.blocking); }
+      } } }));
+    try {
+      await seedCompactableHistory(engine, s, project);
+      usage.input = input; usage.totalTokens = input + 1;
+      await engine.run(s, project, "report usage", () => {});
+      const spend = s.usage!.totalTokens;
+      usage.input = 1; usage.totalTokens = 2;
+      await engine.run(s, project, "continue", () => {});
+      // Background tasks can outlive the answer; give their committed write time to land.
+      for (let i = 0; i < 200 && !s.messages.some((m) => m.tool?.name === "compact"); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.equal(summaries, 1);
+      assert.ok(seen.includes(blocking), `activity=${JSON.stringify(seen)}, expected blocking=${blocking}`);
+      assert.equal(s.compactions, undefined);
+      assert.equal(s.messages.find((m) => m.tool?.name === "compact")?.tool?.arguments.reason, "threshold");
+      assert.equal(s.usage!.totalTokens, spend + 4);
+      assert.equal(s.status, "completed");
+    } finally { await engine.close(); temp.cleanup(); }
+  });
+}
+
+test("closing during manual summarization checkpoints it and restore finishes it once", async () => {
+  const temp = temporary(); const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "recover-compact"); store.state.sessions.push(s);
+  let started!: () => void; const begin = new Promise<void>((resolve) => { started = resolve; });
+  let engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)),
+    models({ compaction: { pause: true, started } }));
+  try {
+    await seedCompactableHistory(engine, s, project);
+    const spend = s.usage!.totalTokens;
+    const pending = engine.compact(s, undefined, () => {});
+    await begin;
+    await engine.close();
+    assert.equal(await pending, "aborted");
+    const restored = new Store(temp.root);
+    engine = await openEngine(restored, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)), models());
+    await engine.restore(() => {});
+    await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+    const resumed = restored.state.sessions[0]!;
+    assert.equal(resumed.compactions, undefined);
+    assert.equal(resumed.messages.filter((m) => m.tool?.name === "compact").length, 1);
+    assert.equal(resumed.usage!.totalTokens, spend + 2);
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("manual compaction during a run waits for summary placement without interrupting the response", async () => {
+  const temp = temporary(); const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "busy-compact"); store.state.sessions.push(s);
+  let started!: () => void; const begin = new Promise<void>((resolve) => { started = resolve; });
+  let finish!: () => void;
+  const options = { pause: false, started: () => { if (options.pause) started(); }, finish: (done: () => void) => { finish = done; } };
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)), models(options));
+  try {
+    await seedCompactableHistory(engine, s, project);
+    options.pause = true;
+    const running = engine.run(s, project, "keep working", () => {});
+    await begin;
+    let applied = false;
+    const compacting = engine.compact(s, undefined, () => {}).then((result) => { applied = true; return result; });
+    // Let the summarization task finish while the response is still paused.
+    let queued = false;
+    for (let i = 0; i < 200; i++) {
+      const inspection = await engine.harness.inspect(BACKGROUND_CONTEXT);
+      if (inspection.submissions.some((item) => item.type === "write")) { queued = true; break; }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(queued, "summarization should finish while the response is paused");
+    assert.equal(applied, false, "a queued summary isn't applied yet");
+    assert.equal(s.status, "working");
+    assert.equal(s.stopped, undefined);
+    finish();
+    await running;
+    assert.equal(await compacting, "compacted");
+    assert.equal(s.status, "completed");
+    assert.equal(s.messages.at(-1)?.text, "Recovered answer");
+    assert.ok(s.messages.some((m) => m.tool?.name === "compact"));
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("provider context overflow uses durable compaction and retries the response once", async () => {
+  const temp = temporary(); const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "overflow-compact"); store.state.sessions.push(s);
+  const options = { overflow: false, context: (_c: Context) => { requests++; } };
+  let requests = 0;
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)), models(options));
+  try {
+    await seedCompactableHistory(engine, s, project);
+    const spend = s.usage!.totalTokens; const count = requests;
+    options.overflow = true;
+    await engine.run(s, project, "continue", () => {});
+    assert.equal(requests, count + 2);
+    assert.equal(s.status, "completed");
+    assert.equal(s.messages.find((m) => m.tool?.name === "compact")?.tool?.arguments.reason, "overflow");
+    assert.equal(s.usage!.totalTokens, spend + 6);
+    assert.equal(s.messages.at(-1)?.text, "Recovered answer");
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("failed blocking auto-compaction fails the run without sending an oversized response request", async () => {
+  const temp = temporary(); const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "auto-failure"); store.state.sessions.push(s);
+  const usage: Usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  let requests = 0;
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => assert.fail(String(error)),
+    models({ contextWindow: 100_000, usage, context: () => { requests++; }, compaction: { fail: true } }));
+  try {
+    await seedCompactableHistory(engine, s, project);
+    usage.input = 90_000; usage.totalTokens = 90_001;
+    await engine.run(s, project, "report usage", () => {});
+    const count = requests; const spend = s.usage!.totalTokens;
+    await engine.run(s, project, "continue", () => {});
+    assert.equal(requests, count);
+    assert.equal(s.status, "failed");
+    assert.match(s.messages.at(-1)!.text, /Summary unavailable/);
+    assert.equal(s.compactionFailure?.reason, "threshold");
+    assert.equal(s.usage!.totalTokens, spend + 2);
   } finally { await engine.close(); temp.cleanup(); }
 });

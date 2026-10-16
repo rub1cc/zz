@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import type { CompactionResult as DurableCompactionResult, TaskId } from "@earendil-works/pi-durable";
 import { stripTerminalSequences, TuiAltScreen, visibleWidth } from "@earendil-works/pi-tui";
 import { Controller } from "../src/controller.js";
 import { Composer } from "../src/composer.js";
-import { rows, rowId } from "../src/model.js";
+import { rows, rowId, type CompactResult } from "../src/model.js";
 import { Store } from "../src/store.js";
 import { Dashboard, scrollToEndIndicator } from "../src/ui.js";
 import { FakeEngine, FakeTerminal, temporary, tick } from "./helpers.js";
@@ -949,5 +950,82 @@ test("peek replies always show session-scoped status and accept question marks a
     f.terminal.onInput(" Ready"); f.terminal.onInput("?"); f.terminal.onInput("\r"); await tick();
     assert.equal(f.engine.calls.at(-1)?.prompt, "? Ready?");
     assert.equal(f.engine.calls.length, 2);
+  } finally { await f.cleanup(); }
+});
+
+test("/compact targets the open or selected session, passes instructions, and never sends a prompt", async () => {
+  const f = setup();
+  try {
+    assert.equal(f.app.composer.onSubmit?.("/compact"), true);
+    assert.match(f.c.notice, /Open or select a session/);
+    assert.equal(f.engine.compactions.length, 0);
+    f.c.send("first task"); await tick();
+    const first = f.store.state.sessions[0]!;
+    f.c.send("second task"); await tick();
+    const second = f.store.state.sessions[1]!;
+    const calls = f.engine.calls.length;
+    f.c.select(`session:${first.id}`);
+    assert.equal(f.app.composer.onSubmit?.("/compact keep exact paths\nand pending tests"), true);
+    await tick();
+    assert.equal(f.engine.compactions[0]?.session.id, first.id);
+    assert.equal(f.engine.compactions[0]?.instructions, "keep exact paths\nand pending tests");
+    assert.match(f.c.notice, /Context compacted/);
+    f.c.open();
+    f.c.selection = `session:${second.id}`;
+    assert.equal(f.app.composer.onSubmit?.("/compact"), true); await tick();
+    assert.equal(f.engine.compactions[1]?.session.id, first.id, "open session takes precedence over list selection");
+    assert.equal(f.engine.compactions[1]?.instructions, undefined);
+    assert.equal(f.engine.calls.length, calls);
+    assert.equal(f.store.state.sessions.length, 2);
+  } finally { await f.cleanup(); }
+});
+
+test("compaction activity supports Escape cancellation without marking an idle session stopped", async () => {
+  const f = setup();
+  try {
+    f.c.send("task"); await tick(); f.c.open();
+    const session = f.c.opened!;
+    let finish!: (result: CompactResult) => void;
+    f.engine.compact = async () => new Promise<CompactResult>((resolve) => { finish = resolve; });
+    const compacting = f.c.compact();
+    await f.c.compact();
+    assert.match(f.c.notice, /already compacting/);
+    assert.equal(f.c.canStop(session), true);
+    f.app.composer.setValue("unsent draft");
+    f.c.escape(); await tick();
+    assert.deepEqual(f.engine.cancelled, [session.id]);
+    assert.equal(session.status, "completed");
+    assert.equal(session.stopped, undefined);
+    assert.equal(f.c.mode, "session");
+    assert.equal(f.app.composer.getValue(), "unsent draft");
+    finish("aborted"); await compacting;
+    assert.match(f.c.notice, /Compaction cancelled/);
+  } finally { await f.cleanup(); }
+});
+
+test("automatic compaction, retries, failures and summary cards render safely at narrow widths", async () => {
+  const f = setup();
+  try {
+    f.c.send("task"); await tick(); f.c.open();
+    const session = f.c.opened!;
+    session.compactions = [{ taskId: 123 as TaskId<DurableCompactionResult>, reason: "threshold", blocking: true, attempt: 2,
+      retry: { at: Date.now(), error: "Provider busy\nretrying" } }];
+    session.compactionFailure = { taskId: 100 as TaskId<DurableCompactionResult>, reason: "overflow", error: "Summary failed\x1b[2J" };
+    session.messages.push({ role: "tool", text: "", timestamp: Date.now(), tool: {
+      id: "summary", name: "compact", arguments: { reason: "threshold" }, output: "Checkpoint summary", status: "done",
+    } });
+    const text = f.app.body.transcript.render(120).map(stripTerminalSequences).join("\n");
+    assert.match(text, /Compacting context \(auto \/ blocking\) \/ retry 2: Provider busy/);
+    assert.match(text, /Compaction failed \(overflow\): Summary failed/);
+    assert.match(text, /Context compacted \(threshold\)/);
+    assert.ok(!text.includes("Checkpoint summary"));
+    f.app.body.transcript.toggleAll(true);
+    assert.match(f.app.body.transcript.render(120).join("\n"), /Checkpoint summary/);
+    for (const width of [1, 12, 40, 120]) {
+      const lines = f.app.body.transcript.render(width);
+      assert.ok(lines.every((line) => visibleWidth(line) <= width));
+      assert.ok(lines.every((line) => !line.includes("\x1b[2J")));
+    }
+    assert.equal(f.c.canStop(session), true);
   } finally { await f.cleanup(); }
 });

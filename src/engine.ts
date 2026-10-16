@@ -12,7 +12,7 @@ import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import type { Engine } from "./controller.js";
-import { finishWork, isThinkingLevel, lastReply, markStopped, type AgentSettings, type Message, type ModelOption, type PreparedInput, type Project, type Session, type SessionStats, type SkillOption } from "./model.js";
+import { compactionLabel, finishWork, isThinkingLevel, lastReply, markStopped, type AgentSettings, type CompactResult, type Message, type ModelOption, type PreparedInput, type Project, type Session, type SessionStats, type SkillOption } from "./model.js";
 import { directory, Store } from "./store.js";
 import { SkillCatalog } from "./skills.js";
 import { generateSessionTitle } from "./title.js";
@@ -41,6 +41,8 @@ export function applyView(session: Session, view: ConversationView): void {
   const messages: Message[] = [];
   session.usage = conversationUsage(view.docs["pi.usage"] as UsageState | undefined);
   const live = view.docs["pi.live"] as LiveState | undefined;
+  session.compactions = live?.compactions?.length ? structuredClone(live.compactions) : undefined;
+  session.compactionFailure = live?.compactionFailure && structuredClone(live.compactionFailure);
   const agent = view.docs["pi.agent"] as AgentState | undefined;
   if (agent) session.agent = { model: agent.model, thinkingLevel: agent.thinkingLevel ?? "off" };
   const calls = new Map<string, Message>();
@@ -49,6 +51,14 @@ export function applyView(session: Session, view: ConversationView): void {
   let error: string | undefined;
   let needsInput = false;
   for (const entry of view.entries) {
+    if (entry.kind === "pi.compaction") {
+      const reason = entry.data && typeof entry.data === "object" && !Array.isArray(entry.data) ? entry.data.reason : undefined;
+      messages.push({ role: "tool", text: "", timestamp: entry.model?.[0]?.timestamp ?? session.updatedAt, tool: {
+        id: `compaction:${entry.id}`, name: "compact", arguments: { reason: reason ?? "manual" },
+        output: (entry.model ?? []).map(textOf).join("\n"), status: "done",
+      } });
+      continue;
+    }
     for (const message of entry.model ?? []) {
       if (message.role === "system") continue;
       if (message.role === "user") error = undefined;
@@ -126,6 +136,8 @@ export function applyView(session: Session, view: ConversationView): void {
     if (failure) session.messages.push({ role: "error", text: failure, timestamp: session.updatedAt });
     session.preview = failure ?? lastReply(session).replace(/\s+/g, " ").slice(0, 250);
   }
+  if (session.compactions?.length) session.preview = compactionLabel(session)!;
+  else if (session.compactionFailure && session.status === "completed") session.preview = `Compaction failed: ${session.compactionFailure.error}`;
   session.updatedAt = messages.at(-1)?.timestamp ?? session.updatedAt;
 }
 
@@ -133,6 +145,7 @@ export class DurableEngine implements Engine {
   private handles = new Map<string, Conversation>();
   private views = new Map<string, { dispose(): void }>();
   private active = new Map<string, Promise<void>>();
+  private manualCompactions = new Map<string, Promise<CompactResult>>();
   private contextUpdates = new Map<string, Promise<void>>();
   private stopping = new Set<string>();
   private cancellations = new Map<string, Promise<void>>();
@@ -199,14 +212,14 @@ export class DurableEngine implements Engine {
   async configure(change: Partial<AgentSettings>, session?: Session): Promise<void> {
     if (this.closing) throw new Error("zz is closing.");
     const thinkingOnly = change.thinkingLevel !== undefined && change.model === undefined;
-    if (!thinkingOnly && session && (this.active.has(session.id) || session.status === "working")) throw new Error("Wait for this session to finish first.");
+    if (!thinkingOnly && session && (this.active.has(session.id) || session.status === "working" || session.compactions?.length || this.manualCompactions.has(session.id))) throw new Error("Wait for this session to finish first.");
     const current = this.configuration(session);
     const next = { ...current, ...change };
     if (!next.model) throw new Error("Choose a model first with /model.");
     const model = this.models.getModel(next.model.provider, next.model.modelId);
     if (!model) throw new Error("This model is no longer in Pi's catalog.");
     if (!await this.models.checkAuth(model.provider)) throw new Error(`Run pi and /login for ${model.provider}, then restart zz.`);
-    if (!thinkingOnly && session && this.active.has(session.id)) throw new Error("Wait for this session to finish first.");
+    if (!thinkingOnly && session && (this.active.has(session.id) || session.compactions?.length || this.manualCompactions.has(session.id))) throw new Error("Wait for this session to finish first.");
     if (!isThinkingLevel(next.thinkingLevel)) throw new Error("Invalid thinking level.");
     if (change.thinkingLevel && !getSupportedThinkingLevels(model).includes(change.thinkingLevel)) {
       throw new Error(`This model supports thinking: ${getSupportedThinkingLevels(model).join(", ")}.`);
@@ -380,6 +393,52 @@ export class DurableEngine implements Engine {
     this.store.save();
   }
 
+  compact(session: Session, instructions: string | undefined, changed: () => void): Promise<CompactResult> {
+    if (this.closing) return Promise.reject(new Error("zz is closing."));
+    if (this.stopping.has(session.id)) return Promise.reject(new Error("This session is still stopping."));
+    if (this.manualCompactions.has(session.id) || session.compactions?.length) {
+      return Promise.reject(new Error("This session is already compacting."));
+    }
+    const conversation = this.handles.get(session.id);
+    if (!conversation) return Promise.reject(new Error("No conversation to compact. Send a task first."));
+    const promise = this.compactConversation(session, conversation, instructions, changed).finally(() => {
+      this.manualCompactions.delete(session.id);
+      this.store.save();
+      changed();
+    });
+    this.manualCompactions.set(session.id, promise);
+    return promise;
+  }
+
+  private async compactConversation(session: Session, conversation: Conversation, instructions: string | undefined, changed: () => void): Promise<CompactResult> {
+    try {
+      await this.observe(session, conversation, changed);
+      if (this.closing || this.stopping.has(session.id)) return "aborted";
+      const id = await conversation.compact(instructions?.trim() || undefined, ctx);
+      const { outcome } = (await this.harness.waitForTask(id, ctx)).state;
+      if (outcome.status === "aborted") return "aborted";
+      if (outcome.status !== "completed") {
+        throw new Error(outcome.status === "orphaned" ? outcome.reason : outcome.error.message);
+      }
+      const submissionId = outcome.result.submissionId;
+      if (submissionId !== undefined) {
+        // Completing the summary request isn't success until its write reaches a safe turn boundary.
+        const submission = await this.harness.submission(submissionId, ctx);
+        if (!submission) throw new Error("Compaction summary submission is missing.");
+        const placed = await submission.wait(ctx);
+        if (placed.status === "unanswered") {
+          if (placed.reason === "stale") return "stale";
+          throw new Error(`Compaction summary was not applied: ${placed.reason}`);
+        }
+      }
+      await this.contextUpdates.get(session.id);
+      return submissionId !== undefined || outcome.result.entryId !== undefined ? "compacted" : "unchanged";
+    } catch (error) {
+      if (this.closing) return "aborted";
+      throw error;
+    }
+  }
+
   cancel(sessionId: string): Promise<void> {
     const existing = this.cancellations.get(sessionId);
     if (existing) return existing;
@@ -403,7 +462,7 @@ export class DurableEngine implements Engine {
       title?.abort.abort();
       const conversation = this.handles.get(sessionId) ?? (session?.conversationId !== undefined
         ? await this.harness.conversation(session.conversationId as ConversationId, ctx) : undefined);
-      await Promise.all([conversation?.abort(ctx, { background: true }), running, title?.done]);
+      await Promise.all([conversation?.abort(ctx, { background: true }), running, title?.done, this.manualCompactions.get(sessionId)?.catch(() => {})]);
       await this.contextUpdates.get(sessionId);
       if (session?.stopped) { markStopped(session); this.store.save(); }
     } finally { this.stopping.delete(sessionId); }
@@ -425,7 +484,7 @@ export class DurableEngine implements Engine {
     this.closePromise = (async () => {
       try {
         await durableClose;
-        await Promise.allSettled([...this.active.values(), ...this.contextUpdates.values()]);
+        await Promise.allSettled([...this.active.values(), ...this.manualCompactions.values(), ...this.contextUpdates.values()]);
         await settleWithin(Promise.allSettled([...this.titles.values()].map((title) => title.done)), 250);
       } finally {
         for (const view of this.views.values()) view.dispose();
