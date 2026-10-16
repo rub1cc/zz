@@ -3,7 +3,8 @@
 # Node.js/npm must already be installed. Never invokes sudo or dependency scripts.
 set -euo pipefail
 
-main() {
+# Keep EXIT cleanup in the same scope as the function's local variables.
+main() (
   case "$(uname -s)" in
     Darwin|Linux) ;;
     *) echo "zz: this installer supports macOS and Linux." >&2; exit 1 ;;
@@ -67,6 +68,6 @@ NODE
   esac
   rm -rf -- "$temp"
   trap - EXIT
-}
+)
 
 main "$@"
