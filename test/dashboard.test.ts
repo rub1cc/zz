@@ -132,14 +132,29 @@ test("Escape stops once and stays in the session; Left only goes back with an em
   } finally { await f.cleanup(); }
 });
 
-test("Left with an empty composer returns to the dashboard without stopping active work", async () => {
+for (const [key, data] of [["Left", "\x1b[D"], ["Ctrl+H", "\x08"], ["Kitty Ctrl+H", "\x1b[104;5u"]] as const) {
+  test(`${key} with an empty composer returns to the dashboard without stopping active work`, async () => {
+    const f = setup();
+    try {
+      f.c.send("working task"); await tick(); f.c.open();
+      const session = f.c.opened!; session.status = "working";
+      f.terminal.onInput(data);
+      assert.equal(f.c.mode, "sessions"); assert.equal(session.status, "working");
+      assert.equal(f.c.selection, `session:${session.id}`);
+      assert.equal(f.engine.cancelled.length, 0);
+      assert.equal(f.engine.stopped.length, 0);
+    } finally { await f.cleanup(); }
+  });
+}
+
+test("Ctrl+H with a draft keeps editing instead of leaving the session", async () => {
   const f = setup();
   try {
-    f.c.send("working task"); await tick(); f.c.open();
-    const session = f.c.opened!; session.status = "working";
-    f.terminal.onInput("\x1b[D");
-    assert.equal(f.c.mode, "sessions"); assert.equal(session.status, "working");
-    assert.equal(f.engine.cancelled.length, 0);
+    f.c.send("task"); await tick(); f.c.open();
+    f.app.composer.setValue("draft");
+    f.terminal.onInput("\x08");
+    assert.equal(f.c.mode, "session");
+    assert.equal(f.app.composer.getValue(), "draf");
   } finally { await f.cleanup(); }
 });
 

@@ -114,7 +114,7 @@ read, not a guarantee that every instruction was followed.
 Inside a session:
 - Click a tool row to expand/collapse its arguments, output, and details.
 - Tab or Ctrl+N/P selects a tool; Space or Enter toggles it with an
-  empty composer. Right expands; Space/Enter collapses again. Left with an empty
+  empty composer. Right expands; Space/Enter collapses again. Left or Ctrl+H with an empty
   composer returns to the dashboard without cancelling work. Text in the composer still
   behaves as ordinary text and Enter sends it.
 - `/expand` and `/collapse` show/hide all tool details. Page Up/Down scrolls long
@@ -227,8 +227,8 @@ and session lists never follow chat output.
   Its sessions and running work are retained; re-adding the path restores the group.
 - Escape dismisses suggestions/dialogs first. In a session it stops active model
   and tool work, preserves history and your draft, and stays in the session.
-- Left Arrow returns to the dashboard only when the composer is empty. With text,
-  it moves the cursor normally. Going back does not stop a running task.
+- Left Arrow or Ctrl+H returns to the dashboard only when the composer is empty.
+  With text, normal editing behavior is preserved. Going back does not stop a running task.
 - `/stop` stops the open or selected session without deleting it. Repeated Escape
   while stopping does not leave the session. Reply when stopped to continue with
   the same conversation; stopped work is not automatically resumed on restart.

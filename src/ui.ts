@@ -233,7 +233,7 @@ export class Dashboard extends VStack implements Focusable {
     if (matchesKey(data, Key.pageUp)) { this.scroll.scrollBy(-Math.max(1, this.scroll.viewportHeight - 2)); this.tui.requestRender(); return; }
     if (matchesKey(data, Key.pageDown)) { this.scroll.scrollBy(Math.max(1, this.scroll.viewportHeight - 2)); this.tui.requestRender(); return; }
     if (c.mode === "session") {
-      if (!this.composer.getValue() && matchesKey(data, "left")) { c.back(); return; }
+      if (!this.composer.getValue() && (matchesKey(data, "left") || matchesKey(data, "ctrl+h"))) { c.back(); return; }
       if (matchesKey(data, "tab") || matchesKey(data, "ctrl+n") || matchesKey(data, "ctrl+p")) {
         this.body.render(this.tui.terminal.columns);
         this.body.transcript.move(matchesKey(data, "ctrl+p") ? -1 : 1);
@@ -356,7 +356,7 @@ class DialogView implements Component, Focusable {
       "space           peek last reply when composer is empty", "ctrl+o          manage projects",
       "ctrl+x twice    delete selected session", "a               add a project (in project management)",
       "pgup / pgdn     scroll transcript or peek", "esc             stop work in session; close dialogs",
-      "left            dashboard when composer is empty (work continues)",
+      "left / ctrl+h   dashboard when composer is empty (work continues)",
       "/stop           stop open/selected session, preserving its history",
       "ctrl+l /model   choose model (new tasks or open session)",
       "ctrl+t /thinking choose supported thinking level",
