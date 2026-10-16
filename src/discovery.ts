@@ -1,0 +1,114 @@
+import { access } from "node:fs/promises";
+import { constants } from "node:fs";
+import { delimiter, join } from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { CombinedAutocompleteProvider, type AutocompleteProvider, type SlashCommand } from "@earendil-works/pi-tui";
+import { oneLine } from "./format.js";
+
+export interface DiscoveryContext {
+  cwd: string;
+  /** Peek replies offer files, but do not dispatch dashboard commands. */
+  commands: boolean;
+  session: boolean;
+}
+
+export function composerCommands(session: boolean): SlashCommand[] {
+  return [
+    { name: "model", description: "Choose a model" },
+    { name: "thinking", description: "Choose a thinking level" },
+    { name: "skills", description: "Find and load a skill" },
+    { name: "session", description: "Context, tokens, cache and estimated cost" },
+    { name: "stop", description: "Stop the open or selected session without deleting it" },
+    { name: "help", description: "Show keyboard shortcuts" },
+    ...(session ? [
+      { name: "bottom", description: "Scroll to bottom and follow output" },
+      { name: "expand", description: "Show all tool details" },
+      { name: "collapse", description: "Hide all tool details" },
+    ] : []),
+  ];
+}
+
+/** Reuse an installed fd, including Pi's copy. Never download or run project code. */
+export async function findFd(): Promise<string | null> {
+  const suffix = process.platform === "win32" ? ".exe" : "";
+  const candidates = [join(getAgentDir(), "bin", `fd${suffix}`),
+    ...(process.env.PATH ?? "").split(delimiter).filter(Boolean)
+      .flatMap((dir) => [join(dir, `fd${suffix}`), join(dir, `fdfind${suffix}`)])];
+  for (const file of candidates) {
+    try { await access(file, constants.X_OK); return file; } catch { /* Try the next installed binary. */ }
+  }
+  return null;
+}
+
+/** Pi supplies filtering, quoting, cancellation and completion insertion. */
+export class ComposerDiscovery implements AutocompleteProvider {
+  private readonly provider: CombinedAutocompleteProvider;
+  private readonly fd: Promise<string | null>;
+  private files?: CombinedAutocompleteProvider;
+  pending = false;
+  onRequest?: () => void;
+
+  constructor(readonly context: DiscoveryContext, fd: Promise<string | null> = findFd()) {
+    this.provider = new CombinedAutocompleteProvider(context.commands ? composerCommands(context.session) : [], context.cwd);
+    this.fd = fd;
+  }
+
+  async getSuggestions(...args: Parameters<AutocompleteProvider["getSuggestions"]>) {
+    const [lines, line, col, options] = args;
+    this.pending = true;
+    this.onRequest?.();
+    try {
+      // Only resolve fd for @ search; command discovery never waits for filesystem discovery.
+      const before = (lines[line] ?? "").slice(0, col);
+      const at = /(?:^|[\s([<{`])(@(?:"[^"]*|[^\s"]*))$/.exec(before)?.[1];
+      let suggestions;
+      if (at) {
+        const fd = await this.fd;
+        if (options.signal.aborted) return null;
+        if (fd) {
+          this.files ??= new CombinedAutocompleteProvider([], this.context.cwd, fd);
+          suggestions = await this.files.getSuggestions(...args);
+        } else {
+          // Without fd, @ still browses directories using Pi's ordinary path completion.
+          const path = at.slice(1);
+          const copy = [...lines];
+          copy[line] = before.slice(0, -at.length) + path + (lines[line] ?? "").slice(col);
+          const result = await this.provider.getSuggestions(copy, line, col - 1, { ...options, force: true });
+          suggestions = result && { prefix: at, items: result.items.map((item) => ({
+            ...item, value: `@${item.value}`, description: "Path completion (install fd for recursive search)",
+          })) };
+        }
+      } else {
+        // Commands belong to the start of the message, never a later line in a draft.
+        if (line > 0 && before.trimStart().startsWith("/") && !options.force) return null;
+        suggestions = await this.provider.getSuggestions(...args);
+        // At the start of a prompt, an absolute path can otherwise look like a command.
+        if (!suggestions && line === 0 && before.startsWith("/") && !before.includes(" ")) {
+          suggestions = await this.provider.getSuggestions(lines, line, col, { ...options, force: true });
+        }
+      }
+      if (options.signal.aborted) return null;
+      // Filenames are untrusted terminal text; keep insertion values exact, labels safe.
+      return suggestions && { ...suggestions, items: suggestions.items.map((item) => ({
+        ...item, label: oneLine(item.label), description: item.description && oneLine(item.description),
+      })) };
+    } finally { this.pending = false; }
+  }
+
+  applyCompletion(...args: Parameters<AutocompleteProvider["applyCompletion"]>) {
+    const [lines, cursorLine, cursorCol, item, prefix] = args;
+    // Pi's inserter treats /foo at column zero as a command even when it is a path.
+    if (prefix.startsWith("/") && (item.value.startsWith("/") || item.value.startsWith('"/'))) {
+      const copy = [...lines];
+      const before = (lines[cursorLine] ?? "").slice(0, cursorCol - prefix.length);
+      copy[cursorLine] = before + item.value + (lines[cursorLine] ?? "").slice(cursorCol);
+      return { lines: copy, cursorLine, cursorCol: before.length + item.value.length
+        - (item.label.endsWith("/") && item.value.endsWith('"') ? 1 : 0) };
+    }
+    return this.provider.applyCompletion(...args);
+  }
+
+  shouldTriggerFileCompletion(...args: Parameters<NonNullable<AutocompleteProvider["shouldTriggerFileCompletion"]>>) {
+    return this.provider.shouldTriggerFileCompletion(...args);
+  }
+}
