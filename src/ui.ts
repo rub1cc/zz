@@ -10,6 +10,7 @@ import { accent, bold, dim, fit, green, markdown, oneLine, pad, red, warning, wo
 import { Transcript } from "./transcript.js";
 import { SettingsDialog } from "./settings-dialog.js";
 import { Composer } from "./composer.js";
+import { composerCommands } from "./discovery.js";
 import { composerStatus, usageDetails } from "./usage.js";
 
 export const scrollToEndIndicator = () => accent("[ Scroll to bottom / ctrl+end ]");
@@ -161,6 +162,11 @@ export class Dashboard extends VStack implements Focusable {
       this.body.transcript.toggleAll(command === "/expand");
       return true;
     }
+    // Never turn a known command from another view into a new agent task.
+    if (composerCommands(true).some(({ name }) => command === `/${name}`)) {
+      this.controller.fail(`${command} is only available in an open session. Type / to see commands for this view.`);
+      return true;
+    }
     return false;
   }
 
@@ -188,7 +194,7 @@ export class Dashboard extends VStack implements Focusable {
   sync(): void {
     const c = this.controller;
     this.composer.setDiscovery(c.project && c.mode !== "projects"
-      ? { cwd: c.project.path, commands: true, session: c.mode === "session" } : undefined);
+      ? { cwd: c.project.path, commands: true, session: c.mode === "session", selectedSession: c.selected?.kind === "session" } : undefined);
     if (c.mode !== this.previousMode) {
       this.bodyHost.clear();
       this.bodyHost.addChild(this.scroll, { basis: 0, grow: 1, minSize: 1 });
@@ -356,7 +362,14 @@ class DialogView implements Component, Focusable {
       return frame([bold("Session usage"), "", ...lines.slice(this.offset, this.offset + height), "", dim("pgup pgdn scroll / any other key closes")]);
     }
     if (dialog.kind === "help") {
-      const help = ["up / ctrl+p     select previous project or session",
+      const session = c.mode === "session";
+      const selectedSession = c.selected?.kind === "session";
+      const view = session ? "Open session" : selectedSession ? "Dashboard (session selected)" : "Dashboard (project selected)";
+      const help = [bold(`Commands: ${view}`),
+        ...composerCommands(session, selectedSession).map(({ name, description }) => `/${name}  ${description}`),
+        ...(!session && !selectedSession ? [dim("Select a session for /session, /compact and /stop.")] : []),
+        "", bold("Keyboard shortcuts"),
+      "up / ctrl+p     select previous project or session",
       "down / ctrl+n   select next project or session",
       "enter           new task when composer has text", "enter           open session when composer is empty",
       "ctrl+j          insert a newline in the draft",
@@ -370,18 +383,15 @@ class DialogView implements Component, Focusable {
       "ctrl+x twice    delete session or all sessions in selected project", "a               add a project (in project management)",
       "pgup / pgdn     scroll transcript or peek", "esc             stop work in session; close dialogs",
       "left / ctrl+h   dashboard when composer is empty (work continues)",
-      "/stop           stop open/selected session, preserving its history",
-      "ctrl+l /model   choose model (new tasks or open session)",
-      "ctrl+t /thinking choose supported thinking level",
+      "ctrl+l          choose model (new tasks or open session)",
+      "ctrl+t          choose supported thinking level",
       "shift+tab       cycle supported thinking levels",
-      "/skills         choose a skill; /skill:name [task] loads it",
-      "/session        context, tokens, cache and estimated cost",
-      "/compact [instructions] summarize older context in open/selected session",
-      "ctrl+end /bottom scroll to bottom and follow new output",
+      "/skill:name [task] load a skill in a task or reply",
+      "ctrl+end        scroll to bottom and follow new output",
       "tab / ctrl+n/p  select tools in session",
       "space / enter   expand or collapse selected tool (empty composer)",
-      "/expand /collapse show or hide all tool details",
-      "ctrl+c          quit (running sessions pause)", "", dim("New tasks always run in the selected row's project.")];
+      "ctrl+c          quit (running sessions pause)", "", dim("New tasks always run in the selected row's project.")]
+        .flatMap((line) => wrapTextWithAnsi(line, inner));
       const height = Math.max(1, Math.floor(this.tui.terminal.rows * 0.85) - 6);
       this.offset = Math.min(this.offset, Math.max(0, help.length - height));
       return frame([bold("zz shortcuts"), "", ...help.slice(this.offset, this.offset + height), "", dim("pgup pgdn scroll / any other key closes")]);

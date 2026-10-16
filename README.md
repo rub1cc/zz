@@ -160,9 +160,15 @@ labelled accordingly. Set `ZZ_REDUCED_MOTION=1` to disable shimmer animation
 
 ## Composer Discovery
 
-- Type `/` at the start of a task or session reply to search commands. Session-only
-  actions (`/bottom`, `/expand`, `/collapse`) appear only in an open session.
-  `/help` opens the shortcut reference; `/skills` opens the skill picker.
+- Type `/` at the start of a task or session reply to search commands available
+  in the current view. A project row offers `/model`, `/thinking`, `/skills`, and
+  `/help`. Selecting a session also offers `/session`, `/compact`, and `/stop`.
+  Opening a session adds transcript actions: `/bottom`, `/expand`, `/collapse`.
+  On the dashboard, model/thinking choices apply to **new tasks**, not the selected
+  session; in an open session they apply to that session.
+  `/help` lists the current view's commands plus the shortcut reference;
+  `/skills` opens the skill picker. Manually entering a transcript command outside
+  an open session shows a notice instead of starting a task.
 - Type `@` to find files in the selected project's directory. Recursive search
   uses an existing `fd` / `fdfind` on PATH or Pi's installed copy; zz never downloads
   it. Without fd, `@` still completes directory/file prefixes (e.g. `@src/`).

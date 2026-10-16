@@ -831,6 +831,74 @@ test("composer menus own navigation keys, fill commands before dispatch and dism
   } finally { await f.cleanup(); }
 });
 
+test("command discovery follows project selection, session selection and the open view", async () => {
+  const f = setup();
+  const expectSuggestion = async (command: string, available: boolean) => {
+    f.app.composer.setValue("");
+    f.terminal.onInput(command); await tick();
+    assert.equal(f.app.composer.showingSuggestions, available, `${command} in ${f.c.mode} with ${f.c.selected?.kind} selected`);
+  };
+  try {
+    f.c.send("task"); await tick();
+    const session = f.store.state.sessions[0]!;
+    f.c.select(`project:${f.pb.id}`);
+    for (const command of ["/session", "/compact", "/stop", "/bottom", "/expand", "/collapse"]) await expectSuggestion(command, false);
+    for (const command of ["/model", "/thinking", "/skills", "/help"]) await expectSuggestion(command, true);
+    f.c.select(`session:${session.id}`);
+    assert.equal(f.app.composer.showingSuggestions, false, "Selection changes dismiss the old menu");
+    for (const command of ["/session", "/compact", "/stop"]) await expectSuggestion(command, true);
+    await expectSuggestion("/bottom", false);
+    f.c.open();
+    for (const command of ["/session", "/compact", "/stop", "/bottom", "/expand", "/collapse"]) await expectSuggestion(command, true);
+    f.c.back();
+    await expectSuggestion("/bottom", false);
+    f.c.select(`project:${f.pb.id}`);
+    await expectSuggestion("/compact", false);
+    assert.equal(f.engine.calls.length, 1, "Discovery must never dispatch commands or tasks");
+  } finally { await f.cleanup(); }
+});
+
+test("help lists only the current view's commands and explains their scope", async () => {
+  const f = setup();
+  const help = () => {
+    f.app.composer.onSubmit?.("/help"); f.tui.renderNow();
+    const text = f.tui.getScreenLines().map(stripTerminalSequences).join("\n");
+    f.terminal.onInput("\x1b");
+    return text;
+  };
+  try {
+    f.terminal.rows = 100; f.terminal.onResize();
+    const project = help();
+    assert.match(project, /Commands: Dashboard \(project selected\)/);
+    assert.match(project, /\/model\s+Choose the model for new tasks/);
+    assert.doesNotMatch(project, /\|\s*\/(session|compact|stop|bottom|expand|collapse)\s/);
+    f.c.send("task"); await tick();
+    const selected = help();
+    assert.match(selected, /Commands: Dashboard \(session selected\)/);
+    assert.match(selected, /\/compact\s+Summarize older context in the selected session/);
+    assert.doesNotMatch(selected, /\|\s*\/(bottom|expand|collapse)\s/);
+    f.c.open();
+    const open = help();
+    assert.match(open, /Commands: Open session/);
+    assert.match(open, /\/model\s+Choose this session's model/);
+    for (const command of ["bottom", "expand", "collapse"]) assert.match(open, new RegExp(`\\|\\s*\\/${command}\\s`));
+    assert.equal(f.engine.calls.length, 1);
+  } finally { await f.cleanup(); }
+});
+
+test("manually entered transcript commands on the dashboard do not start agent tasks", async () => {
+  const f = setup();
+  try {
+    for (const command of ["/bottom", "/expand", "/collapse"]) {
+      f.app.composer.setValue(command); f.terminal.onInput("\r"); await tick();
+      assert.match(f.c.notice, /only available in an open session/);
+      assert.equal(f.app.composer.getValue(), "");
+    }
+    assert.equal(f.engine.calls.length, 0);
+    assert.equal(f.store.state.sessions.length, 0);
+  } finally { await f.cleanup(); }
+});
+
 test("path completion uses the selected project and peek session rather than the launch cwd", async () => {
   const f = setup();
   try {

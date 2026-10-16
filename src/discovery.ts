@@ -10,17 +10,21 @@ export interface DiscoveryContext {
   /** Peek replies offer files, but do not dispatch dashboard commands. */
   commands: boolean;
   session: boolean;
+  /** A session row is selected on the dashboard (not a project header). */
+  selectedSession?: boolean;
 }
 
-export function composerCommands(session: boolean): SlashCommand[] {
+export function composerCommands(session: boolean, selectedSession = false): SlashCommand[] {
   return [
-    { name: "model", description: "Choose a model" },
-    { name: "thinking", description: "Choose a thinking level" },
+    { name: "model", description: session ? "Choose this session's model" : "Choose the model for new tasks" },
+    { name: "thinking", description: session ? "Choose this session's thinking level" : "Choose the thinking level for new tasks" },
     { name: "skills", description: "Find and load a skill" },
-    { name: "session", description: "Context, tokens, cache and estimated cost" },
-    { name: "compact", description: "Summarize older context in the open or selected session (optional instructions)" },
-    { name: "stop", description: "Stop the open or selected session without deleting it" },
-    { name: "help", description: "Show keyboard shortcuts" },
+    ...(session || selectedSession ? [
+      { name: "session", description: `Context, tokens, cache and estimated cost for the ${session ? "open" : "selected"} session` },
+      { name: "compact", description: `Summarize older context in the ${session ? "open" : "selected"} session (optional instructions)` },
+      { name: "stop", description: `Stop the ${session ? "open" : "selected"} session without deleting it` },
+    ] : []),
+    { name: "help", description: "Show commands for this view and keyboard shortcuts" },
     ...(session ? [
       { name: "bottom", description: "Scroll to bottom and follow output" },
       { name: "expand", description: "Show all tool details" },
@@ -50,7 +54,7 @@ export class ComposerDiscovery implements AutocompleteProvider {
   onRequest?: () => void;
 
   constructor(readonly context: DiscoveryContext, fd: Promise<string | null> = findFd()) {
-    this.provider = new CombinedAutocompleteProvider(context.commands ? composerCommands(context.session) : [], context.cwd);
+    this.provider = new CombinedAutocompleteProvider(context.commands ? composerCommands(context.session, context.selectedSession) : [], context.cwd);
     this.fd = fd;
   }
 
