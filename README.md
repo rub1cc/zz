@@ -242,8 +242,11 @@ and session lists never follow chat output.
 Stopping cannot undo file edits or external effects that have already happened.
 
 `*` means working, `?` needs input, `.` completed, `!` failed, and `-` paused.
-Agents use an explicit `ask_user` tool to request a decision; a question mark in
-ordinary prose is not guessed to be a blocked task.
+Agents are instructed to use the explicit `ask_user` tool whenever they expect an
+answer, including conversational/random questions, clarification, decisions, and
+approval requests. These all enter `needs-input` until you reply. Rhetorical,
+quoted, or example questions do not require the tool; a question mark in ordinary
+prose alone does not change the session state.
 
 ## Persistence And Execution
 

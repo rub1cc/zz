@@ -154,12 +154,12 @@ export class DurableEngine implements Engine {
     registry.install(defineExtension({
       name: "zz",
       sections: [
-        section("preamble", () => "You are a coding assistant working in a project directory. Inspect before editing, preserve existing changes, and verify your work. Use ask_user when you need the user's decision before continuing. Otherwise finish with a concise report.", { tag: false }),
+        section("preamble", () => "You are a coding assistant working in a project directory. Inspect before editing, preserve existing changes, and verify your work. Use ask_user whenever you ask the user a question and expect an answer, including conversational or random questions, clarification, decisions, and approval requests. Put the question in the tool call rather than only in ordinary response text so the session waits for input. Do not use ask_user for rhetorical questions, quoted questions, or examples that do not need an answer. Otherwise finish with a concise report.", { tag: false }),
         section("cwd", ({ env }) => env?.cwd),
         section("skills", ({ agent }) => agent.cwd ? skills.prompt(agent.cwd) : undefined, { tag: false }),
       ],
       tools: [defineTool({
-        name: "ask_user", description: "Ask for a decision needed to proceed. This pauses work until the user replies.",
+        name: "ask_user", description: "Ask the user a question whenever you expect an answer, including conversational or random questions, clarification, decisions, and approval requests. This marks the session as needs-input and pauses work until the user replies. Do not use for rhetorical questions, quoted questions, or examples that do not need an answer.",
         parameters: Type.Object({ question: Type.String() }),
         execute: async ({ question }) => ({ output: [{ type: "text", text: question }], control: { terminate: true } }),
       })],

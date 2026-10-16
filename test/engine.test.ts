@@ -77,6 +77,8 @@ function models(options: { pause?: boolean; started?: () => void; context?: (con
         ? [{ type: "text", text: `Read: ${last.content.filter((b) => b.type === "text").map((b) => b.text).join("")}` }]
         : last?.content === "long-shell"
           ? [{ type: "toolCall", id: "sleep-call", name: "bash", arguments: { command: "printf 'SHELL_STARTED\\n'; sleep 30; printf 'SHOULD_NOT_FINISH\\n'" } }]
+        : last?.content === "Ask a random question"
+          ? [{ type: "toolCall", id: "random-question", name: "ask_user", arguments: { question: "What is your favorite useless skill?" } }]
         : typeof last?.content === "string" && last.content.includes("ask")
           ? [{ type: "toolCall", id: `ask-${Date.now()}`, name: "ask_user", arguments: { question: "Retry or stop?" } }]
           : typeof last?.content === "string" && last.content.includes("read")
@@ -149,6 +151,37 @@ test("ask_user marks needs input and a reply resumes the same conversation", asy
     assert.ok(s.work?.finishedAt);
     assert.equal(s.messages.at(-1)?.text, "Retry or stop?");
     await engine.run(s, project, "retry", () => {});
+    assert.equal(s.status, "completed");
+    assert.equal(s.messages.filter((m) => m.role === "user").length, 2);
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("conversational questions are instructed to use ask_user and wait for a reply", async () => {
+  const temp = temporary();
+  const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "random-question"); store.state.sessions.push(s);
+  const contexts: Context[] = [];
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models({
+    context: (context) => contexts.push(context),
+  }));
+  try {
+    // The offline provider simulates the tool call; verify the actual policy sent to it too.
+    await engine.run(s, project, "Ask a random question", () => {});
+    const system = contexts[0]!.messages.filter((m) => m.role === "system");
+    const instructions = [contexts[0]!.systemPrompt,
+      ...system.flatMap((m) => [m.content, ...Object.values(m.sections ?? {})])].join("\n");
+    assert.match(instructions, /Use ask_user whenever you ask the user a question and expect an answer/);
+    assert.match(instructions, /including conversational or random questions/);
+    assert.match(instructions, /Do not use ask_user for rhetorical questions, quoted questions, or examples/);
+    const tool = [...(contexts[0]!.tools ?? []), ...system.flatMap((m) => m.toolsAdded ?? [])]
+      .find((tool) => tool.name === "ask_user");
+    assert.match(tool?.description ?? "", /including conversational or random questions/);
+    assert.match(tool?.description ?? "", /needs-input/);
+    assert.equal(s.status, "needs-input");
+    assert.equal(s.messages.at(-1)?.text, "What is your favorite useless skill?");
+    const conversation = s.conversationId;
+    await engine.run(s, project, "Juggling", () => {});
+    assert.equal(s.conversationId, conversation);
     assert.equal(s.status, "completed");
     assert.equal(s.messages.filter((m) => m.role === "user").length, 2);
   } finally { await engine.close(); temp.cleanup(); }
