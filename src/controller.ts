@@ -17,8 +17,6 @@ export interface Engine {
 export type Mode = "sessions" | "projects" | "session";
 export type Dialog =
   | { kind: "peek"; sessionId: string }
-  | { kind: "delete"; sessionId: string }
-  | { kind: "remove-project"; projectId: string }
   | { kind: "add-project" }
   | { kind: "model" | "thinking"; sessionId?: string; choices: ModelOption[] }
   | { kind: "skills"; sessionId?: string; skills: SkillOption[] }
@@ -30,6 +28,9 @@ export class Controller {
   selection?: string;
   openedSessionId?: string;
   dialog?: Dialog;
+  pendingDelete?: string;
+  private deleting = false;
+  private deletingProjectId?: string;
   notice = "";
   onChange: () => void = () => {};
   private closing = false;
@@ -147,6 +148,7 @@ export class Controller {
   }
 
   select(id: string): void {
+    this.pendingDelete = undefined;
     this.selection = id;
     const row = this.selected;
     if (row) this.store.state.selectedProjectId = row.project.id;
@@ -162,6 +164,7 @@ export class Controller {
   }
 
   toggleProjects(): void {
+    this.pendingDelete = undefined;
     const project = this.project;
     this.dialog = undefined;
     this.mode = this.mode === "projects" ? "sessions" : "projects";
@@ -172,12 +175,14 @@ export class Controller {
   open(): void {
     const selected = this.selected;
     if (selected?.kind !== "session") return;
+    this.pendingDelete = undefined;
     this.openedSessionId = selected.session.id;
     this.mode = "session";
     this.changed();
   }
 
   back(): void {
+    this.pendingDelete = undefined;
     this.dialog = undefined;
     if (this.mode === "session") {
       this.selection = this.openedSessionId ? `session:${this.openedSessionId}` : this.selection;
@@ -227,32 +232,52 @@ export class Controller {
   }
 
   requestDelete(): void {
-    if (this.mode === "session") return;
+    if (this.mode === "session" || this.deleting) return;
     const selected = this.selected;
-    if (selected?.kind === "session") this.dialog = { kind: "delete", sessionId: selected.session.id };
-    else if (this.mode === "projects" && selected) this.dialog = { kind: "remove-project", projectId: selected.project.id };
+    if (selected && (selected.kind === "session" || this.store.state.sessions.some((s) => s.projectId === selected.project.id))) {
+      this.pendingDelete = rowId(selected);
+    }
+    this.changed();
+  }
+
+  cancelDelete(): void {
+    if (!this.pendingDelete) return;
+    this.pendingDelete = undefined;
     this.changed();
   }
 
   async confirmDelete(): Promise<void> {
-    const dialog = this.dialog;
-    this.dialog = undefined;
-    if (dialog?.kind === "delete") {
-      try {
-        this.pending.add(dialog.sessionId);
-        await this.engine.stop(dialog.sessionId);
-        this.store.state.sessions = this.store.state.sessions.filter((s) => s.id !== dialog.sessionId);
-        this.pending.delete(dialog.sessionId);
-      } catch (error) {
-        this.pending.delete(dialog.sessionId);
-        this.fail(error);
-        return;
+    const selected = this.selected;
+    const target = this.pendingDelete;
+    this.cancelDelete();
+    if (!selected || target !== rowId(selected) || this.mode === "session" || this.deleting) return;
+    const sessions = selected.kind === "session" ? [selected.session]
+      : this.store.state.sessions.filter((s) => s.projectId === selected.project.id);
+    const ids = new Set(sessions.map((s) => s.id));
+    this.deleting = true;
+    this.deletingProjectId = selected.kind === "project" ? selected.project.id : undefined;
+    try {
+      for (const id of ids) this.pending.add(id);
+      const results = await Promise.allSettled(sessions.map((s) => this.engine.stop(s.id)));
+      const failure = results.find((result) => result.status === "rejected");
+      if (failure?.status === "rejected") throw failure.reason;
+      const index = this.currentRows.findIndex((row) => rowId(row) === this.selection);
+      this.store.state.sessions = this.store.state.sessions.filter((s) => !ids.has(s.id));
+      // Keep a surviving selection (including navigation during stop); otherwise stay at the same row.
+      if (!this.selected) {
+        const remaining = this.currentRows;
+        const next = remaining[Math.max(0, Math.min(index, remaining.length - 1))];
+        this.selection = next && rowId(next);
       }
-    } else if (dialog?.kind === "remove-project") {
-      this.store.state.projects = this.store.state.projects.filter((p) => p.id !== dialog.projectId);
-      this.notice = "Project removed from the list. Files and session history are kept.";
-    } else return;
-    this.selection = this.currentRows[0] && rowId(this.currentRows[0]);
+      if (selected.kind === "project") this.notice = "Project sessions deleted. Project and files are kept.";
+    } catch (error) {
+      this.fail(error);
+      return;
+    } finally {
+      for (const id of ids) this.pending.delete(id);
+      this.deleting = false;
+      this.deletingProjectId = undefined;
+    }
     this.store.state.selectedProjectId = this.selected?.project.id;
     this.store.save();
     this.changed();
@@ -278,6 +303,7 @@ export class Controller {
       ? this.store.state.projects.find((p) => p.id === session?.projectId)
       : this.project;
     if (!project || (target && !session)) { this.fail("Select a project first. Use ctrl+o to add one."); return false; }
+    if (project.id === this.deletingProjectId) { this.fail("This project's sessions are being deleted."); return false; }
     if (session?.status === "working" || (target && (this.pending.has(target) || this.cancelling.has(target)))) {
       this.fail("This session is still working. Wait for its reply before sending another.");
       return false;

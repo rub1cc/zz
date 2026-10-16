@@ -512,27 +512,230 @@ test("ctrl+x requires a second ctrl+x; any other key cancels without deleting fi
     writeFileSync(join(f.pb.path, "keep.txt"), "keep");
     f.c.send("delete me"); await tick();
     const id = f.store.state.sessions[0]!.id;
-    f.terminal.onInput("\x18"); assert.equal(f.c.dialog?.kind, "delete");
-    f.terminal.onInput("x"); assert.equal(f.c.dialog, undefined); assert.equal(f.store.state.sessions.length, 1);
+    const session = f.store.state.sessions[0]!;
+    const preview = session.preview;
+    f.terminal.onInput("\x18"); f.tui.renderNow();
+    assert.equal(f.c.dialog, undefined);
+    assert.equal(f.c.pendingDelete, `session:${id}`);
+    const line = f.app.body.render(120).find((line) => line.includes("delete me"))!;
+    assert.match(line, /\x1b\[31mctrl\+x again to delete/);
+    assert.doesNotMatch(stripTerminalSequences(line), new RegExp(preview));
+    assert.equal(session.preview, preview, "Confirmation must not overwrite the saved preview");
+    assert.doesNotMatch(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Delete session\?|Any other key cancels/);
+    f.terminal.onInput("x");
+    assert.equal(f.c.pendingDelete, undefined); assert.equal(f.c.dialog, undefined); assert.equal(f.store.state.sessions.length, 1);
+    assert.ok(f.app.body.render(120).some((line) => stripTerminalSequences(line).includes(preview)));
     f.terminal.onInput("\x18"); f.terminal.onInput("\x18"); await tick();
     assert.equal(f.store.state.sessions.length, 0); assert.deepEqual(f.engine.stopped, [id]);
     assert.equal(readFileSync(join(f.pb.path, "keep.txt"), "utf8"), "keep");
   } finally { await f.cleanup(); }
 });
 
-test("ctrl+o manages projects; removal and re-add reconnect retained sessions", async () => {
+for (const position of [0, 1, 2]) {
+  test(`deleting session ${position + 1} keeps the same row position, clamped at the end`, async () => {
+    const f = setup();
+    try {
+      for (let i = 0; i < 3; i++) { f.c.send(`task ${i}`); await tick(); }
+      const sessions = f.store.state.sessions;
+      sessions.forEach((session, index) => { session.createdAt = index; });
+      const before = f.c.currentRows;
+      const target = before.filter((row) => row.kind === "session")[position]!;
+      const index = before.findIndex((row) => rowId(row) === rowId(target));
+      const remaining = before.filter((row) => rowId(row) !== rowId(target));
+      const expected = rowId(remaining[Math.min(index, remaining.length - 1)]!);
+      f.c.select(rowId(target));
+      f.terminal.onInput("\x18"); f.terminal.onInput("\x18"); await tick();
+      assert.equal(f.c.selection, expected);
+      assert.equal(f.store.state.selectedProjectId, f.pb.id);
+      assert.equal(new Store(f.store.root).state.selectedProjectId, f.pb.id);
+      assert.equal(f.store.state.sessions.length, 2);
+    } finally { await f.cleanup(); }
+  });
+}
+
+test("deleting the final session falls back to its own project, not the first project", async () => {
   const f = setup();
   try {
-    f.c.send("retained task"); await tick();
-    f.terminal.onInput("\x0f"); assert.equal(f.c.mode, "projects");
+    f.c.send("only task"); await tick();
     f.terminal.onInput("\x18"); f.terminal.onInput("\x18"); await tick();
-    assert.equal(f.store.state.projects.length, 1); assert.equal(f.store.state.sessions.length, 1);
-    f.terminal.onInput("a"); f.terminal.onInput(f.pb.path); f.terminal.onInput("\r");
-    assert.equal(f.c.dialog, undefined); assert.equal(f.store.state.projects.length, 2);
-    f.terminal.onInput("\x0f"); assert.equal(f.c.mode, "sessions");
-    assert.equal(f.c.project?.path, f.pb.path);
-    assert.equal(rows(f.store.state).filter((r) => r.kind === "session").length, 1);
+    assert.equal(f.c.selection, `project:${f.pb.id}`);
+    assert.equal(f.store.state.selectedProjectId, f.pb.id);
   } finally { await f.cleanup(); }
+});
+
+for (const target of ["session", "project"] as const) {
+  test(`${target} deletion does not override navigation while stopping`, async () => {
+    const f = setup();
+    let finishStop!: () => void;
+    try {
+      f.c.send("delete me"); await tick();
+      if (target === "project") f.c.select(`project:${f.pb.id}`);
+      f.engine.stop = async () => new Promise<void>((resolve) => { finishStop = resolve; });
+      f.c.requestDelete();
+      const deleting = f.c.confirmDelete();
+      f.c.select(`project:${f.pa.id}`);
+      finishStop(); await deleting;
+      assert.equal(f.c.selection, `project:${f.pa.id}`);
+      assert.equal(f.store.state.selectedProjectId, f.pa.id);
+      assert.equal(f.store.state.sessions.length, 0);
+    } finally { finishStop?.(); await f.cleanup(); }
+  });
+}
+
+test("failed session deletion retains the selected session", async () => {
+  const f = setup();
+  try {
+    f.c.send("keep me"); await tick();
+    const selection = f.c.selection;
+    f.engine.stop = async () => { throw new Error("Stop failed"); };
+    f.c.requestDelete(); await f.c.confirmDelete();
+    assert.equal(f.c.selection, selection);
+    assert.equal(f.store.state.sessions.length, 1);
+    assert.match(f.c.notice, /Stop failed/);
+  } finally { await f.cleanup(); }
+});
+
+test("inline delete confirmation belongs only to its row and stays bounded at narrow widths", async () => {
+  const f = setup();
+  try {
+    f.c.send("first task"); await tick();
+    const first = f.store.state.sessions[0]!;
+    f.c.send("second task"); await tick();
+    const second = f.store.state.sessions[1]!;
+    f.c.select(`session:${first.id}`);
+    f.terminal.onInput("\x18");
+    first.preview = "A newer reply";
+    f.c.changed();
+    const lines = f.app.body.render(120);
+    assert.equal(lines.filter((line) => line.includes("ctrl+x again to delete")).length, 1);
+    assert.ok(lines.find((line) => line.includes("first task"))!.includes("ctrl+x again to delete"));
+    assert.ok(!lines.find((line) => line.includes("second task"))!.includes("ctrl+x again to delete"));
+    for (const width of [1, 4, 10, 24, 50, 120]) {
+      const narrow = f.app.body.render(width);
+      assert.ok(narrow.every((line) => visibleWidth(line) <= width));
+      const text = narrow.map(stripTerminalSequences).join("").replace(/\s/g, "");
+      assert.ok(text.includes("ctrl+xagaintodelete"));
+    }
+    f.c.select(`session:${second.id}`);
+    assert.equal(f.c.pendingDelete, undefined);
+    assert.ok(f.app.body.render(120).some((line) => stripTerminalSequences(line).includes("A newer reply")));
+    f.terminal.onInput("\x18");
+    assert.equal(f.c.pendingDelete, `session:${second.id}`);
+    assert.equal(f.store.state.sessions.length, 2, "Changing selection must require a fresh confirmation");
+    f.terminal.onInput("\x1b");
+    assert.equal(f.c.pendingDelete, undefined);
+    assert.equal(f.c.dialog, undefined);
+    assert.equal(f.engine.stopped.length, 0);
+  } finally { await f.cleanup(); }
+});
+
+for (const mode of ["sessions", "projects"] as const) {
+  test(`ctrl+x on a project in ${mode} confirms inline and deletes only its sessions`, async () => {
+    const f = setup();
+    try {
+      writeFileSync(join(f.pb.path, "keep.txt"), "keep");
+      f.c.send("first task"); await tick();
+      f.c.send("second task"); await tick();
+      const targets = [...f.store.state.sessions];
+      targets[0]!.status = "working";
+      f.c.select(`project:${f.pa.id}`);
+      f.c.send("other project task"); await tick();
+      const other = f.store.state.sessions.at(-1)!;
+      f.c.select(`project:${f.pb.id}`);
+      if (mode === "projects") f.terminal.onInput("\x0f");
+      assert.equal(f.c.mode, mode);
+      const before = f.app.body.render(120);
+      const header = before[f.app.body.positions.get(`project:${f.pb.id}`)!]!;
+      f.terminal.onInput("\x18");
+      assert.equal(f.c.pendingDelete, `project:${f.pb.id}`);
+      assert.equal(f.c.dialog, undefined);
+      const lines = f.app.body.render(120);
+      assert.equal(lines[f.app.body.positions.get(`project:${f.pb.id}`)!], header,
+        "The project header must stay unchanged while its sessions are marked");
+      if (mode === "projects") assert.ok(lines.every((line) => !line.includes("ctrl+x again to delete")));
+      if (mode === "sessions") {
+        for (const session of targets) {
+          assert.ok(lines.find((line) => line.includes(session.title))!.includes("\x1b[31mctrl+x again to delete"));
+        }
+        assert.ok(!lines.find((line) => line.includes(other.title))!.includes("ctrl+x again to delete"));
+      }
+      for (const width of [1, 4, 10, 24, 50, 120]) {
+        assert.ok(f.app.body.render(width).every((line) => visibleWidth(line) <= width));
+      }
+      f.terminal.onInput("x");
+      assert.equal(f.c.pendingDelete, undefined);
+      assert.ok(f.app.body.render(120).every((line) => !line.includes("ctrl+x again to delete")));
+      assert.equal(f.store.state.sessions.length, 3);
+      assert.equal(f.engine.stopped.length, 0);
+      f.terminal.onInput("\x18"); f.terminal.onInput("\x18"); await tick();
+      assert.deepEqual(f.engine.stopped.sort(), targets.map((s) => s.id).sort());
+      assert.deepEqual(f.store.state.sessions, [other]);
+      assert.deepEqual(f.store.state.projects, [f.pa, f.pb]);
+      assert.equal(readFileSync(join(f.pb.path, "keep.txt"), "utf8"), "keep");
+      assert.equal(f.c.selection, `project:${f.pb.id}`);
+      const cleared = f.app.body.render(120);
+      const clearedHeader = cleared[f.app.body.positions.get(`project:${f.pb.id}`)!]!;
+      assert.match(stripTerminalSequences(clearedHeader), /0 sessions/);
+      assert.ok(!clearedHeader.includes("ctrl+x again to delete"));
+      const restored = new Store(f.store.root);
+      assert.deepEqual(restored.state.sessions.map((s) => s.id), [other.id]);
+      assert.deepEqual(restored.state.projects, [f.pa, f.pb]);
+      if (mode === "projects") f.terminal.onInput("\x0f");
+      assert.equal(f.c.project?.path, f.pb.path);
+      assert.equal(rows(f.store.state).filter((r) => r.kind === "session" && r.project.id === f.pb.id).length, 0);
+      assert.equal(f.c.send("new task in the same project"), true); await tick();
+      assert.equal(f.store.state.sessions.at(-1)!.projectId, f.pb.id);
+    } finally { await f.cleanup(); }
+  });
+}
+
+test("ctrl+x on an empty project is a no-op", async () => {
+  const f = setup();
+  try {
+    f.c.select(`project:${f.pb.id}`);
+    const before = f.app.body.render(120);
+    f.terminal.onInput("\x18");
+    assert.equal(f.c.pendingDelete, undefined);
+    assert.deepEqual(f.app.body.render(120), before);
+    f.terminal.onInput("\x18"); await tick();
+    assert.deepEqual(f.store.state.projects, [f.pa, f.pb]);
+    assert.equal(f.store.state.sessions.length, 0);
+    assert.equal(f.engine.stopped.length, 0);
+  } finally { await f.cleanup(); }
+});
+
+test("project deletion waits for all stops, prevents new work and retains the group on failure", async () => {
+  const f = setup();
+  let finishStop!: () => void;
+  try {
+    f.c.send("first task"); await tick();
+    f.c.send("second task"); await tick();
+    const targets = [...f.store.state.sessions];
+    const stopped = new Promise<void>((resolve) => { finishStop = resolve; });
+    f.engine.stop = async (id) => {
+      f.engine.stopped.push(id);
+      if (id === targets[0]!.id) throw new Error("Stop failed");
+      await stopped;
+    };
+    f.c.select(`project:${f.pb.id}`);
+    f.terminal.onInput("\x18"); f.terminal.onInput("\x18"); await tick();
+    assert.equal(f.c.send("must not start"), false);
+    assert.equal(f.engine.calls.length, 2);
+    assert.equal(f.store.state.projects.length, 2);
+    assert.equal(f.store.state.sessions.length, 2);
+    f.terminal.onInput("\x18");
+    assert.equal(f.c.pendingDelete, undefined, "Deletion cannot be armed again while stops are pending");
+    finishStop(); await tick();
+    assert.match(f.c.notice, /Stop failed/);
+    assert.equal(f.store.state.projects.length, 2);
+    assert.deepEqual(f.store.state.sessions, targets);
+    assert.deepEqual(f.engine.stopped.sort(), targets.map((s) => s.id).sort());
+    f.engine.stop = async () => {};
+    f.terminal.onInput("\x18"); f.terminal.onInput("\x18"); await tick();
+    assert.deepEqual(f.store.state.projects, [f.pa, f.pb]);
+    assert.equal(f.c.selection, `project:${f.pb.id}`);
+    assert.equal(f.store.state.sessions.length, 0);
+  } finally { finishStop?.(); await f.cleanup(); }
 });
 
 test("renders bounded lines at narrow widths, with selection kept visible and dialogs usable", async () => {

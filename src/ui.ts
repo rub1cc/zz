@@ -6,7 +6,7 @@ import {
 import { Controller } from "./controller.js";
 import { age, lastReply, rowId, type Row } from "./model.js";
 import { displayPath } from "./store.js";
-import { accent, bold, dim, fit, green, markdown, oneLine, pad, warning, workingIcon } from "./format.js";
+import { accent, bold, dim, fit, green, markdown, oneLine, pad, red, warning, workingIcon } from "./format.js";
 import { Transcript } from "./transcript.js";
 import { SettingsDialog } from "./settings-dialog.js";
 import { Composer } from "./composer.js";
@@ -43,6 +43,8 @@ class SessionList extends Dynamic {
       const id = rowId(row);
       this.positions.set(id, lines.length);
       const selected = c.selection === id;
+      const confirmation = row.kind === "session" && (c.pendingDelete === id || c.pendingDelete === `project:${row.project.id}`)
+        ? "ctrl+x again to delete" : undefined;
       let rowLines: string[];
       if (row.kind === "project") {
         const count = c.store.state.sessions.filter((s) => s.projectId === row.project.id).length;
@@ -56,13 +58,17 @@ class SessionList extends Dynamic {
         const title = oneLine(session.title);
         const titleWidth = Math.max(visibleWidth(title), Math.min(28, Math.max(8, Math.floor(width * 0.3))));
         const previewWidth = Math.max(0, width - titleWidth - time.length - 10);
-        if (previewWidth > 8) {
-          const preview = dim(pad(fit(oneLine(session.preview), previewWidth), previewWidth));
+        if (previewWidth > 8 && (!confirmation || previewWidth >= confirmation.length)) {
+          const preview = confirmation
+            ? red(pad(confirmation, previewWidth))
+            : dim(pad(fit(oneLine(session.preview), previewWidth), previewWidth));
           rowLines = [`  ${symbol} ${pad(title, titleWidth)}  ${preview}  ${dim(time)}`];
         } else {
           const indent = width >= 6 ? "    " : "";
           rowLines = wrapTextWithAnsi(title, Math.max(1, width - indent.length))
             .map((part, index) => `${index === 0 && indent ? `  ${symbol} ` : indent}${part}`);
+          if (confirmation) rowLines.push(...wrapTextWithAnsi(red(confirmation), Math.max(1, width - indent.length))
+            .map((part) => `${indent}${part}`));
         }
       }
       // Keep selection and mouse targets across every wrapped title line.
@@ -168,7 +174,7 @@ export class Dashboard extends VStack implements Focusable {
   private footer(width: number): string[] {
     const c = this.controller;
     const rule = dim("-".repeat(Math.max(0, width - 4)));
-    if (c.mode === "projects") return ["", `  ${rule}`, `  ${dim("a add / enter select / ctrl+x remove / ctrl+o back")}`, `  ${c.notice ? warning(oneLine(c.notice)) : dim("Removing a project keeps its files and session history.")}`, ""];
+    if (c.mode === "projects") return ["", `  ${rule}`, `  ${dim("a add / enter select / ctrl+x clear sessions / ctrl+o back")}`, `  ${c.notice ? warning(oneLine(c.notice)) : dim("Ctrl+x twice deletes all sessions in the selected project. Project and files are kept.")}`, ""];
     const context = c.mode === "session" ? `Reply to ${oneLine(c.opened?.title ?? "session")}` : `New task in ${oneLine(displayPath(c.project?.path ?? "(select a project)"))}`;
     return ["", `  ${dim(context)}`,
       ...(c.notice ? [`  ${warning(oneLine(c.notice))}`] : []),
@@ -229,6 +235,13 @@ export class Dashboard extends VStack implements Focusable {
 
   handleInput(data: string): void {
     const c = this.controller;
+    if (c.pendingDelete) {
+      if (matchesKey(data, "ctrl+x")) {
+        void c.confirmDelete().catch((error: unknown) => c.fail(error)); return;
+      }
+      c.cancelDelete();
+      return;
+    }
     // Legacy terminals encode Ctrl+J as LF, which also matches Enter. Route
     // composer shortcuts before the empty-composer open/toggle shortcuts.
     if (c.mode !== "projects" && (matchesKey(data, "ctrl+j") || matchesKey(data, "ctrl+g"))) {
@@ -284,7 +297,6 @@ class DialogView implements Component, Focusable {
   readonly input: Input | Composer;
   private _focused = false;
   private offset = 0;
-  private busy = false;
   private cache?: { text: string; width: number; lines: string[] };
   get focused(): boolean { return this._focused; }
   set focused(value: boolean) { this._focused = value; this.input.focused = value; }
@@ -309,15 +321,9 @@ class DialogView implements Component, Focusable {
   handleInput(data: string): void {
     const c = this.controller;
     const dialog = c.dialog;
-    if (this.busy) return;
     if (this.input instanceof Composer && this.input.handleDiscoveryInput(data)) { this.tui.requestRender(); return; }
     if (matchesKey(data, "escape")) { c.dialog = undefined; c.notice = ""; c.changed(); return; }
-    if (dialog?.kind === "delete" || dialog?.kind === "remove-project") {
-      if (matchesKey(data, "ctrl+x")) {
-        this.busy = true;
-        void c.confirmDelete().catch((error: unknown) => c.fail(error));
-      } else { c.dialog = undefined; c.changed(); }
-    } else if (dialog?.kind === "help" || dialog?.kind === "usage") {
+    if (dialog?.kind === "help" || dialog?.kind === "usage") {
       if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.pageDown)) {
         this.offset = Math.max(0, this.offset + (matchesKey(data, Key.pageDown) ? 8 : -8));
       } else { c.dialog = undefined; c.changed(); }
@@ -338,14 +344,6 @@ class DialogView implements Component, Focusable {
       ...lines.map((line) => `| ${pad(fit(line, inner), inner)} |`),
       `+${"-".repeat(Math.max(0, width - 2))}+`,
     ].map((line) => fit(line, width));
-    if (dialog.kind === "delete") return frame([
-      bold("Delete session?"), "", oneLine(c.session(dialog.sessionId)?.title ?? ""), "",
-      warning("ctrl+x again to delete"), dim("Any other key cancels. Project files are never deleted."),
-    ]);
-    if (dialog.kind === "remove-project") return frame([
-      bold("Remove project from the list?"), "", fit(oneLine(displayPath(dialog.projectId)), inner), "",
-      warning("ctrl+x again to remove"), dim("Files and sessions are kept. Re-add the path to restore them."),
-    ]);
     if (dialog.kind === "usage") {
       const session = c.session(dialog.sessionId);
       const lines = (session ? usageDetails(c.engine.stats(session)) : ["Session not found."])
@@ -366,7 +364,7 @@ class DialogView implements Component, Focusable {
       "↑↓ / ctrl+n/p   select suggestion; tab / enter fills without sending",
       "esc             dismiss suggestions before stopping work",
       "space           peek last reply when composer is empty", "ctrl+o          manage projects",
-      "ctrl+x twice    delete selected session", "a               add a project (in project management)",
+      "ctrl+x twice    delete session or all sessions in selected project", "a               add a project (in project management)",
       "pgup / pgdn     scroll transcript or peek", "esc             stop work in session; close dialogs",
       "left / ctrl+h   dashboard when composer is empty (work continues)",
       "/stop           stop open/selected session, preserving its history",

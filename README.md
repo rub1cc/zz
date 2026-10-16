@@ -221,10 +221,11 @@ and session lists never follow chat output.
   Editor failures leave the original draft intact; temporary draft files are removed.
 - Ctrl+O switches to project management. `a` adds an existing directory;
   Enter selects a project and returns to sessions. `~` paths are supported.
-- Ctrl+X on a session opens a confirmation: **ctrl+x again to delete**.
+- Ctrl+X on a session replaces its row preview with **ctrl+x again to delete** in red (no popup).
   Any other key cancels. Deleting stops its active work and removes it from the list.
-- In project management, Ctrl+X twice removes the project from the list.
-  Its sessions and running work are retained; re-adding the path restores the group.
+- Ctrl+X on a project marks only its session rows for deletion in red; the project header stays unchanged.
+  Ctrl+X again stops and deletes all its sessions, keeping the project in the list.
+  This also works in project management. Any other key cancels. Project files are never deleted.
 - Escape dismisses suggestions/dialogs first. In a session it stops active model
   and tool work, preserves history and your draft, and stays in the session.
 - Left Arrow or Ctrl+H returns to the dashboard only when the composer is empty.
@@ -272,7 +273,7 @@ same directory can edit the same files. Only use trusted projects and prompts.
 zz supplies skill discovery and explicit skill loading. Coding-agent extensions
 and AGENTS.md loading are not automatically provided by the durable package.
 
-Neither deleting a session nor removing a project deletes project files. Session
+Deleting sessions individually or by project never deletes project files. Session
 deletion removes its UI record, but the underlying durable audit history remains
 in SQLite (the current durable API has no conversation-purge operation). Back up
 the complete data directory while zz is stopped if you need to preserve it.

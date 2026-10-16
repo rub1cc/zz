@@ -27,7 +27,7 @@ Usage: zz [project-directory] [--model provider/model-id] [--thinking level] [--
 New tasks run in the selected project. Up/down or ctrl+p/ctrl+n navigates the list.
 With an empty composer: enter opens a session; space peeks and lets you reply.
 ctrl+j inserts a newline; enter sends. ctrl+g edits the draft in $VISUAL/$EDITOR (default vim).
-ctrl+o manages projects. ctrl+x twice deletes a session. ctrl+c quits.
+ctrl+o manages projects. ctrl+x twice deletes a session or all sessions in the selected project. ctrl+c quits.
 If shutdown stalls, press ctrl+c again to force exit (automatic after 5 seconds).
 Inside a session, Escape stops running work and stays in the session.
 Left Arrow returns to the dashboard when the composer is empty; work continues.

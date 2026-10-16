@@ -5,6 +5,7 @@ export const bold = (s: string) => `\x1b[1m${s}\x1b[22m`;
 export const accent = (s: string) => `\x1b[36m${s}\x1b[39m`;
 export const warning = (s: string) => `\x1b[33m${s}\x1b[39m`;
 export const green = (s: string) => `\x1b[32m${s}\x1b[39m`;
+export const red = (s: string) => `\x1b[31m${s}\x1b[39m`;
 export const plain = (s: string) => stripTerminalSequences(s).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
 export const oneLine = (s: string) => plain(s).replace(/\s+/g, " ");
 export const fit = (s: string, width: number) => truncateToWidth(s, Math.max(0, width));
