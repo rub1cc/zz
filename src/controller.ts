@@ -96,6 +96,7 @@ export class Controller {
     if (!this.auth) { this.fail("Authentication is unavailable in this runtime."); return; }
     if (this.dialog?.kind === "auth") this.dialog.flow.dispose();
     const flow = new AuthFlow(action, this.auth, () => this.changed(), async (providerId, operation) => {
+      this.auth?.codexQuota?.invalidate(providerId);
       if (this.closing || flow.disposed || operation !== "login" || this.engine.configuration().model) return;
       const model = (await this.engine.listModels()).find((model) => model.provider === providerId);
       if (this.closing || flow.disposed || this.engine.configuration().model) return;
@@ -691,6 +692,7 @@ export class Controller {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
+    this.auth?.codexQuota?.close();
     const shell = this.activeShell?.run;
     shell?.cancel();
     if (this.dialog?.kind === "auth") this.dialog.flow.dispose();

@@ -292,8 +292,16 @@ openai-codex/gpt-6.1-sol · high · ███████░ ~90%/500k · ◉ 99
 - `~$` is estimated USD cost from recorded provider usage/catalog rates, **not a
   subscription charge or remaining quota**. Unknown cost displays `cost ?`;
   zero may mean the model is unpriced. In-flight requests and usage the provider
-  never reports cannot be counted. Codex subscription quota/reset data is not
-  currently available, so that segment is omitted rather than guessed.
+  never reports cannot be counted.
+- With OpenAI subscription login (`openai-codex` or `openai`), the status line
+  also shows `codex 72% ↻ 4d9h`: **weekly quota remaining** and time until reset.
+  This is provider-reported account-wide usage, including activity outside zz,
+  not the current session's token usage. It refreshes in the background every
+  three minutes while that provider is selected, including in peek replies.
+  API keys do not expose this subscription quota. Loading, unavailable, stale,
+  or expired quota data is omitted rather than guessed. Quota requests reuse
+  Pi's OAuth login; zz does not save the quota or tokens in session metadata.
+  The Codex usage backend is not a stable public API and may become unavailable.
 - `/session` opens a scrollable breakdown for the open session or selected session
   row. It includes the separate title request in totals and lists that overhead
   separately. Older title requests made before usage tracking cannot be recovered.
@@ -824,8 +832,11 @@ Example `ask_multiple_questions` arguments:
 
 ## Persistence And Execution
 
-Data lives in `$XDG_DATA_HOME/zz` (default `~/.local/share/zz`). Override it with
-`--data-dir PATH` or `ZZ_DATA_DIR`.
+Data lives in `~/.zz`. Override it with `--data-dir PATH` or `ZZ_DATA_DIR`
+(the flag takes precedence). `XDG_DATA_HOME` does not affect this location.
+Existing data is not moved automatically: with zz stopped, move the previous
+data directory (`~/.local/share/zz` or `$XDG_DATA_HOME/zz`) to `~/.zz`, or keep
+using it with an explicit override. Move the whole directory, not just `state.json`.
 
 - `state.json`: project list, selection, session index, and cached display history.
 - `sessions.sqlite`: durable conversations, model context, tools, and checkpoints.

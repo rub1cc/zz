@@ -53,7 +53,7 @@ on the dashboard these controls change defaults for new sessions.
 Ctrl+V or dragged paths stage images; @image.png attaches on send.
 Backspace with empty draft text removes the last staged image.
 /settings controls reasoning visibility. Project instruction Markdown loads automatically.
-Data: --data-dir, ZZ_DATA_DIR, or $XDG_DATA_HOME/zz (~/.local/share/zz).
+Data: --data-dir, ZZ_DATA_DIR, or ~/.zz (default).
 Agents can edit files and run commands. Project directories are not sandboxes.`);
 } else {
   void main().catch((error: unknown) => {
@@ -65,7 +65,7 @@ Agents can edit files and run commands. Project directories are not sandboxes.`)
 async function main(): Promise<void> {
   if (positionals.length > 1) throw new Error("Pass at most one project directory.");
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("An interactive terminal is required. Use zz --help for usage.");
-  const root = resolve(values["data-dir"] ?? process.env.ZZ_DATA_DIR ?? join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "zz"));
+  const root = resolve(values["data-dir"] ?? process.env.ZZ_DATA_DIR ?? join(homedir(), ".zz"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
   let release: () => Promise<void>;
   try { release = await lockfile.lock(root, { realpath: true, stale: 10_000, update: 2_000 }); }

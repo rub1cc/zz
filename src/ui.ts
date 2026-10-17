@@ -220,6 +220,7 @@ export class Dashboard extends VStack implements Focusable {
     }) : undefined), { basis: "auto", shrink: 0 });
     this.composer.onSubmit = (text, images) => this.command(text) ? "command" : controller.send(text, undefined, images);
     controller.onChange = () => this.sync();
+    controller.auth?.codexQuota?.start(() => tui.requestRender());
   }
 
   override handleMouse(event: TuiMouseEvent): ReturnType<VStack["handleMouse"]> {
@@ -310,13 +311,16 @@ export class Dashboard extends VStack implements Focusable {
     return ["",
       ...(!this.questionComposer && c.mode === "session" ? this.taskDisplay.render(c.opened, width, taskBudget, this.tui.terminal.rows) : []),
       ...notice, ...input,
-      composerStatus(c.configuration, c.engine.stats(c.mode === "session" ? c.opened : undefined))];
+      composerStatus(c.configuration, c.engine.stats(c.mode === "session" ? c.opened : undefined),
+        c.auth?.codexQuota?.value(c.configuration.model?.provider))];
   }
 
-  dispose(): void { this.taskDisplay.close(); }
+  dispose(): void { this.taskDisplay.close(); this.controller.auth?.codexQuota?.close(); }
 
   sync(): void {
     const c = this.controller;
+    const quotaSettings = c.dialog?.kind === "peek" ? c.engine.configuration(c.session(c.dialog.sessionId)) : c.configuration;
+    c.auth?.codexQuota?.select(c.mode === "projects" ? undefined : quotaSettings.model?.provider);
     this.taskDisplay.sync(c.store.state.sessions);
     if (c.dialog || c.mode !== this.previousMode || c.openedSessionId !== this.previousSessionId) this.wheelScroll.reset();
     if (c.mode !== this.previousMode || c.openedSessionId !== this.previousSessionId) {
@@ -619,7 +623,8 @@ class DialogView implements Component, Focusable {
     const hint = queueHint(session, c.store.settings.replyBehavior);
     const belowComposer = [
       ...(hint ? [dim(hint)] : []),
-      composerStatus(c.engine.configuration(session), c.engine.stats(session)),
+      composerStatus(c.engine.configuration(session), c.engine.stats(session),
+        c.auth?.codexQuota?.value(c.engine.configuration(session).model?.provider)),
     ];
     const checklist = this.taskDisplay.render(session, inner, Math.max(0, Math.min(taskVisibleLimit(this.tui.terminal.rows) + 2,
       Math.floor(this.tui.terminal.rows * 0.85) - 7 - inputLines.length - belowComposer.length - (c.notice ? 1 : 0))), this.tui.terminal.rows);

@@ -3,6 +3,7 @@ import { calculateContextTokens, estimateMessageTokens } from "@earendil-works/p
 import type { ContextView, UsageState } from "@earendil-works/pi-durable";
 import type { AgentSettings, ContextEstimate, Session, SessionStats } from "./model.js";
 import { accent, dim, oneLine, warning } from "./format.js";
+import { formatCodexQuota, type CodexWeeklyQuota } from "./codex-quota.js";
 
 export function emptyUsage(): Usage {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
@@ -64,7 +65,7 @@ export function formatCost(cost: number): string {
 }
 
 /** One quiet status row; unknown measurements stay unknown, never fake zeroes or quota. */
-export function composerStatus(settings: AgentSettings, stats: SessionStats): string {
+export function composerStatus(settings: AgentSettings, stats: SessionStats, quota?: CodexWeeklyQuota): string {
   const { context, contextWindow, usage } = stats;
   const percent = context && contextWindow ? context.tokens / contextWindow * 100 : undefined;
   const filled = percent === undefined ? 0 : Math.max(0, Math.min(8, Math.floor(percent / 100 * 8)));
@@ -72,11 +73,14 @@ export function composerStatus(settings: AgentSettings, stats: SessionStats): st
   const contextText = `${bar}${percent === undefined ? "?" : `~${Math.round(percent)}%`}/${contextWindow ? formatTokens(contextWindow) : "?"}`;
   const model = settings.model ? `${settings.model.provider}/${settings.model.modelId}` : "no model";
   const cost = usage && (usage.cost.total >= 1 ? `$${usage.cost.total.toFixed(2)}` : formatCost(usage.cost.total));
+  const quotaText = quota && (settings.model?.provider === "openai-codex" || settings.model?.provider === "openai")
+    ? formatCodexQuota(quota) : undefined;
   return [
     dim(oneLine(model)), accent(settings.thinkingLevel),
     percent !== undefined && percent > 70 ? warning(contextText) : dim(contextText),
     dim(`◉ ${context?.cacheHitRate === undefined ? "?" : `${Math.round(context.cacheHitRate)}%`}`),
     dim(cost ? `~${cost}` : "cost ?"),
+    ...(quotaText ? [dim(quotaText)] : []),
   ].join(dim(" · "));
 }
 

@@ -1,5 +1,6 @@
 import type { AuthEvent, AuthPrompt, AuthType, LoginOptions } from "@earendil-works/pi-ai";
 import { CredentialSynchronizationError, type ModelRuntime } from "@earendil-works/pi-coding-agent";
+import type { CodexQuota } from "./codex-quota.js";
 
 export type AuthAction = "login" | "logout";
 export type AuthRuntime = Pick<ModelRuntime, "getProviders" | "getProvider" | "getProviderAuthStatus" | "isUsingOAuth" | "listCredentials" | "login" | "logout" | "refresh">;
@@ -12,7 +13,7 @@ export interface AuthChoice {
   status: string;
   interactive: boolean;
 }
-export interface AuthAccess { runtime: AuthRuntime; options?: LoginOptions }
+export interface AuthAccess { runtime: AuthRuntime; options?: LoginOptions; codexQuota?: CodexQuota }
 
 /** One transient authentication interaction. Never enters conversation history or zz storage. */
 export class AuthFlow {
