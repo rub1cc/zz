@@ -18,6 +18,7 @@ import { pendingQuestion } from "./questions.js";
 import { Composer } from "./composer.js";
 import { composerCommands } from "./discovery.js";
 import { composerStatus, usageDetails } from "./usage.js";
+import { taskChecklist, taskDetails, taskProgress } from "./task-display.js";
 
 export const scrollToEndIndicator = () => accent("[ Scroll to bottom (/bottom) ]");
 
@@ -92,7 +93,8 @@ class SessionList extends Dynamic {
           ];
           this.renameHeight = rowLines.length;
         } else {
-          const time = age(activityTimestamp(session));
+          const progress = taskProgress(session.tasks);
+          const time = `${progress ? `${progress} tasks  ` : ""}${age(activityTimestamp(session))}`;
           const title = oneLine(session.title);
           const titleWidth = titleWidths.get(row.project.id)!;
           const label = status === "completed" ? "Done" : status === "needs-input" ? "Needs input"
@@ -109,6 +111,7 @@ class SessionList extends Dynamic {
             const indent = width >= 6 ? "    " : "";
             rowLines = wrapTextWithAnsi(title, Math.max(1, width - indent.length))
               .map((part, index) => `${index === 0 && indent ? `  ${symbol} ` : indent}${part}`);
+            if (progress) rowLines.push(fit(`${indent}${dim(`${progress} tasks`)}`, width));
             if (confirmation) rowLines.push(...wrapTextWithAnsi(red(confirmation), Math.max(1, width - indent.length))
               .map((part) => `${indent}${part}`));
           }
@@ -227,6 +230,7 @@ export class Dashboard extends VStack implements Focusable {
     if (command === "/settings" || command === "/config") { this.controller.showSettings(); return true; }
     if (command === "/projects") { this.controller.toggleProjects(); return true; }
     if (command === "/session") { this.controller.showUsage(); return true; }
+    if (command === "/tasks") { this.controller.showTasks(); return true; }
     if (command === "/answer") { this.controller.showQuestions(); return true; }
     if (/^\/copy(?:\s|$)/.test(command)) {
       void this.controller.copyResponse(command.slice("/copy".length)); return true;
@@ -276,9 +280,14 @@ export class Dashboard extends VStack implements Focusable {
     const c = this.controller;
     const rule = dim("-".repeat(Math.max(0, width)));
     if (c.mode === "projects") return ["", rule, dim("a add / enter select / ctrl+x clear sessions / esc back"), c.notice ? warning(oneLine(c.notice)) : dim("Ctrl+x twice deletes all sessions in the selected project. Project and files are kept.")];
+    const notice = !this.questionComposer && !this.body.rename && c.notice ? [warning(oneLine(c.notice))] : [];
+    const input = this.questionComposer ? this.questionComposer.render(width, Math.max(1, this.tui.terminal.rows - this.header(width).length - 3))
+      : this.composer.render(width);
+    const taskBudget = Math.max(0, Math.min(6, Math.floor(this.tui.terminal.rows / 4),
+      this.tui.terminal.rows - this.header(width).length - input.length - notice.length - 3));
     return ["",
-      ...(!this.questionComposer && !this.body.rename && c.notice ? [warning(oneLine(c.notice))] : []),
-      ...(this.questionComposer ? this.questionComposer.render(width, Math.max(1, this.tui.terminal.rows - this.header(width).length - 3)) : this.composer.render(width)),
+      ...(!this.questionComposer && c.mode === "session" ? taskChecklist(c.opened?.tasks, width, taskBudget) : []),
+      ...notice, ...input,
       composerStatus(c.configuration, c.engine.stats(c.mode === "session" ? c.opened : undefined))];
   }
 
@@ -483,6 +492,7 @@ class DialogView implements Component, Focusable {
       const dialog = controller.dialog;
       if (dialog?.kind === "add-project") return controller.addProject(text.trim());
       if (dialog?.kind === "peek") {
+        if (text.trim() === "/tasks") { controller.showTasks(dialog.sessionId); return "command"; }
         if (text.trimStart().startsWith("!")) { controller.runShell(text.trimStart().slice(1), dialog.sessionId); return "command"; }
         return controller.send(text, dialog.sessionId, images);
       }
@@ -497,7 +507,7 @@ class DialogView implements Component, Focusable {
     if (matchesKey(data, "escape")) {
       c.dialog = undefined; c.notice = ""; c.changed(); return;
     }
-    if (dialog?.kind === "help" || dialog?.kind === "usage") {
+    if (dialog?.kind === "help" || dialog?.kind === "usage" || dialog?.kind === "tasks") {
       if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.pageDown)) {
         this.offset = Math.max(0, this.offset + (matchesKey(data, Key.pageDown) ? 8 : -8));
       } else { c.dialog = undefined; c.changed(); }
@@ -518,13 +528,14 @@ class DialogView implements Component, Focusable {
       ...lines.map((line) => `| ${pad(fit(line, inner), inner)} |`),
       `+${"-".repeat(Math.max(0, width - 2))}+`,
     ].map((line) => fit(line, width));
-    if (dialog.kind === "usage") {
+    if (dialog.kind === "usage" || dialog.kind === "tasks") {
       const session = c.session(dialog.sessionId);
-      const lines = (session ? usageDetails(c.engine.stats(session)) : ["Session not found."])
+      const lines = (session ? dialog.kind === "tasks" ? taskDetails(session.tasks, inner)
+        : usageDetails(c.engine.stats(session)) : ["Session not found."])
         .flatMap((line) => wrapTextWithAnsi(line, inner));
       const height = Math.max(1, Math.floor(this.tui.terminal.rows * 0.85) - 6);
       this.offset = Math.min(this.offset, Math.max(0, lines.length - height));
-      return frame([bold("Session usage"), "", ...lines.slice(this.offset, this.offset + height), "", dim("pgup pgdn scroll / any other key closes")]);
+      return frame([bold(dialog.kind === "tasks" ? "Session tasks" : "Session usage"), "", ...lines.slice(this.offset, this.offset + height), "", dim("pgup pgdn scroll / any other key closes")]);
     }
     if (dialog.kind === "help") {
       const session = c.mode === "session";
@@ -532,7 +543,7 @@ class DialogView implements Component, Focusable {
       const view = session ? "Open session" : selectedSession ? "Dashboard (session selected)" : "Dashboard (project selected)";
       const help = [bold(`Commands: ${view}`),
         ...composerCommands(session, selectedSession).map(({ name, description }) => `/${name}  ${description}`),
-        ...(!session && !selectedSession ? [dim("Select a session for /copy, /session, /compact, /undo and /stop.")] : []),
+        ...(!session && !selectedSession ? [dim("Select a session for /copy, /session, /tasks, /compact, /undo and /stop.")] : []),
         "", bold("Keyboard shortcuts"),
       "up / ctrl+p     select previous project or session",
       "down / ctrl+n   select next project or session",
@@ -582,8 +593,10 @@ class DialogView implements Component, Focusable {
       ...(hint ? [dim(hint)] : []),
       composerStatus(c.engine.configuration(session), c.engine.stats(session)),
     ];
+    const checklist = taskChecklist(session?.tasks, inner, Math.max(0, Math.min(4, Math.floor(this.tui.terminal.rows / 5),
+      Math.floor(this.tui.terminal.rows * 0.85) - 7 - inputLines.length - belowComposer.length - (c.notice ? 1 : 0))));
     const available = Math.max(1, Math.floor(this.tui.terminal.rows * 0.85)
-      - 6 - inputLines.length - belowComposer.length - (c.notice ? 1 : 0));
+      - 6 - inputLines.length - checklist.length - belowComposer.length - (c.notice ? 1 : 0));
     const lines = replyLines;
     this.offset = Math.min(this.offset, Math.max(0, lines.length - available));
     const end = Math.max(available, lines.length - this.offset);
@@ -591,7 +604,7 @@ class DialogView implements Component, Focusable {
     return frame([
       bold(oneLine(session?.title ?? "Last reply")), dim("Last agent message"), "", ...body, "",
       ...(c.notice ? [warning(oneLine(c.notice))] : []),
-      ...inputLines, ...belowComposer,
+      ...checklist, ...inputLines, ...belowComposer,
     ]);
   }
 

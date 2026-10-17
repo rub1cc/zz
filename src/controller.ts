@@ -33,7 +33,7 @@ export type Dialog =
   | { kind: "settings"; sessionId?: string; selected: SettingsSelection }
   | { kind: "model" | "thinking"; sessionId?: string; choices: ModelOption[]; returnToSettings?: boolean }
   | { kind: "skills"; sessionId?: string; skills: SkillOption[] }
-  | { kind: "usage"; sessionId: string }
+  | { kind: "usage" | "tasks"; sessionId: string }
   | { kind: "undo"; sessionId: string; checkpoints: UndoCheckpoint[] }
   | { kind: "help" };
 
@@ -136,6 +136,14 @@ export class Controller {
     const error = answerError(request, answers);
     if (error) { this.fail(error); return false; }
     return this.send(answerText(request, answers), sessionId);
+  }
+
+  showTasks(sessionId?: string): void {
+    const session = sessionId ? this.session(sessionId) : this.mode === "session" ? this.opened : this.selected?.kind === "session" ? this.selected.session : undefined;
+    if (!session) { this.fail("Open or select a session first to view /tasks."); return; }
+    this.dialog = { kind: "tasks", sessionId: session.id };
+    this.notice = "";
+    this.changed();
   }
 
   showUsage(): void {

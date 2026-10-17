@@ -29,6 +29,7 @@ export function composerCommands(session: boolean, selectedSession = false): Sla
       { name: "answer", description: "Reopen the pending question form" },
       { name: "copy", description: "Copy response text (/copy [N], 1 = latest)" },
       { name: "session", description: `Context, tokens, cache and estimated cost for the ${session ? "open" : "selected"} session` },
+      { name: "tasks", description: `View checklist details for the ${session ? "open" : "selected"} session` },
       { name: "compact", description: `Summarize older context in the ${session ? "open" : "selected"} session (optional instructions)` },
       { name: "undo", description: "Choose a checkpoint to restore conversation and tracked file edits" },
       { name: "stop", description: `Stop the ${session ? "open" : "selected"} session without deleting it` },

@@ -1,5 +1,6 @@
 import type { ImageContent, ModelThinkingLevel, Usage } from "@earendil-works/pi-ai";
 import type { CompactionFailure, CompactionStatus, CompactionPolicy, ModelRef } from "@earendil-works/pi-durable";
+import type { ChecklistTask } from "./tasks.js";
 
 export type CompactResult = "compacted" | "unchanged" | "stale" | "aborted";
 export interface UndoResult { prompt: string; files: number; shell: boolean }
@@ -124,6 +125,8 @@ export interface SessionStats {
 }
 
 export interface Session {
+  /** Presentation cache of zz.tasks; durable conversation state is authoritative. */
+  tasks?: ChecklistTask[];
   /** Local display history, never submitted to the model or replayed as commands. */
   shellResponses?: ShellResponse[];
   /** Cached durable activity, refreshed from pi.live on restore. Independent of the agent run. */

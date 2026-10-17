@@ -384,6 +384,51 @@ compaction settings are not imported or overwritten.
 
 Undo is session-level recovery, not a replacement for Git or backups.
 
+## Task Checklists
+
+For substantial multi-step work, the agent can track progress using `task_create`,
+`task_update`, `task_list`, and `task_get`. Simple questions and one-step edits do
+not need a checklist. Tasks belong to their session, not the whole project.
+
+```text
+Tasks - 1/3 complete (/tasks)
+  ☒ #1 Inspect authentication
+  ☐ #2 Implementing password reset
+  ☐ #3 Test password reset
+```
+
+- A live, height-bounded checklist appears above the session or peek composer;
+  dashboard session rows show the completed/total count. Longer lists prioritize
+  active and pending work and show a `more` hint. Empty lists occupy no space.
+  The checklist yields space to tall drafts; structured question forms temporarily
+  take precedence over it.
+- `/tasks` opens scrollable task titles, statuses and descriptions for the open
+  session or selected dashboard session. It also works directly in a peek reply.
+  It never sends an agent request.
+- Tasks start `pending`; the agent explicitly marks them `in_progress` and then
+  `completed` after required verification. Pending tasks use a dim `☐`, active
+  tasks a cyan `☐`, and completed tasks a green `☒`. `activeForm` supplies ongoing
+  wording. Ending a response, stopping work or closing zz does not complete tasks.
+- Dependencies are functional but are not annotated in the checklist or details
+  view. Task tools expose prerequisites to the agent; the backend rejects missing
+  IDs, cycles and starting/completing blocked tasks. Completing a prerequisite
+  unblocks its dependents without starting them. Before reopening a prerequisite,
+  return any active/completed dependents to pending. Deleting an obsolete task
+  removes its dependency references, without completing its dependents.
+- Checklist state is committed to durable SQLite storage and survives compaction,
+  cancellation and restart. `/undo` restores the checklist at the selected
+  conversation checkpoint. The display cache in `state.json` is not authoritative.
+  Mutation receipts prevent an interrupted tool replay from applying twice.
+- A compact current-state summary and task-use guidance are included in model
+  context, even with a custom `.pi/SYSTEM.md`. Full descriptions are available
+  through `task_get`. Task ownership/delegation and cross-session lists are not
+  implemented. A session supports up to 1000 tasks; deleting tasks does not reuse
+  their IDs within the active conversation branch.
+
+Task tool cards remain in activity history, with raw data hidden until expansion;
+errors remain visible. Checklist entries record agent-reported progress, not
+independent proof of test success, and may contain sensitive project information.
+
 ## Compact Activity
 
 The conversation uses `❯` for user prompts, `●` for assistant replies and tool
@@ -477,7 +522,7 @@ labelled accordingly. Set `ZZ_REDUCED_MOTION=1` to disable shimmer animation
 - Type `/` at the start of a task or session reply to search commands available
   in the current view. A project row offers `/model`, `/thinking`, `/skills`,
   `/settings`, `/login`, `/logout`, and `/help`. Selecting a session also offers
-  `/copy [N]`, `/session`, `/compact`, `/undo`, and `/stop`.
+  `/copy [N]`, `/session`, `/tasks`, `/compact`, `/undo`, and `/stop`.
   Opening a session adds transcript actions: `/bottom`, `/expand`, `/collapse`.
   On the dashboard, model/thinking choices apply to **new tasks**, not the selected
   session; in an open session they apply to that session.
@@ -500,7 +545,8 @@ labelled accordingly. Set `ZZ_REDUCED_MOTION=1` to disable shimmer animation
 
 Text-file references insert paths, not file contents; ask the agent to read them
 when needed. Explicit `@` image references attach image content on send. Peek
-replies offer skill/file/path completion and clipboard images, not dashboard commands.
+replies offer skill/file/path completion and clipboard images, not dashboard
+command completion; `/tasks` can still open that peek's checklist details.
 
 ## Skills
 
@@ -781,6 +827,10 @@ context/usage accounting, title overhead, restore, and narrow usage dialogs.
 Compaction tests cover manual instructions, no-ops, concurrent responses, history
 and spend retention, cancellation, restart, background/blocking thresholds, overflow
 recovery, failures, and narrow activity rendering.
+Checklist tests cover lifecycle/schema validation, dependency cycles and blockers,
+atomic updates, concurrent creation, replay receipts, session isolation, compaction,
+restart and interrupted-run recovery, stale cache replacement, undo, task details,
+and narrow session/peek/dashboard rendering without dependency annotations.
 Authentication tests also cover shared Pi credential storage, prompt variants,
 secret masking/redaction, cancellation, logout confirmation and catalog failures.
 Direct-shell tests run real local processes for project/session/peek scoping, pipes,

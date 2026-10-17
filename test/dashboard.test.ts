@@ -2196,3 +2196,118 @@ test("$ autocomplete uses the engine catalog for the selected project and peek s
     assert.equal(f.engine.calls.length, 1, "Accepting a skill must not send a reply");
   } finally { await f.cleanup(); }
 });
+
+test("session and peek checklists show live task state without dependency annotations, and dashboard rows show counts", async () => {
+  const f = setup();
+  try {
+    f.c.send("Add password reset"); await tick();
+    const session = f.store.state.sessions[0]!;
+    session.tasks = [
+      { id: "1", subject: "Inspect auth", status: "completed", blockedBy: [] },
+      { id: "2", subject: "Implement reset", activeForm: "Implementing reset", status: "in_progress", blockedBy: ["1"] },
+      { id: "3", subject: "Test reset", status: "pending", blockedBy: ["2"] },
+    ];
+    f.c.open(); f.c.changed(); f.tui.renderNow();
+    const screen = () => f.tui.getScreenLines().map(stripTerminalSequences).join("\n");
+    assert.match(screen(), /Tasks - 1\/3 complete/);
+    assert.match(screen(), /\u2610 #2 Implementing reset/);
+    assert.match(screen(), /\u2610 #3 Test reset/);
+    assert.doesNotMatch(screen(), /blocked|blockedBy|depends/);
+    session.tasks[1]!.status = "completed";
+    session.tasks[2]!.status = "in_progress";
+    f.c.changed(); f.tui.renderNow();
+    assert.match(screen(), /Tasks - 2\/3 complete/);
+    assert.match(screen(), /\u2610 #3 Test reset/);
+    assert.doesNotMatch(screen(), /Implementing reset/);
+    for (const width of [8, 16, 24, 80]) {
+      for (const height of [12, 24, 32]) {
+        f.terminal.columns = width; f.terminal.rows = height;
+        f.terminal.onResize(); f.tui.renderNow();
+        const lines = f.tui.getScreenLines().map(stripTerminalSequences);
+        assert.equal(lines.length, height);
+        assert.ok(lines.every((line) => visibleWidth(line) <= width));
+        assert.ok(lines.some((line) => line.startsWith("Tasks")), `checklist at ${width}x${height}`);
+        assert.ok(lines.at(-1)?.startsWith("test/"), "model status stays visible");
+        assert.doesNotMatch(lines.join("\n"), /blockedBy|blocked by/);
+      }
+    }
+    f.terminal.columns = 24; f.terminal.rows = 12; f.terminal.onResize();
+    f.app.composer.setValue("draft line\n".repeat(5)); f.tui.renderNow();
+    assert.doesNotMatch(screen(), /Tasks -/, "the checklist yields space to tall drafts");
+    f.app.composer.setValue("");
+    f.terminal.columns = 120; f.terminal.rows = 32; f.terminal.onResize();
+    f.c.back(); f.c.select(`session:${session.id}`); f.c.changed(); f.tui.renderNow();
+    assert.match(screen(), /2\/3 tasks/);
+    assert.doesNotMatch(screen(), /Tasks -/);
+    f.c.peek(); f.tui.renderNow();
+    assert.match(screen(), /Tasks - 2\/3 complete/);
+    assert.doesNotMatch(screen(), /blockedBy|blocked by/);
+    f.terminal.onInput("/tasks"); f.terminal.onInput("\r"); f.tui.renderNow();
+    assert.equal(f.c.dialog?.kind, "tasks");
+    assert.match(screen(), /Session tasks/);
+    f.terminal.onInput("\x1b");
+    assert.equal(f.engine.calls.length, 1);
+  } finally { await f.cleanup(); }
+});
+
+test("/tasks opens scoped, scrollable details without sending work, preserves drafts and refreshes live", async () => {
+  const f = setup();
+  const submit = () => f.app.composer.onSubmit?.("/tasks");
+  const screen = () => { f.tui.renderNow(); return f.tui.getScreenLines().map(stripTerminalSequences).join("\n"); };
+  try {
+    submit();
+    assert.equal(f.c.dialog, undefined);
+    assert.match(f.c.notice, /Open or select a session/);
+    assert.equal(f.engine.calls.length, 0);
+    f.c.send("first"); await tick();
+    const first = f.store.state.sessions[0]!;
+    first.tasks = [
+      { id: "1", subject: "First task", description: "First task requirements", status: "in_progress", blockedBy: [] },
+      { id: "2", subject: "Next task", status: "pending", blockedBy: ["1"] },
+    ];
+    f.c.send("second"); await tick();
+    const second = f.store.state.sessions.at(-1)!;
+    f.c.select(`session:${first.id}`);
+    f.app.composer.setValue("preserve my draft");
+    submit();
+    assert.equal((f.c as Controller).dialog?.kind, "tasks");
+    assert.match(screen(), /Session tasks/);
+    assert.match(screen(), /First task requirements/);
+    assert.doesNotMatch(screen(), /blockedBy|blocked by/);
+    assert.equal(f.app.composer.getValue(), "preserve my draft");
+    first.tasks[0]!.status = "completed"; f.c.changed();
+    assert.match(screen(), /Completed/);
+    f.terminal.onInput("\x1b");
+    f.c.select(`session:${second.id}`); f.c.open(); submit();
+    assert.match(screen(), /No checklist tasks/);
+    f.terminal.onInput("\x1b");
+    f.c.back(); f.c.select(`session:${first.id}`); f.c.open();
+    first.tasks = Array.from({ length: 25 }, (_, index) => ({
+      id: String(index + 1), subject: `Checklist item ${index}`, description: `Requirements ${index}`, status: "pending", blockedBy: [],
+    }));
+    f.terminal.columns = 28; f.terminal.rows = 16; f.terminal.onResize(); submit();
+    const initial = screen();
+    for (let i = 0; i < 50; i++) f.terminal.onInput("\x1b[6~");
+    assert.notEqual(screen(), initial);
+    assert.match(screen(), /Requirements 24/);
+    assert.ok(f.tui.getScreenLines().every((line) => visibleWidth(line) <= 28));
+    f.terminal.onInput("\x1b");
+    assert.equal(f.engine.calls.length, 2);
+  } finally { await f.cleanup(); }
+});
+
+test("structured questions take precedence over checklist rows without changing task state", async () => {
+  const f = setup();
+  try {
+    const session = waitingSession("checklist-question"); session.projectId = f.pa.id;
+    session.tasks = [{ id: "1", subject: "Waiting for a decision", status: "in_progress", blockedBy: [] }];
+    f.store.state.sessions.push(session);
+    f.c.select(`session:${session.id}`); f.c.open(); f.c.changed(); f.tui.renderNow();
+    assert.equal(f.c.questionForm?.sessionId, session.id);
+    assert.doesNotMatch(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Tasks -/);
+    assert.equal(session.tasks[0]?.status, "in_progress");
+    f.terminal.onInput("\x1b"); f.tui.renderNow();
+    assert.match(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Tasks - 0\/1 complete/);
+    assert.equal(f.engine.calls.length, 0);
+  } finally { await f.cleanup(); }
+});

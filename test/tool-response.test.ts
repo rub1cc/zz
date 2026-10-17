@@ -193,3 +193,15 @@ test("all tool variants fit tiny widths, sanitize controls, and retain literal s
     assert.match(render(value, true), /\*\*literal\*\*/);
   }
 });
+
+test("checklist tools keep raw task data out of compact activity but retain expansion and errors", () => {
+  for (const name of ["task_create", "task_update", "task_list", "task_get"]) {
+    const value = tool({ name, arguments: { taskId: "2", addBlockedBy: ["1"] },
+      output: JSON.stringify({ id: "2", subject: "Test auth", blockedBy: ["1"] }) });
+    assert.doesNotMatch(render(value), /blockedBy|addBlockedBy|Test auth/);
+    assert.match(render(value), /Task (?:created|updated|details available)/);
+    assert.match(render(value, true), /blockedBy/);
+    assert.match(render({ ...value, status: "error", output: "Task has unfinished prerequisites" }), /unfinished prerequisites/);
+    assert.doesNotMatch(render({ ...value, status: "running" }), /Task created|Task updated/);
+  }
+});

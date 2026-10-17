@@ -1860,3 +1860,143 @@ test("malformed direct questions and missing structured steps fail without pausi
     } finally { await engine.close(); temp.cleanup(); }
   }
 });
+
+function taskCall(name: string, args: ToolCall["arguments"], id = `${name}-${Date.now()}-${Math.random()}`): ToolCall {
+  return { type: "toolCall", id, name, arguments: args };
+}
+
+test("checklist tools commit isolated task state, expose the current checklist and reject invalid mutations atomically", async () => {
+  const prompts: string[] = [];
+  const runtime = models({ context: (context) => prompts.push(getCurrentSystemPrompt(context.messages)), reply: (context) => {
+    const last = context.messages.at(-1);
+    return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("tools:")
+      ? JSON.parse(last.content.slice(6)) as ToolCall[] : [{ type: "text", text: "Done" }];
+  } });
+  const f = await undoFixture(runtime);
+  try {
+    const run = async (name: string, args: ToolCall["arguments"]) => {
+      await f.engine.run(f.s, f.project, toolPrompt(taskCall(name, args)), () => {});
+      return f.s.messages.findLast((message) => message.tool?.name === name)!.tool!;
+    };
+    mkdirSync(join(f.work, ".pi"));
+    writeFileSync(join(f.work, ".pi", "SYSTEM.md"), "CUSTOM_TASK_PREAMBLE");
+    const created = await run("task_create", { subject: "Inspect auth", description: "PRIVATE_TASK_DESCRIPTION", activeForm: "Inspecting auth" });
+    assert.equal(created.status, "done");
+    assert.equal(JSON.parse(created.output).id, "1");
+    assert.match(prompts[0]!, /CUSTOM_TASK_PREAMBLE/);
+    assert.match(prompts[0]!, /Use tasks for substantial multi-step work/);
+    assert.match(prompts.at(-1)!, /Current committed checklist/);
+    assert.doesNotMatch(prompts.at(-1)!, /PRIVATE_TASK_DESCRIPTION/);
+    await run("task_create", { subject: "Implement reset", blockedBy: ["1"] });
+    const before = structuredClone(f.s.tasks);
+    for (const [name, args] of [
+      ["task_update", { taskId: "2", status: "in_progress" }],
+      ["task_update", { taskId: "2", status: "completed" }],
+      ["task_update", { taskId: "1", addBlockedBy: ["2"] }],
+      ["task_create", { subject: "Bad prerequisite", blockedBy: ["99"] }],
+      ["task_create", { subject: " " }],
+    ] as [string, ToolCall["arguments"]][]) {
+      assert.equal((await run(name, args)).status, "error");
+      assert.deepEqual(f.s.tasks, before);
+    }
+    assert.equal((await run("task_get", { taskId: "99" })).status, "error");
+    const details = JSON.parse((await run("task_get", { taskId: "1" })).output);
+    assert.equal(details.description, "PRIVATE_TASK_DESCRIPTION");
+    const listed = JSON.parse((await run("task_list", {})).output);
+    assert.deepEqual(listed[1].unresolvedDependencies, ["1"]);
+    await run("task_update", { taskId: "1", status: "completed" });
+    assert.equal(f.s.tasks?.[1]?.status, "pending", "unblocking does not automatically start work");
+    assert.deepEqual(JSON.parse((await run("task_get", { taskId: "2" })).output).unresolvedDependencies, []);
+    await run("task_update", { taskId: "2", status: "in_progress" });
+    assert.equal(f.s.tasks?.[1]?.status, "in_progress");
+    assert.equal(f.s.status, "completed", "an idle agent can have unfinished checklist tasks");
+    const other = session(f.project, "other-checklist"); f.store.state.sessions.push(other);
+    await f.engine.run(other, f.project, toolPrompt(taskCall("task_list", {})), () => {});
+    assert.deepEqual(JSON.parse(other.messages.findLast((message) => message.tool)?.tool?.output ?? "null"), []);
+    await f.engine.run(other, f.project, toolPrompt(taskCall("task_create", { subject: "Other session" })), () => {});
+    assert.equal(other.tasks?.[0]?.id, "1");
+    assert.equal(f.s.tasks?.[0]?.subject, "Inspect auth");
+    assert.equal((await run("task_update", { taskId: "2", status: "deleted" })).status, "done");
+    assert.equal(f.s.tasks?.length, 1);
+    await run("task_create", { subject: "Replacement" });
+    assert.equal(f.s.tasks?.[1]?.id, "3");
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("concurrent checklist creates receive distinct IDs without losing updates", async () => {
+  const f = await undoFixture();
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt(...Array.from({ length: 12 }, (_, index) =>
+      taskCall("task_create", { subject: `Task ${index}` }))), () => {});
+    assert.equal(f.s.tasks?.length, 12);
+    assert.equal(new Set(f.s.tasks?.map((task) => task.id)).size, 12);
+    assert.equal(new Set(f.s.tasks?.map((task) => task.subject)).size, 12);
+    assert.ok(f.s.messages.filter((message) => message.tool).every((message) => message.tool?.status === "done"));
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("checklists survive compaction and restart, override stale display caches, and rewind with undo", async () => {
+  const f = await undoFixture(); let engine = f.engine;
+  try {
+    await engine.run(f.s, f.project, toolPrompt(taskCall("task_create", { subject: "Persistent task", description: "Keep this requirement" })), () => {});
+    await seedCompactableHistory(engine, f.s, f.project);
+    const expected = structuredClone(f.s.tasks);
+    assert.equal(await engine.compact(f.s, undefined, () => {}), "compacted");
+    assert.deepEqual(f.s.tasks, expected);
+    await engine.run(f.s, f.project, toolPrompt(taskCall("task_update", { taskId: "1", status: "completed" })), () => {});
+    const updateCheckpoint = (await engine.undoCheckpoints(f.s))[0]!;
+    assert.equal(f.s.tasks?.[0]?.status, "completed");
+    await engine.close();
+    const restored = new Store(f.store.root);
+    const recovered = restored.state.sessions[0]!;
+    assert.equal(recovered.tasks?.[0]?.status, "completed");
+    recovered.tasks![0]!.subject = "STALE_DISPLAY_CACHE";
+    engine = await openEngine(restored, { provider: "test", modelId: "mock" }, (error) => f.errors.push(error), undoModels());
+    await engine.restore(() => {});
+    assert.equal(recovered.tasks?.[0]?.subject, "Persistent task");
+    await engine.undo(recovered, updateCheckpoint.id, () => {});
+    assert.deepEqual(recovered.tasks, expected);
+    const list = toolPrompt(taskCall("task_get", { taskId: "1" }));
+    await engine.run(recovered, f.project, list, () => {});
+    const result = JSON.parse(recovered.messages.findLast((message) => message.tool?.name === "task_get")!.tool!.output);
+    assert.equal(result.description, "Keep this requirement");
+    assert.equal(result.status, "pending");
+    const oldest = (await engine.undoCheckpoints(recovered)).at(-1)!;
+    await engine.undo(recovered, oldest.id, () => {});
+    assert.equal(recovered.tasks, undefined);
+    await engine.close();
+    const again = new Store(f.store.root);
+    engine = await openEngine(again, { provider: "test", modelId: "mock" }, (error) => f.errors.push(error), undoModels());
+    await engine.restore(() => {});
+    assert.equal(again.state.sessions[0]?.tasks, undefined);
+    assert.deepEqual(f.errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("an interrupted model request resumes with the committed checklist and no duplicate creates", async () => {
+  const finish: ((failure?: string, content?: (TextContent | ThinkingContent | ToolCall)[]) => void)[] = [];
+  const f = await undoFixture(models({ pause: true, finish: (done) => finish.push(done) }));
+  let engine = f.engine;
+  const prompts: string[] = [];
+  try {
+    const running = engine.run(f.s, f.project, "Track this work", () => {});
+    await until(() => finish.length === 1);
+    finish[0]!(undefined, [taskCall("task_create", { subject: "Recover this task" })]);
+    await until(() => finish.length === 2);
+    assert.equal(f.s.tasks?.length, 1);
+    await engine.close(); await running;
+    const restored = new Store(f.store.root);
+    engine = await openEngine(restored, { provider: "test", modelId: "mock" }, (error) => f.errors.push(error), models({
+      context: (context) => prompts.push(getCurrentSystemPrompt(context.messages)),
+    }));
+    await engine.restore(() => {});
+    const recovered = restored.state.sessions[0]!;
+    await until(() => recovered.status === "completed" && !recovered.pendingInput);
+    assert.equal(recovered.tasks?.length, 1);
+    assert.equal(recovered.tasks?.[0]?.subject, "Recover this task");
+    assert.match(prompts.at(-1)!, /Recover this task/);
+    assert.deepEqual(f.errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});

@@ -23,6 +23,7 @@ import { contextEstimate, conversationUsage, sessionStats, sumUsage } from "./us
 import { settleWithin } from "./shutdown.js";
 import { UndoDoc, UndoHistory } from "./undo.js";
 import { askQuestionParameters, askMultipleQuestionsParameters, isQuestionTool, questionnaire, questionText } from "./questions.js";
+import { taskExtension, TasksDoc, type TaskState } from "./tasks.js";
 
 const ctx = BACKGROUND_CONTEXT;
 const SessionMeta = defineDoc<{ sessionId: string; priorUsage?: JsonRepresentation<Usage> }>({
@@ -208,6 +209,7 @@ export class DurableEngine implements Engine {
     registry.install(createCodingTools({ images: await getImageProcessor() }));
     const undoHistory = new UndoHistory(store.root);
     registry.install(undoHistory.extension);
+    registry.install(taskExtension);
     registry.install(defineExtension({
       name: "zz",
       sections: [
@@ -359,6 +361,15 @@ export class DurableEngine implements Engine {
 
   private async observe(session: Session, conversation: Conversation, changed: () => void): Promise<void> {
     if (this.views.has(session.id)) return;
+    // Conversation views mount only built-in docs; observe our checklist separately.
+    // Materialize an empty document for older conversations as well as new ones.
+    await conversation.commit(async (tx) => { await tx.doc(TasksDoc, conversation.id); }, ctx);
+    const tasks = (await this.harness.documentState(TasksDoc, conversation.id, ctx))!;
+    const syncTasks = (state: Readonly<TaskState> | null): void => {
+      session.tasks = state?.items.length ? structuredClone(state.items) : undefined;
+    };
+    syncTasks(tasks.value);
+    tasks.subscribe((value) => { syncTasks(value); changed(); });
     const view = await conversation.viewState(ctx);
     const priorUsage = (await this.harness.snapshot(SessionMeta, conversation.id, ctx))?.priorUsage;
     let entries = view.value.entries;
@@ -391,7 +402,7 @@ export class DurableEngine implements Engine {
       if (value.entries !== entries) { entries = value.entries; void refresh(); }
       changed();
     });
-    this.views.set(session.id, view);
+    this.views.set(session.id, { get value() { return view.value; }, dispose: () => { view.dispose(); tasks.dispose(); } });
     await refresh();
   }
 

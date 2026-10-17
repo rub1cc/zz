@@ -26,7 +26,7 @@ test("slash discovery filters available commands and excludes later draft lines 
   assert.equal(await suggestions(p, "draft\n/mo"), null);
   assert.equal(await suggestions(provider(process.cwd(), true, false), "/mo"), null);
   const selected = await suggestions(provider(process.cwd(), false, true, true), "/");
-  assert.deepEqual(selected?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "projects", "login", "logout", "answer", "copy", "session", "compact", "undo", "stop", "help"]);
+  assert.deepEqual(selected?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "projects", "login", "logout", "answer", "copy", "session", "tasks", "compact", "undo", "stop", "help"]);
   const open = await suggestions(provider(process.cwd(), true), "/");
   assert.deepEqual(open?.items.map((i) => i.value), [...selected!.items.map((i) => i.value), "bottom", "expand", "collapse"]);
   assert.deepEqual(composerCommands(true).filter((c) => !composerCommands(false, true).some((base) => base.name === c.name)).map((c) => c.name), ["bottom", "expand", "collapse"]);

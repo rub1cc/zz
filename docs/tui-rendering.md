@@ -60,6 +60,7 @@ navigation, follow-end scrolling, and explicit scroll-to-bottom remain intact.
 | Direct chat question | Question tool summary and projected question text | Normal composer remains available |
 | Structured questions | Question tool summary, existing inline question composer | Option descriptions, validation, review, submit unchanged |
 | Historical ask_user calls | Compatible tool heading and question handling | Historical structured answers still recognized |
+| Checklist task tools | Create/update/details summary, without raw task JSON | Arguments and output available on expansion; errors remain visible |
 | Submitted structured answers | Compact question/answer summary | Model receives the original answer payload unchanged |
 | Unknown tool name / legacy tool-only message | Generic heading/output fallback | All available arguments/output/details inspectable |
 | Image-only user/assistant message | Native image or textual fallback | Existing image caching/conversion unchanged |
@@ -106,6 +107,11 @@ are not grouped or hidden.
 | Queued follow-ups / steering / mixed queue | Separate numbered queue, delivery modes and image counts |
 | Manual/automatic/overflow compaction | Existing reason, blocking/retry status, failure text |
 | Saved compaction summary | Compact tool summary, expandable content |
+| Session/peek checklist | Height-bounded completed/total summary and task statuses above composer; no dependency annotations |
+| Long checklist | Active/pending work prioritized, remaining-count hint; `/tasks` opens scrollable full details |
+| Dashboard checklist | Completed/total count on session rows, including narrow wrapped rows |
+| Empty checklist / question wizard | No checklist rows; structured questions retain composer precedence |
+| Checklist restart/compaction/undo | Committed state persists; undo restores checkpoint state rather than guessing from activity |
 | Local !command | Prompt marker, explicitly local shell heading, full retained inline output |
 | Local shell running/stopping | Waiting/output text and shell lifecycle status |
 | Local shell done/failed | Actual exit code/error, including empty output |
@@ -116,12 +122,28 @@ are not grouped or hidden.
 | Resize, narrow widths, Unicode | Wraps response bodies, truncates tool/group headings to one row, drops indentation when space is scarce |
 | Reduced motion | Existing ZZ_REDUCED_MOTION / NO_COLOR behavior retained |
 
-The dashboard, authentication/settings dialogs, usage footer, undo picker, and
-peek's latest-reply-only scope are unchanged. The shared composer and local shell
+Apart from checklist counts and the new task details dialog, the dashboard,
+authentication/settings dialogs, usage footer, undo picker, and peek's
+latest-reply-only transcript scope are unchanged. The shared composer and local shell
 heading also use the new markers in peek. Native approval/sandbox prompts,
 MCP-specific cards, subagents, and unsupported provider block types are not
 invented: zz does not currently expose those event types. Structured approval
 questions continue to work through the existing question tools.
+
+## Checklist Coverage
+
+`src/tasks.ts` defines the task policy, validated tools and rewindable durable
+state. `src/engine.ts` observes this custom document separately from Pi's built-in
+conversation view. `src/task-display.ts` renders only committed presentation
+caches; dependency IDs remain available to the model but are not UI annotations.
+
+`test/tasks.test.ts` covers lifecycle, schemas, cycles, blockers, deletion,
+idempotent replay and bounded rendering. `test/engine.test.ts` exercises actual
+SQLite tools, parallel creates, session isolation, compaction, interruption,
+restart, stale caches and undo. `test/dashboard.test.ts` covers live session/peek
+checklists, dashboard counts and scoped, scrollable `/tasks` details across narrow
+terminals. `test/tool-response.test.ts` verifies compact cards, expanded raw data
+and visible errors; discovery tests cover command availability.
 
 ## Claude Code Research
 

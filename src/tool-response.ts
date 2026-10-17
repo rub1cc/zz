@@ -30,10 +30,15 @@ export function activityLabel(tool: ToolActivity): string {
   const path = typeof tool.arguments.path === "string" ? tool.arguments.path.replaceAll("\\", "/") : "";
   if (tool.name === "read" && /(^|\/)SKILL\.md$/i.test(path)) return `Skill ${oneLine(path.split("/").at(-2) || "instructions")}`;
   const names: Record<string, string> = { read: "Read", write: "Write", edit: "Update", bash: "Bash", powershell: "PowerShell",
-    ask_user: "Ask user", ask_question: "Ask question", ask_multiple_questions: "Ask questions" };
+    ask_user: "Ask user", ask_question: "Ask question", ask_multiple_questions: "Ask questions",
+    task_create: "Create task", task_update: "Update task", task_list: "List tasks", task_get: "Get task" };
   const name = Object.hasOwn(names, tool.name) ? names[tool.name]! : tool.name;
   const target = isShellTool(tool) ? "" : path;
   return `${oneLine(name)}${target ? `(${oneLine(target)})` : ""}`;
+}
+
+function isTaskTool(tool: ToolActivity): boolean {
+  return ["task_create", "task_update", "task_list", "task_get"].includes(tool.name);
 }
 
 export function isShellTool(tool: ToolActivity): boolean {
@@ -130,6 +135,7 @@ function summary(tool: ToolActivity, output: string): string {
   if (tool.status === "error") return "Error (/expand)";
   if (tool.status === "interrupted") return "Interrupted; completion not confirmed. (/expand)";
   if (tool.name === "compact") return "Summary available (/expand)";
+  if (isTaskTool(tool)) return `${tool.name === "task_create" ? "Task created" : tool.name === "task_update" ? "Task updated" : "Task details available"} (/expand)`;
   if (tool.name === "load_skill" || activityLabel(tool).startsWith("Skill ")) return "Skill instructions loaded (/expand)";
   if (tool.name === "read") {
     if (tool.images?.length) return `Read ${tool.images.length} image${tool.images.length === 1 ? "" : "s"}`;
@@ -171,7 +177,7 @@ export function renderToolResponse(tool: ToolActivity, width: number, expanded: 
       if (tool.status === "error" && !diagnostics(tool).length && output) {
         lines.push(...indentLines([warning(fit(oneLine(textLines(output)[0] ?? ""), Math.max(1, width - (width > 4 ? 4 : 0))))], width, "    "));
       }
-    } else if ((failed || !["read", "write", "edit", "compact"].includes(tool.name) && !skill && !question) && output) {
+    } else if ((failed || !["read", "write", "edit", "compact"].includes(tool.name) && !skill && !question && !isTaskTool(tool)) && output) {
       lines.push(...literal(output, width, previewPrefix, previewLimit));
     }
   } else {

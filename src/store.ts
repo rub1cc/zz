@@ -32,6 +32,12 @@ function isState(value: unknown): value is State {
         && p.sessionOrder.every((id) => typeof id === "string") && new Set(p.sessionOrder).size === p.sessionOrder.length))
     && state.sessions.every((s) => typeof s.id === "string" && typeof s.projectId === "string"
       && (s.conversationId === undefined || Number.isSafeInteger(s.conversationId) && s.conversationId >= 0)
+      && (s.tasks === undefined || Array.isArray(s.tasks) && s.tasks.every((task) => !!task
+        && typeof task.id === "string" && /^[1-9][0-9]*$/.test(task.id) && typeof task.subject === "string"
+        && ["pending", "in_progress", "completed"].includes(task.status)
+        && (task.description === undefined || typeof task.description === "string")
+        && (task.activeForm === undefined || typeof task.activeForm === "string")
+        && Array.isArray(task.blockedBy) && task.blockedBy.every((id) => typeof id === "string")))
       && (s.shellResponses === undefined || Array.isArray(s.shellResponses) && s.shellResponses.every(isShellResponse)
         && new Set(s.shellResponses.map((shell) => shell.id)).size === s.shellResponses.length)
       && (s.pendingInput === undefined || isPendingInput(s.pendingInput))
