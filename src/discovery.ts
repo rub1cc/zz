@@ -36,6 +36,7 @@ export function composerCommands(session: boolean, selectedSession = false): Sla
     ] : []),
     { name: "help", description: "Show commands for this view and keyboard shortcuts" },
     ...(session ? [
+      { name: "top", description: "Scroll to the oldest chat output" },
       { name: "bottom", description: "Scroll to bottom and follow output" },
       { name: "expand", description: "Show all tool details" },
       { name: "collapse", description: "Hide all tool details" },

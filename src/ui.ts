@@ -8,6 +8,7 @@ import { activityTimestamp, displayStatus, sessionPreview, transcriptMessages, l
 import { displayPath } from "./store.js";
 import { accent, bold, dim, fit, green, markdown, oneLine, pad, red, warning, workingIcon } from "./format.js";
 import { Transcript } from "./transcript.js";
+import { AdaptiveWheelScroll } from "./scroll.js";
 import { SettingsDialog } from "./settings-dialog.js";
 import { SettingsPage } from "./settings-page.js";
 import { renderShellResponse } from "./shell-response.js";
@@ -51,14 +52,17 @@ class SessionList extends Dynamic {
     this.transcript = new Transcript(controller, () => controller.changed());
   }
 
+  override render(width: number): string[] {
+    // Transcript rows are already width-safe; do not refit the entire history on scroll.
+    if (this.controller.mode === "session" && this.controller.opened) return this.transcript.render(width);
+    return super.render(width);
+  }
+
   private drawList(width: number): string[] {
     const c = this.controller;
     this.hits.clear();
     this.positions.clear();
     this.renameHeight = 0;
-    if (c.mode === "session" && c.opened) {
-      return this.transcript.render(width);
-    }
     const lines: string[] = [];
     const rows = c.currentRows;
     const titleWidths = new Map<string, number>();
@@ -173,6 +177,7 @@ export class Dashboard extends VStack implements Focusable {
   readonly chatScroll: ScrollView;
   readonly listScroll: ScrollView;
   private readonly bodyHost = new VStack();
+  private readonly wheelScroll = new AdaptiveWheelScroll();
   get scroll(): ScrollView { return this.controller.mode === "session" ? this.chatScroll : this.listScroll; }
   private overlay?: OverlayHandle;
   private activeDialog?: Controller["dialog"];
@@ -215,6 +220,18 @@ export class Dashboard extends VStack implements Focusable {
     controller.onChange = () => this.sync();
   }
 
+  override handleMouse(event: TuiMouseEvent): ReturnType<VStack["handleMouse"]> {
+    if (this.controller.mode !== "session" || this.controller.dialog || event.type !== "wheel" || !event.wheelDelta) return;
+    const direction = event.wheelDelta < 0 ? -1 : 1;
+    const lines = this.wheelScroll.next(direction, performance.now());
+    // Pi already includes the Alt-wheel multiplier in wheelDelta.
+    this.chatScroll.scrollBy(direction * lines * Math.abs(event.wheelDelta));
+    return { handled: true, focus: false, render: true, target: {
+      component: this, originX: event.screenX - event.x, originY: event.screenY - event.y,
+      width: event.width, height: event.height,
+    } };
+  }
+
   private command(text: string): boolean {
     if (text.trimStart().startsWith("!")) { this.controller.runShell(text.trimStart().slice(1)); return true; }
     const command = text.trim();
@@ -249,6 +266,9 @@ export class Dashboard extends VStack implements Focusable {
     }
     if (command === "/skills") {
       void this.controller.skills().catch((error: unknown) => this.controller.fail(error)); return true;
+    }
+    if (command === "/top" && this.controller.mode === "session") {
+      this.chatScroll.scrollToStart(); return true;
     }
     if (command === "/bottom" && this.controller.mode === "session") {
       this.chatScroll.scrollToEnd(); return true;
@@ -293,6 +313,7 @@ export class Dashboard extends VStack implements Focusable {
 
   sync(): void {
     const c = this.controller;
+    if (c.dialog || c.mode !== this.previousMode || c.openedSessionId !== this.previousSessionId) this.wheelScroll.reset();
     if (c.mode !== this.previousMode || c.openedSessionId !== this.previousSessionId) {
       this.composer.setHistory(promptHistory(c.mode === "session" ? c.opened : undefined));
     }
@@ -567,6 +588,8 @@ class DialogView implements Component, Focusable {
       "ctrl+r          rename selected session (dashboard)",
       "ctrl+x twice    delete session or all sessions in selected project", "a               add a project (in project management)",
       "pgup / pgdn     scroll transcript or peek",
+      "wheel           adaptive chat scrolling; Alt scrolls 5x farther",
+      "ctrl+home / /top jump to the oldest chat output",
       "left / ctrl+h   dashboard when composer is empty (work continues)",
       "$skill-name [task] load a skill; type $ to find skills",
       "tab / ctrl+n/p  select tool or thinking blocks in session",

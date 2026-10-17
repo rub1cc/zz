@@ -632,6 +632,12 @@ Opening a chat starts at the bottom. While you remain there, new messages and
 streamed text keep the viewport at the end. Scrolling up with the wheel, scrollbar,
 or Page Up pauses following so new output does not move what you are reading.
 
+Chat wheel scrolling starts at three lines per event and accelerates with faster
+wheel gestures, up to 18 lines per event. A pause or direction change resets the
+speed. Tightly batched trackpad/terminal events keep the base speed to avoid extra
+acceleration. Alt+wheel moves five times farther; dashboard lists keep fine,
+one-line scrolling. Ctrl+Home or `/top` jumps directly to the oldest chat output.
+
 Click **Scroll to bottom** or enter `/bottom` to jump to the end
 and resume following. Scrolling back to the bottom manually also resumes following.
 The jump control appears only when a chat is scrolled away from the end. Project

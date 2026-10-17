@@ -1,9 +1,10 @@
+import { isDeepStrictEqual } from "node:util";
 import { Markdown, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { renderShellResponse } from "./shell-response.js";
 import { ImageDisplay } from "./image-display.js";
 import type { Controller } from "./controller.js";
 import { accent, dim, fit, markdownTheme, oneLine, pad, plain, shimmer, warning, workingIcon } from "./format.js";
-import { transcriptMessages, lastReplyMessage, compactionLabel, type Message, type Session } from "./model.js";
+import { transcriptMessages, lastReplyMessage, compactionLabel, type Message, type Session, type TranscriptMessage } from "./model.js";
 import { answeredQuestions, formQuestion, isQuestionTool, type AnsweredQuestion, type Questionnaire } from "./questions.js";
 import { indentLines, renderToolResponse } from "./tool-response.js";
 import { renderToolGroup, toolGroups } from "./tool-groups.js";
@@ -35,9 +36,26 @@ export function renderAnsweredQuestions(answers: AnsweredQuestion[], width: numb
   return lines;
 }
 
+interface HistoryCheckpoint {
+  index: number;
+  line: number;
+  ids: number;
+  question?: Questionnaire;
+}
+
+interface HistoryCache {
+  width: number;
+  messages: TranscriptMessage[];
+  showThinking: boolean;
+  selected?: string;
+  lines: string[];
+  checkpoints: HistoryCheckpoint[];
+}
+
 export class Transcript implements Component {
   private sessionId?: string;
   private cache: { text: string; role: Message["role"]; renderer: Markdown }[] = [];
+  private historyCache?: HistoryCache;
   private expanded = new Set<string>();
   private groupMembers = new Map<string, string[]>();
   private collapsedThinking = new Set<string>();
@@ -47,7 +65,9 @@ export class Transcript implements Component {
   readonly positions = new Map<string, number>();
   selected?: string;
 
-  constructor(readonly controller: Controller, readonly changed: () => void) { this.images = new ImageDisplay(changed); }
+  constructor(readonly controller: Controller, readonly changed: () => void) {
+    this.images = new ImageDisplay(() => { this.historyCache = undefined; changed(); });
+  }
 
   move(delta: number): void {
     if (!this.ids.length) return;
@@ -61,6 +81,7 @@ export class Transcript implements Component {
   toggle(expand?: boolean): void {
     const id = this.selected ?? this.ids.at(-1);
     if (!id) return;
+    this.historyCache = undefined;
     this.selected = id;
     if (id.startsWith("thinking:")) {
       if (expand ?? this.collapsedThinking.has(id)) this.collapsedThinking.delete(id); else this.collapsedThinking.add(id);
@@ -73,6 +94,7 @@ export class Transcript implements Component {
   }
 
   toggleAll(expand: boolean): void {
+    this.historyCache = undefined;
     for (const id of this.ids) {
       if (id.startsWith("thinking:")) { if (expand) this.collapsedThinking.delete(id); else this.collapsedThinking.add(id); }
       else for (const member of this.groupMembers.get(id) ?? [id]) {
@@ -87,9 +109,25 @@ export class Transcript implements Component {
     if (!session) return [];
     if (this.sessionId !== session.id) {
       this.sessionId = session.id; this.cache = []; this.expanded.clear(); this.collapsedThinking.clear(); this.images.clear(); this.selected = undefined;
+      this.historyCache = undefined;
     }
-    this.ids = []; this.hits.clear(); this.positions.clear();
     const messages = transcriptMessages(session);
+    const showThinking = this.controller.store.settings.showThinking !== false;
+    const cached = this.historyCache;
+    const reusable = cached && cached.width === width && cached.showThinking === showThinking && cached.selected === this.selected
+      ? cached : undefined;
+    if (reusable && isDeepStrictEqual(reusable.messages, messages)) return reusable.lines.concat(this.renderStatus(session, width));
+    let unchanged = 0;
+    if (reusable) while (unchanged < Math.min(reusable.messages.length, messages.length)
+      && isDeepStrictEqual(reusable.messages[unchanged], messages[unchanged])) unchanged++;
+    const history = this.renderHistory(messages, width, reusable, unchanged);
+    // Snapshot only changed inputs; nested tool arguments can mutate in place.
+    const snapshot = (reusable?.messages.slice(0, unchanged) ?? []).concat(structuredClone(messages.slice(unchanged)));
+    this.historyCache = { width, showThinking, selected: this.selected, messages: snapshot, ...history };
+    return history.lines.concat(this.renderStatus(session, width));
+  }
+
+  private renderHistory(messages: TranscriptMessage[], width: number, cached?: HistoryCache, unchanged = 0): Pick<HistoryCache, "lines" | "checkpoints"> {
     const groups = toolGroups(messages);
     this.groupMembers.clear();
     // The first call anchors a growing group; expansion remains attached to its member calls.
@@ -100,11 +138,26 @@ export class Transcript implements Component {
       if (this.selected && members.includes(this.selected)) this.selected = id;
     }
     this.cache.length = messages.length;
-    const lines: string[] = [];
-    let question: Questionnaire | undefined;
+    // Appending a routine tool can extend a group that starts before the changed message.
+    for (const [index, group] of groups) if (index < unchanged && group.end >= unchanged) unchanged = index;
+    const resume = cached?.checkpoints.findLast((checkpoint) => checkpoint.index <= unchanged);
+    const start = resume?.index ?? 0;
+    const prefixLines = resume?.line ?? 0;
+    const lines = cached?.lines.slice(0, prefixLines) ?? [];
+    const checkpoints = cached?.checkpoints.filter((checkpoint) => checkpoint.index < start) ?? [];
+    if (start) {
+      this.ids.length = resume!.ids;
+      for (const [id, line] of this.positions) if (line >= prefixLines) this.positions.delete(id);
+      for (const line of this.hits.keys()) if (line >= prefixLines) this.hits.delete(line);
+    } else {
+      this.ids = []; this.hits.clear(); this.positions.clear();
+    }
+    let question = resume?.question;
     let groupedThrough = -1;
-    for (const [index, message] of messages.entries()) {
+    for (let index = start; index < messages.length; index++) {
       if (index <= groupedThrough) continue;
+      const message = messages[index]!;
+      checkpoints.push({ index, line: lines.length, ids: this.ids.length, question });
       const group = groups.get(index);
       if (group) {
         const id = group.tools[0]!.id;
@@ -181,6 +234,13 @@ export class Transcript implements Component {
       lines.push("");
     }
     if (this.selected && !this.ids.includes(this.selected)) this.selected = undefined;
+    checkpoints.push({ index: messages.length, line: lines.length, ids: this.ids.length, question });
+    for (let i = prefixLines; i < lines.length; i++) lines[i] = fit(lines[i]!, width);
+    return { lines, checkpoints };
+  }
+
+  private renderStatus(session: Session, width: number): string[] {
+    const lines: string[] = [];
     const compacting = compactionLabel(session);
     if (compacting) lines.push(...wrapTextWithAnsi(accent(oneLine(compacting)), Math.max(1, width)), "");
     if (session.compactionFailure) lines.push(...wrapTextWithAnsi(warning(oneLine(`Compaction failed (${session.compactionFailure.reason}): ${session.compactionFailure.error}`)), Math.max(1, width)), "");
@@ -211,5 +271,9 @@ export class Transcript implements Component {
     return { handled: true, render: true };
   }
 
-  invalidate(): void { for (const cached of this.cache) cached?.renderer.invalidate(); this.images.invalidate(); }
+  invalidate(): void {
+    this.historyCache = undefined;
+    for (const cached of this.cache) cached?.renderer.invalidate();
+    this.images.invalidate();
+  }
 }

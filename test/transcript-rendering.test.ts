@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { test } from "node:test";
-import { stripTerminalSequences, TuiAltScreen, visibleWidth } from "@earendil-works/pi-tui";
+import { Markdown, stripTerminalSequences, TuiAltScreen, visibleWidth } from "@earendil-works/pi-tui";
 import type { ConversationView } from "@earendil-works/pi-durable";
 import { Controller } from "../src/controller.js";
 import { applyView } from "../src/engine.js";
@@ -215,4 +215,149 @@ test("the full TUI preserves prompt text, cursor markers, borders, scrolling and
     assert.match(text, /Reply 39/);
     assert.ok(app.composer.render(80).some((line) => line.includes("\x1b_pi:c")), "The editor must retain its hardware cursor marker");
   } finally { tui.stop(); await f.close(); }
+});
+
+test("scroll-only TUI frames reuse formatted history and preserve tool click targets", async (t) => {
+  const f = setup(); const terminal = new FakeTerminal(); const tui = new TuiAltScreen(terminal);
+  try {
+    f.session.messages = Array.from({ length: 100 }, (_, i) => ({ role: "assistant", text: `Reply ${i}`, timestamp: i }));
+    f.session.messages.push(toolMessage({ id: "last-tool", name: "bash", arguments: { command: "npm test" }, status: "done", output: "PASS" }));
+    const app = new Dashboard(f.controller, tui, () => {});
+    tui.setLayoutRoot(app); tui.setFocus(app); tui.start(); app.sync(); tui.renderNow();
+    const clear = t.mock.method(app.body.transcript.positions, "clear");
+    const positions = [...app.body.transcript.positions];
+    const bottom = app.chatScroll.scrollTop;
+    const screen = tui.getScreenLines();
+    for (let i = 0; i < 10; i++) {
+      terminal.onInput("\x1b[<64;5;10M");
+      tui.renderNow();
+    }
+    assert.ok(app.chatScroll.scrollTop < bottom);
+    assert.notDeepEqual(tui.getScreenLines(), screen);
+    assert.equal(clear.mock.callCount(), 0, "Scrolling must not rebuild history or its hit map");
+    assert.deepEqual([...app.body.transcript.positions], positions);
+    app.chatScroll.scrollToEnd(); tui.renderNow();
+    const y = app.body.transcript.positions.get("last-tool")! + 1;
+    app.body.transcript.handleMouse({ type: "click", button: "left", x: 4, y, screenX: 4, screenY: y, width: 120, height: 32, shift: false, ctrl: false, alt: false });
+    tui.renderNow();
+    assert.match(tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Arguments[^]*PASS/);
+    assert.equal(clear.mock.callCount(), 1);
+  } finally { tui.stop(); await f.close(); }
+});
+
+test("history cache detects nested mutations, shell streaming, resize and explicit invalidation", async (t) => {
+  const f = setup();
+  try {
+    const details = { result: { diff: "-1 old\n+1 first" } };
+    f.session.messages = [toolMessage({ id: "edit", name: "edit", arguments: { path: "a.ts" }, status: "done", output: "Updated", details })];
+    assert.match(f.render(), /first/);
+    const clear = t.mock.method(f.transcript.positions, "clear");
+    assert.match(f.render(), /first/);
+    assert.equal(clear.mock.callCount(), 0);
+    details.result.diff = "-1 first\n+1 second";
+    assert.match(f.render(), /second/);
+    assert.equal(clear.mock.callCount(), 1);
+    f.session.messages = structuredClone(f.session.messages);
+    f.render();
+    assert.equal(clear.mock.callCount(), 1, "Equivalent durable projections should reuse history");
+    f.session.shellResponses = [{ id: "shell", command: "echo hello", cwd: "/tmp", text: "partial", timestamp: 4, updatedAt: 4,
+      status: "running", droppedBytes: 0, droppedLines: 0 }];
+    assert.match(f.render(), /partial[^]*Shell running/);
+    Object.assign(f.session.shellResponses[0]!, { text: "finished", status: "done", exitCode: 0, updatedAt: 5 });
+    assert.match(f.render(), /finished[^]*Exit code 0/);
+    assert.equal(clear.mock.callCount(), 1, "Shell updates retain the unchanged tool prefix");
+    f.render(20);
+    assert.equal(clear.mock.callCount(), 2);
+    f.transcript.invalidate(); f.render(20);
+    assert.equal(clear.mock.callCount(), 3);
+    f.session.messages = []; f.session.shellResponses = [];
+    assert.equal(f.render(20), "");
+  } finally { await f.close(); }
+});
+
+test("cached history does not freeze work animation, queues or session status", async (t) => {
+  const f = setup();
+  try {
+    let now = 0;
+    t.mock.method(Date, "now", () => now);
+    f.session.messages = [{ role: "assistant", text: "Existing reply", timestamp: 1 }];
+    f.session.status = "working";
+    const initial = f.transcript.render(100);
+    const clear = t.mock.method(f.transcript.positions, "clear");
+    now = 320;
+    const next = f.transcript.render(100);
+    assert.deepEqual(next.slice(0, 2), initial.slice(0, 2));
+    assert.ok(next.includes(workLabel(f.session)!));
+    f.session.preview = "Retrying: rate limit";
+    assert.match(f.render(), /Retrying: rate limit/);
+    f.session.queuedInputs = [{ id: 1, text: "Next task", mode: "steer" }];
+    assert.match(f.render(), /Queued steering[^]*Next task/);
+    f.session.queuedInputs[0]!.text = "Updated task";
+    assert.match(f.render(), /Updated task/);
+    f.session.status = "needs-input";
+    assert.match(f.render(), /Waiting for your answer/);
+    f.session.queuedInputs = [];
+    f.session.status = "paused";
+    assert.doesNotMatch(f.render(), /Queued steering|Waiting for your answer/);
+    assert.match(f.render(), /Paused\. Reply to continue/);
+    assert.equal(clear.mock.callCount(), 0, "Live status updates must not reformat unchanged history");
+  } finally { await f.close(); }
+});
+
+test("streaming redraws format only the changed suffix, including after durable replacements", async (t) => {
+  const f = setup();
+  try {
+    f.session.messages = Array.from({ length: 100 }, (_, i) => ({ role: "assistant", text: `Reply ${i}`, timestamp: i }));
+    f.render();
+    const render = t.mock.method(Markdown.prototype, "render");
+    const clear = t.mock.method(f.transcript.positions, "clear");
+    for (let i = 0; i < 5; i++) {
+      f.session.messages = structuredClone(f.session.messages);
+      f.session.messages.at(-1)!.text += " more";
+      assert.match(f.render(), /Reply 99 more/);
+      assert.equal(render.mock.callCount(), i + 1, "Old replies must not be reformatted for each streaming chunk");
+    }
+    f.session.messages.push({ role: "assistant", text: "New reply", timestamp: 101 });
+    assert.match(f.render(), /New reply/);
+    assert.equal(render.mock.callCount(), 6);
+    assert.equal(clear.mock.callCount(), 0, "Incremental updates retain the unchanged interaction map");
+  } finally { await f.close(); }
+});
+
+test("incremental output and hit maps match full renders when groups grow, split, merge or disappear", async () => {
+  const f = setup();
+  try {
+    const full = new Transcript(f.controller, () => {});
+    const read = (id: string) => toolMessage({ id, name: "read", arguments: { path: `${id}.ts` }, status: "done", output: "source" });
+    const check = () => {
+      full.invalidate();
+      assert.deepEqual(f.transcript.render(100), full.render(100));
+      assert.deepEqual([...f.transcript.positions], [...full.positions]);
+      assert.equal(f.transcript.selected, full.selected);
+    };
+    const selectLast = () => { f.transcript.move(-1); full.move(-1); };
+    const toggle = (expand?: boolean) => { f.transcript.toggle(expand); full.toggle(expand); };
+    f.session.messages = [
+      { role: "user", text: "Check the files", timestamp: 1 },
+      { role: "thinking", text: "Initial reasoning", timestamp: 2 },
+      read("first"), read("second"),
+      { role: "assistant", text: "More work", timestamp: 4 },
+    ];
+    check();
+    f.session.messages.push(read("third")); check();
+    selectLast(); toggle(true); check();
+    f.session.messages.push(read("fourth")); check();
+    f.session.messages.at(-1)!.tool!.status = "error"; check();
+    f.session.messages.at(-1)!.tool!.status = "done"; check();
+    f.session.messages.splice(4, 1); check();
+    f.session.messages.splice(3, 0, { role: "assistant", text: "Group boundary", timestamp: 3 }); check();
+    toggle(false); check();
+    f.session.messages.splice(3, 1); check();
+    f.session.messages.length = 3; check();
+    f.session.messages.push(read("fifth")); check();
+    f.session.messages = structuredClone(f.session.messages); check();
+    f.session.messages[1]!.text += " expanded reasoning"; check();
+    f.session.messages.splice(0, 2); check();
+    f.session.messages = []; check();
+  } finally { await f.close(); }
 });

@@ -966,14 +966,14 @@ test("command discovery follows project selection, session selection and the ope
     f.c.send("task"); await tick();
     const session = f.store.state.sessions[0]!;
     f.c.select(`project:${f.pb.id}`);
-    for (const command of ["/session", "/compact", "/undo", "/stop", "/bottom", "/expand", "/collapse"]) await expectSuggestion(command, false);
+    for (const command of ["/session", "/compact", "/undo", "/stop", "/top", "/bottom", "/expand", "/collapse"]) await expectSuggestion(command, false);
     for (const command of ["/model", "/thinking", "/skills", "/settings", "/help"]) await expectSuggestion(command, true);
     f.c.select(`session:${session.id}`);
     assert.equal(f.app.composer.showingSuggestions, false, "Selection changes dismiss the old menu");
     for (const command of ["/session", "/compact", "/undo", "/stop"]) await expectSuggestion(command, true);
     await expectSuggestion("/bottom", false);
     f.c.open();
-    for (const command of ["/session", "/compact", "/undo", "/stop", "/bottom", "/expand", "/collapse"]) await expectSuggestion(command, true);
+    for (const command of ["/session", "/compact", "/undo", "/stop", "/top", "/bottom", "/expand", "/collapse"]) await expectSuggestion(command, true);
     f.c.back();
     await expectSuggestion("/bottom", false);
     f.c.select(`project:${f.pb.id}`);
@@ -996,18 +996,18 @@ test("help lists only the current view's commands and explains their scope", asy
     const project = help();
     assert.match(project, /Commands: Dashboard \(project selected\)/);
     assert.match(project, /\/model\s+Choose the model for new tasks/);
-    assert.doesNotMatch(project, /\|\s*\/(session|compact|undo|stop|bottom|expand|collapse)\s/);
+    assert.doesNotMatch(project, /\|\s*\/(session|compact|undo|stop|top|bottom|expand|collapse)\s/);
     f.c.send("task"); await tick();
     const selected = help();
     assert.match(selected, /Commands: Dashboard \(session selected\)/);
     assert.match(selected, /\/compact\s+Summarize older context in the selected session/);
     assert.match(selected, /\/undo\s+Choose a checkpoint/);
-    assert.doesNotMatch(selected, /\|\s*\/(bottom|expand|collapse)\s/);
+    assert.doesNotMatch(selected, /\|\s*\/(top|bottom|expand|collapse)\s/);
     f.c.open();
     const open = help();
     assert.match(open, /Commands: Open session/);
     assert.match(open, /\/model\s+Choose this session's model/);
-    for (const command of ["bottom", "expand", "collapse"]) assert.match(open, new RegExp(`\\|\\s*\\/${command}\\s`));
+    for (const command of ["top", "bottom", "expand", "collapse"]) assert.match(open, new RegExp(`\\|\\s*\\/${command}\\s`));
     assert.equal(f.engine.calls.length, 1);
   } finally { await f.cleanup(); }
 });
@@ -1015,7 +1015,7 @@ test("help lists only the current view's commands and explains their scope", asy
 test("manually entered transcript commands on the dashboard do not start agent tasks", async () => {
   const f = setup();
   try {
-    for (const command of ["/bottom", "/expand", "/collapse"]) {
+    for (const command of ["/top", "/bottom", "/expand", "/collapse"]) {
       f.app.composer.setValue(command); f.terminal.onInput("\r"); await tick();
       assert.match(f.c.notice, /only available in an open session/);
       assert.equal(f.app.composer.getValue(), "");
@@ -2334,5 +2334,99 @@ test("cleared checklists disappear from sessions, peeks and dashboard counts whi
     assert.match(screen(), /No checklist tasks/);
     assert.doesNotMatch(screen(), /Finished item/);
     assert.equal(f.engine.calls.length, 1, "cleanup display updates never send a prompt");
+  } finally { await f.cleanup(); }
+});
+
+test("/top and Ctrl+Home jump directly to the oldest output without sending work or losing drafts", async () => {
+  const f = setup();
+  try {
+    f.c.send("long conversation"); await tick();
+    const session = f.store.state.sessions[0]!;
+    session.messages = Array.from({ length: 300 }, (_, i) => ({ role: "assistant", timestamp: i, text: `Reply ${i}` }));
+    f.c.open(); f.tui.renderNow();
+    assert.ok(f.app.scroll.scrollTop > 0);
+    f.app.composer.setValue("/top"); f.terminal.onInput("\r"); f.tui.renderNow();
+    assert.equal(f.app.scroll.scrollTop, 0);
+    assert.equal(f.app.scroll.isFollowingEnd, false);
+    assert.match(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Reply 0/);
+    session.messages.push({ role: "assistant", timestamp: 301, text: "Live update" });
+    f.c.changed(); f.tui.renderNow();
+    assert.equal(f.app.scroll.scrollTop, 0);
+    f.app.composer.setValue("/bottom"); f.terminal.onInput("\r"); f.tui.renderNow();
+    assert.equal(f.app.scroll.isFollowingEnd, true);
+    f.app.composer.setValue("keep this draft");
+    f.terminal.onInput("\x1b[1;5H"); f.tui.renderNow();
+    assert.equal(f.app.scroll.scrollTop, 0);
+    assert.equal(f.app.composer.getValue(), "keep this draft");
+    assert.equal(f.engine.calls.length, 1);
+  } finally { await f.cleanup(); }
+});
+
+test("session wheel starts at three lines, Alt+wheel at fifteen, and dashboard keeps fine scrolling", async (t) => {
+  const f = setup();
+  t.mock.method(performance, "now", () => 0);
+  try {
+    f.c.send("long conversation"); await tick();
+    const session = f.store.state.sessions[0]!;
+    session.messages = Array.from({ length: 100 }, (_, i) => ({ role: "assistant", timestamp: i, text: `Reply ${i}` }));
+    f.c.open(); f.tui.renderNow();
+    const bottom = f.app.scroll.scrollTop;
+    f.terminal.onInput("\x1b[<64;4;6M"); f.tui.renderNow();
+    assert.equal(f.app.scroll.scrollTop, bottom - 3);
+    f.terminal.onInput("\x1b[<65;4;6M"); f.tui.renderNow();
+    assert.equal(f.app.scroll.scrollTop, bottom);
+    assert.equal(f.app.scroll.isFollowingEnd, true);
+    f.terminal.onInput("\x1b[<72;4;6M"); f.tui.renderNow();
+    assert.equal(f.app.scroll.scrollTop, bottom - 15);
+    f.app.scroll.scrollTo(1); f.tui.renderNow();
+    f.terminal.onInput("\x1b[<64;4;6M"); f.tui.renderNow();
+    assert.equal(f.app.scroll.scrollTop, 0);
+    f.store.state.sessions.push(...Array.from({ length: 50 }, (_, i) => ({ ...session, id: `extra-${i}` })));
+    f.c.back(); f.tui.renderNow();
+    f.app.scroll.scrollTo(20); f.tui.renderNow();
+    assert.equal(f.app.scroll.scrollTop, 20);
+    f.terminal.onInput("\x1b[<64;4;6M"); f.tui.renderNow();
+    assert.equal(f.app.scroll.scrollTop, 19);
+  } finally { await f.cleanup(); }
+});
+
+test("fast session wheel gestures accelerate, preserve Alt scaling and reset between views", async (t) => {
+  const f = setup();
+  let now = 0;
+  t.mock.method(performance, "now", () => now);
+  try {
+    f.c.send("long conversation"); await tick();
+    const session = f.store.state.sessions[0]!;
+    session.messages = Array.from({ length: 300 }, (_, i) => ({ role: "assistant", timestamp: i, text: `Reply ${i}` }));
+    f.c.open(); f.tui.renderNow();
+    const wheel = (time: number, button = 64) => {
+      now = time;
+      const before = f.app.scroll.scrollTop;
+      f.terminal.onInput(`\x1b[<${button};4;6M`); f.tui.renderNow();
+      return before - f.app.scroll.scrollTop;
+    };
+    assert.equal(wheel(0), 3);
+    assert.equal(wheel(50), 6);
+    assert.equal(wheel(100), 6);
+    assert.equal(wheel(150, 72), 30, "Alt multiplies the accelerated distance by five");
+    assert.equal(wheel(200, 65), -3, "Reversing direction restores the base speed");
+    assert.equal(wheel(450, 65), -3, "A pause restores the base speed");
+    assert.equal(wheel(500, 65), -6);
+    f.app.scroll.scrollTo(2); f.tui.renderNow();
+    assert.equal(wheel(750), 2, "Scrolling clamps to the start of the transcript");
+    assert.equal(f.app.scroll.isFollowingEnd, false);
+    f.app.composer.setValue("/bottom"); f.terminal.onInput("\r"); f.tui.renderNow();
+    assert.equal(f.app.scroll.isFollowingEnd, true);
+    f.store.state.sessions.push(...Array.from({ length: 50 }, (_, i) => ({ ...session, id: `accelerated-extra-${i}` })));
+    f.c.back(); f.tui.renderNow();
+    f.app.scroll.scrollTo(20); f.tui.renderNow();
+    assert.equal(wheel(800), 1, "Dashboard scrolling never inherits chat acceleration");
+    f.c.select(`session:${session.id}`); f.c.open(); f.tui.renderNow();
+    assert.equal(wheel(850), 3, "A reopened chat starts a fresh gesture");
+    f.c.showUsage(); f.tui.renderNow();
+    assert.equal(wheel(900), 1, "Modal wheel input must not inherit chat acceleration");
+    f.terminal.onInput("\x1b"); f.tui.renderNow();
+    assert.equal(wheel(950), 3, "Dismissing a dialog starts a fresh gesture");
+    assert.equal(f.engine.calls.length, 1);
   } finally { await f.cleanup(); }
 });

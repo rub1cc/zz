@@ -106,3 +106,23 @@ test("legacy form answers keep their summary but direct questions never turn rep
     assert.match(f.render(), /Answers to:/);
   } finally { await f.cleanup(); }
 });
+
+test("incremental user messages retain question context and refresh edited answer labels", async () => {
+  const f = setup();
+  try {
+    const answer = f.session.messages.pop()!;
+    f.render();
+    f.session.messages.push(answer);
+    assert.match(f.render(), /What should I build\? \u2192 Website/);
+    answer.text = answer.text.replace('"web"', '"cli"');
+    const full = new Transcript(f.controller, () => {});
+    assert.deepEqual(f.transcript.render(160), full.render(160));
+    const arguments_ = f.session.messages[1]!.tool!.arguments;
+    const steps = arguments_.questions as { options?: { value: string; label: string }[] }[];
+    steps[0]!.options![1]!.label = "Web application";
+    answer.text = f.text;
+    assert.match(f.render(), /What should I build\? \u2192 Web application/);
+    full.invalidate();
+    assert.deepEqual(f.transcript.render(160), full.render(160));
+  } finally { await f.cleanup(); }
+});

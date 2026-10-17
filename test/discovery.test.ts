@@ -28,8 +28,8 @@ test("slash discovery filters available commands and excludes later draft lines 
   const selected = await suggestions(provider(process.cwd(), false, true, true), "/");
   assert.deepEqual(selected?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "projects", "login", "logout", "answer", "copy", "session", "tasks", "compact", "undo", "stop", "help"]);
   const open = await suggestions(provider(process.cwd(), true), "/");
-  assert.deepEqual(open?.items.map((i) => i.value), [...selected!.items.map((i) => i.value), "bottom", "expand", "collapse"]);
-  assert.deepEqual(composerCommands(true).filter((c) => !composerCommands(false, true).some((base) => base.name === c.name)).map((c) => c.name), ["bottom", "expand", "collapse"]);
+  assert.deepEqual(open?.items.map((i) => i.value), [...selected!.items.map((i) => i.value), "top", "bottom", "expand", "collapse"]);
+  assert.deepEqual(composerCommands(true).filter((c) => !composerCommands(false, true).some((base) => base.name === c.name)).map((c) => c.name), ["top", "bottom", "expand", "collapse"]);
   assert.match(composerCommands(false, true).find((c) => c.name === "model")!.description!, /new tasks/);
   assert.match(composerCommands(false, true).find((c) => c.name === "stop")!.description!, /selected session/);
   assert.match(composerCommands(true).find((c) => c.name === "stop")!.description!, /open session/);
