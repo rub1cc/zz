@@ -6,7 +6,7 @@ import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { JsonObject } from "@earendil-works/pi-durable";
 import type { ToolExecutionApi } from "@earendil-works/pi-durable";
-import { createTask, getTask, taskExtension, unresolvedDependencies, updateTask, type TaskState } from "../src/tasks.js";
+import { applyTaskBatch, createTask, getTask, legacyTaskExtension, prepareTaskUpdate, taskExtension, unresolvedDependencies, updateTask, type TaskState } from "../src/tasks.js";
 import { taskChecklist, taskDetails, taskProgress } from "../src/task-display.js";
 import { Store } from "../src/store.js";
 import { temporary } from "./helpers.js";
@@ -74,21 +74,25 @@ test("deleting obsolete tasks removes references without reusing IDs or completi
   assert.throws(() => getTask(tasks, "1"), /No task/);
 });
 
-test("tool schemas reject malformed tasks and dependency lists", () => {
-  const create = taskExtension.tools!.find((tool) => tool.name === "task_create")!;
+test("the batch schema requires explicit actions, valid task fields and bounded nonempty operations", () => {
   const update = taskExtension.tools!.find((tool) => tool.name === "task_update")!;
-  const check = (tool: typeof create, args: JsonObject) => validateToolArguments(tool, { type: "toolCall", id: "test", name: tool.name, arguments: args });
-  for (const args of [{}, { subject: " " }, { subject: "a".repeat(201) }, { subject: "Valid", activeForm: " " },
-    { subject: "Valid", blockedBy: ["1", "1"] }, { subject: "Valid", blockedBy: ["0"] }] as JsonObject[]) {
-    assert.throws(() => check(create, args));
-  }
-  for (const args of [{ taskId: "0" }, { taskId: "1", status: "blocked" }, { taskId: "1", addBlockedBy: ["bad"] }] as JsonObject[]) {
-    assert.throws(() => check(update, args));
-  }
-  assert.ok(check(create, { subject: "Valid", blockedBy: ["1"] }));
+  const check = (args: JsonObject) => validateToolArguments(update, { type: "toolCall", id: "test", name: update.name, arguments: args });
+  const invalid: JsonObject[] = [
+    {}, { operations: [] }, { operations: Array.from({ length: 101 }, () => ({ action: "create", subject: "Task" })) },
+    ...([{}, { subject: "Missing action" }, { action: "bad" }, { action: "create", subject: " " },
+      { action: "create", subject: "a".repeat(201) }, { action: "create", subject: "Valid", activeForm: " " },
+      { action: "create", subject: "Valid", blockedBy: ["1", "1"] }, { action: "create", subject: "Valid", blockedBy: ["0"] },
+      { action: "create", subject: "Valid", ref: "1bad" }, { action: "create", subject: "Valid", blockedBy: [{ ref: "" }] },
+      { action: "update", taskId: "0" }, { action: "update", taskId: "1", status: "deleted" },
+      { action: "update", taskId: "1", status: "blocked" }, { action: "delete" },
+    ] as JsonObject[]).map((op) => ({ operations: [op] })),
+  ];
+  for (const args of invalid) assert.throws(() => check(args), JSON.stringify(args));
+  assert.ok(check({ operations: [{ action: "create", subject: "Valid", ref: "auth", blockedBy: ["1", { ref: "setup" }] }] }));
+  assert.deepEqual(taskExtension.tools!.map((tool) => tool.name), ["task_update", "task_list", "task_get"]);
 });
 
-test("safe task tools return saved receipts on replay instead of reapplying mutations", async () => {
+test("safe batch tools replay the whole saved result without duplicating creates or deletes", async () => {
   let tasks = state();
   const api = { conversationId: 1, taskId: 100,
     commit: async (change: (tx: { doc: () => Promise<TaskState> }) => Promise<unknown>) => {
@@ -98,19 +102,39 @@ test("safe task tools return saved receipts on replay instead of reapplying muta
       return result;
     },
   } as unknown as ToolExecutionApi;
-  const create = taskExtension.tools!.find((tool) => tool.name === "task_create")!;
   const update = taskExtension.tools!.find((tool) => tool.name === "task_update")!;
-  assert.equal(create.replay, "safe");
   assert.equal(update.replay, "safe");
-  const first = await create.execute({ subject: "Once" }, api, BACKGROUND_CONTEXT);
-  const replayed = await create.execute({ subject: "Once" }, api, BACKGROUND_CONTEXT);
-  assert.deepEqual(first, replayed);
-  assert.equal(tasks.items.length, 1);
+  const args = { operations: [{ action: "create", subject: "First" }, { action: "create", subject: "Second" }] };
+  const first = await update.execute(args, api, BACKGROUND_CONTEXT);
+  assert.deepEqual(await update.execute(args, api, BACKGROUND_CONTEXT), first);
+  assert.equal(tasks.items.length, 2);
   const deleteApi = { ...api, taskId: 101 } as unknown as ToolExecutionApi;
-  const deleted = await update.execute({ taskId: "1", status: "deleted" }, deleteApi, BACKGROUND_CONTEXT);
-  assert.deepEqual(await update.execute({ taskId: "1", status: "deleted" }, deleteApi, BACKGROUND_CONTEXT), deleted);
+  const deletes = { operations: [{ action: "delete", taskId: "1" }, { action: "delete", taskId: "2" }] };
+  const deleted = await update.execute(deletes, deleteApi, BACKGROUND_CONTEXT);
+  assert.deepEqual(await update.execute(deletes, deleteApi, BACKGROUND_CONTEXT), deleted);
   assert.equal(tasks.items.length, 0);
-  assert.equal(tasks.nextId, 2);
+  assert.equal(tasks.nextId, 3);
+  const before = structuredClone(tasks);
+  await assert.rejects(update.execute({ operations: [{ action: "create", subject: "Rollback" }, { action: "delete", taskId: "99" }] },
+    { ...api, taskId: 102 } as unknown as ToolExecutionApi, BACKGROUND_CONTEXT));
+  assert.deepEqual(tasks, before);
+
+  const legacy = legacyTaskExtension.tools![0]!;
+  const legacyApi = { ...api, taskId: 103 } as unknown as ToolExecutionApi;
+  const created = await legacy.execute({ subject: "Old create" }, legacyApi, BACKGROUND_CONTEXT);
+  assert.deepEqual(await legacy.execute({ subject: "Old create" }, legacyApi, BACKGROUND_CONTEXT), created);
+  assert.equal(tasks.items.length, 1);
+  const oldUpdateApi = { ...api, taskId: 104 } as unknown as ToolExecutionApi;
+  await update.execute({ taskId: "3", status: "completed" }, oldUpdateApi, BACKGROUND_CONTEXT);
+  assert.equal(tasks.items[0]?.status, "completed", "saved old intents bypass prepareArguments during recovery");
+});
+
+test("legacy single updates normalize without exposing the old schema to the model", () => {
+  assert.deepEqual(prepareTaskUpdate({ taskId: "1", status: "completed", activeForm: "Checking" }), {
+    operations: [{ action: "update", taskId: "1", status: "completed", activeForm: "Checking" }],
+  });
+  assert.deepEqual(prepareTaskUpdate({ taskId: "1", status: "deleted" }), { operations: [{ action: "delete", taskId: "1" }] });
+  assert.throws(() => prepareTaskUpdate({ subject: "Ambiguous creation" }));
 });
 
 test("checklist rendering is bounded, safe and never displays dependency annotations", () => {
@@ -129,7 +153,7 @@ test("checklist rendering is bounded, safe and never displays dependency annotat
   assert.match(rendered, /\u2610 #3 Run tests/);
   assert.doesNotMatch(rendered, /\[>\]|\[x\]|\[ \]/);
   assert.match(colored, /\x1b\[32m  \u2612 #1 Inspect auth/);
-  assert.match(colored, /\x1b\[36m  \u2610 #2 Implementing auth/);
+  assert.match(colored, /\x1b\[1m\x1b\[38;5;214m  \u2610 #2 Implementing auth/);
   assert.match(colored, /\x1b\[2m  \u2610 #3 Run tests/);
   assert.doesNotMatch(rendered, /blocked|blockedBy|depends/);
   const details = taskDetails(tasks.items, 100).map(stripTerminalSequences).join("\n");
@@ -178,4 +202,97 @@ test("cached task state is backward compatible, validated and preserved without 
       assert.equal(readFileSync(store.file, "utf8"), content);
     }
   } finally { f.cleanup(); }
+});
+
+test("batches resolve forward references and return final tasks in operation order", () => {
+  const tasks = state();
+  const created = applyTaskBatch(tasks, { operations: [
+    { action: "create", subject: "Implement", ref: "implement", blockedBy: [{ ref: "inspect" }] },
+    { action: "create", subject: "Inspect", ref: "inspect", status: "in_progress" },
+    { action: "create", subject: "Test", blockedBy: [{ ref: "implement" }] },
+  ] });
+  assert.deepEqual(created.results.map((result) => result.taskId), ["1", "2", "3"]);
+  assert.deepEqual(tasks.items.map((task) => task.blockedBy), [["2"], [], ["1"]]);
+  assert.deepEqual(created.results[0], { action: "create", ref: "implement", taskId: "1", status: "pending" });
+  const changed = applyTaskBatch(tasks, { operations: [
+    { action: "update", taskId: "1", status: "in_progress" },
+    { action: "update", taskId: "2", status: "completed" },
+  ] });
+  assert.deepEqual(changed.results.map((result) => result.status), ["in_progress", "completed"]);
+  const deleted = applyTaskBatch(tasks, { operations: [
+    { action: "delete", taskId: "1" },
+    { action: "update", taskId: "3", description: "Still pending" },
+    { action: "create", subject: "Document", blockedBy: ["2"] },
+  ] });
+  assert.deepEqual(deleted.results[0], { action: "delete", taskId: "1", status: "deleted" });
+  assert.deepEqual(getTask(tasks, "3").blockedBy, []);
+  assert.equal(getTask(tasks, "3").status, "pending");
+  assert.equal(tasks.nextId, 5);
+});
+
+test("invalid batches roll back every operation, reserved ID and reference", () => {
+  const tasks = state();
+  createTask(tasks, { subject: "Existing" });
+  const invalid: Parameters<typeof applyTaskBatch>[1][] = [
+    { operations: [{ action: "create", subject: "New" }, { action: "delete", taskId: "99" }] },
+    { operations: [{ action: "update", taskId: "1", subject: "Changed" }, { action: "create", subject: "New", blockedBy: ["99"] }] },
+    { operations: [{ action: "create", subject: "New", ref: "same" }, { action: "create", subject: "Again", ref: "same" }] },
+    { operations: [{ action: "create", subject: "New", blockedBy: [{ ref: "missing" }] }] },
+    { operations: [{ action: "create", subject: "A", ref: "a", blockedBy: [{ ref: "b" }] },
+      { action: "create", subject: "B", ref: "b", blockedBy: [{ ref: "a" }] }] },
+    { operations: [{ action: "create", subject: "Self", ref: "self", blockedBy: [{ ref: "self" }] }] },
+    { operations: [{ action: "delete", taskId: "1" }, { action: "update", taskId: "1", status: "completed" }] },
+    { operations: [{ action: "create", subject: "New", blockedBy: ["1"] }, { action: "delete", taskId: "1" }] },
+    { operations: [{ action: "update", taskId: "1", addBlockedBy: ["2"], status: "in_progress" }, { action: "create", subject: "Pending" }] },
+  ];
+  for (const batch of invalid) {
+    const before = structuredClone(tasks);
+    assert.throws(() => applyTaskBatch(tasks, batch));
+    assert.deepEqual(tasks, before);
+  }
+  assert.equal(createTask(tasks, { subject: "After rollback" }).id, "2");
+});
+
+test("dependency edits and session limits are checked against the final graph", () => {
+  const tasks = state();
+  createTask(tasks, { subject: "Prerequisite" });
+  createTask(tasks, { subject: "Dependent", blockedBy: ["1"] });
+  applyTaskBatch(tasks, { operations: [
+    { action: "update", taskId: "2", status: "completed" },
+    { action: "update", taskId: "1", status: "completed" },
+  ] });
+  applyTaskBatch(tasks, { operations: [
+    { action: "update", taskId: "1", status: "pending" },
+    { action: "update", taskId: "2", status: "pending", removeBlockedBy: ["1"], addBlockedBy: [{ ref: "new" }] },
+    { action: "create", subject: "New prerequisite", ref: "new" },
+  ] });
+  assert.deepEqual(getTask(tasks, "2").blockedBy, ["3"]);
+  assert.throws(() => applyTaskBatch(tasks, { operations: [{ action: "create", subject: "Another", blockedBy: [{ ref: "new" }] }] }), /Unknown/);
+
+  const full = state();
+  full.items = Array.from({ length: 1000 }, (_, i) => ({ id: String(i + 1), subject: "Task", status: "pending", blockedBy: [] }));
+  full.nextId = 1001;
+  assert.throws(() => applyTaskBatch(full, { operations: [{ action: "create", subject: "Too many" }] }), /1000/);
+  assert.equal(full.nextId, 1001);
+  applyTaskBatch(full, { operations: [{ action: "create", subject: "Replacement" }, { action: "delete", taskId: "1" }] });
+  assert.equal(full.items.length, 1000);
+  assert.equal(full.items.at(-1)?.id, "1001");
+});
+
+test("large batch receipts retain every generated ID without echoing long task descriptions", async () => {
+  const tasks = state();
+  const update = taskExtension.tools!.find((tool) => tool.name === "task_update")!;
+  const api = { conversationId: 1, taskId: 200,
+    commit: async (change: (tx: { doc: () => Promise<TaskState> }) => Promise<unknown>) => change({ doc: async () => tasks }),
+  } as unknown as ToolExecutionApi;
+  const result = await update.execute({ operations: Array.from({ length: 100 }, (_, index) => ({
+    action: "create", subject: `Task ${index}`, description: "x".repeat(16000),
+  })) }, api, BACKGROUND_CONTEXT);
+  const text = result.output?.find((block) => block.type === "text");
+  assert.ok(text?.type === "text");
+  const results = JSON.parse(text.text).results;
+  assert.equal(results.length, 100);
+  assert.equal(results[99].taskId, "100");
+  assert.ok(text.text.length < 16000);
+  assert.equal(tasks.items[99]?.description?.length, 16000);
 });

@@ -386,9 +386,11 @@ Undo is session-level recovery, not a replacement for Git or backups.
 
 ## Task Checklists
 
-For substantial multi-step work, the agent can track progress using `task_create`,
-`task_update`, `task_list`, and `task_get`. Simple questions and one-step edits do
-not need a checklist. Tasks belong to their session, not the whole project.
+For substantial multi-step work, the agent can track progress using three tools:
+`task_update` creates, updates or deletes tasks in an atomic batch; `task_list`
+inspects the checklist and `task_get` reads one task's full details. Simple
+questions and one-step edits do not need a checklist. Tasks belong to their
+session, not the whole project.
 
 ```text
 Tasks - 1/3 complete (/tasks)
@@ -405,16 +407,17 @@ Tasks - 1/3 complete (/tasks)
 - `/tasks` opens scrollable task titles, statuses and descriptions for the open
   session or selected dashboard session. It also works directly in a peek reply.
   It never sends an agent request.
-- Tasks start `pending`; the agent explicitly marks them `in_progress` and then
-  `completed` after required verification. Pending tasks use a dim `☐`, active
-  tasks a cyan `☐`, and completed tasks a green `☒`. `activeForm` supplies ongoing
-  wording. Ending a response, stopping work or closing zz does not complete tasks.
+- Tasks default to `pending`; the agent explicitly marks them `in_progress` and
+  then `completed` after required verification. Creation can also set a status.
+  Pending tasks use a dim `☐`, active tasks a bold amber `☐`, and completed tasks a
+  green `☒`. `activeForm` supplies ongoing wording. Ending a response, stopping
+  work or closing zz does not complete tasks.
 - Dependencies are functional but are not annotated in the checklist or details
   view. Task tools expose prerequisites to the agent; the backend rejects missing
   IDs, cycles and starting/completing blocked tasks. Completing a prerequisite
-  unblocks its dependents without starting them. Before reopening a prerequisite,
-  return any active/completed dependents to pending. Deleting an obsolete task
-  removes its dependency references, without completing its dependents.
+  unblocks its dependents without starting them. When reopening a prerequisite,
+  return any active/completed dependents to pending in the same batch. Deleting
+  an obsolete task removes its dependency references, without completing its dependents.
 - Checklist state is committed to durable SQLite storage and survives compaction,
   cancellation and restart. `/undo` restores the checklist at the selected
   conversation checkpoint. The display cache in `state.json` is not authoritative.
@@ -424,6 +427,44 @@ Tasks - 1/3 complete (/tasks)
   through `task_get`. Task ownership/delegation and cross-session lists are not
   implemented. A session supports up to 1000 tasks; deleting tasks does not reuse
   their IDs within the active conversation branch.
+
+`task_update` always takes an `operations` array, even for a single change:
+
+```js
+task_update({
+  operations: [
+    { action: "create", subject: "Inspect authentication", ref: "inspect", status: "in_progress" },
+    { action: "create", subject: "Implement password reset", blockedBy: [{ ref: "inspect" }] }
+  ]
+})
+```
+
+A later batch can finish a prerequisite and start its dependent together:
+
+```js
+task_update({
+  operations: [
+    { action: "update", taskId: "1", status: "completed" },
+    { action: "update", taskId: "2", status: "in_progress" }
+  ]
+})
+```
+
+The second example assumes the earlier results returned IDs `1` and `2`; real
+calls use those returned IDs, not guessed numbers. Deletion uses
+`{ action: "delete", taskId: "3" }` for an existing obsolete task.
+Each batch accepts 1-100 operations, targets each task at most once, and validates
+the final dependency
+graph. If any operation fails, nothing changes and no IDs are consumed. New tasks
+can have unique `ref` names; dependency lists accept `{ ref: "name" }`, including
+forward references within that batch. Refs are not persisted or reusable in a
+later batch. Results follow operation order and contain each action, `taskId`,
+final status, and optional create ref; descriptions are read through `task_get`.
+
+Existing task data and activity remain readable. New provider requests advertise
+only the three tools. A compatibility handler retains old `task_create` execution
+and single-task `task_update` arguments for interrupted calls, with old replay
+receipts preserved. No separate create or delete tool is advertised.
 
 Task tool cards remain in activity history, with raw data hidden until expansion;
 errors remain visible. Checklist entries record agent-reported progress, not
@@ -828,9 +869,11 @@ Compaction tests cover manual instructions, no-ops, concurrent responses, histor
 and spend retention, cancellation, restart, background/blocking thresholds, overflow
 recovery, failures, and narrow activity rendering.
 Checklist tests cover lifecycle/schema validation, dependency cycles and blockers,
-atomic updates, concurrent creation, replay receipts, session isolation, compaction,
-restart and interrupted-run recovery, stale cache replacement, undo, task details,
-and narrow session/peek/dashboard rendering without dependency annotations.
+atomic mixed batches and rollback, forward references, compact batch results,
+concurrent creation, replay receipts, session isolation, compaction, restart and
+interrupted old/new tool recovery, three-tool provider requests, stale cache
+replacement, undo, task details, and narrow session/peek/dashboard rendering
+without dependency annotations.
 Authentication tests also cover shared Pi credential storage, prompt variants,
 secret masking/redaction, cancellation, logout confirmation and catalog failures.
 Direct-shell tests run real local processes for project/session/peek scoping, pipes,

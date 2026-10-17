@@ -1,5 +1,5 @@
 import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { accent, bold, dim, fit, green, oneLine, plain } from "./format.js";
+import { amber, bold, dim, fit, green, oneLine, plain } from "./format.js";
 import type { ChecklistTask } from "./tasks.js";
 
 export function taskProgress(tasks: readonly ChecklistTask[] | undefined): string | undefined {
@@ -19,7 +19,7 @@ export function taskChecklist(tasks: readonly ChecklistTask[] | undefined, width
     return priority[a.status] - priority[b.status];
   });
   for (const task of visible.slice(0, count)) {
-    const color = task.status === "completed" ? green : task.status === "in_progress" ? accent : dim;
+    const color = task.status === "completed" ? green : task.status === "in_progress" ? (text: string) => bold(amber(text)) : dim;
     const mark = task.status === "completed" ? "\u2612" : "\u2610";
     const label = task.status === "in_progress" ? task.activeForm ?? task.subject : task.subject;
     lines.push(fit(color(`  ${mark} #${task.id} ${oneLine(label)}`), width));

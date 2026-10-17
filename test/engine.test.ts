@@ -6,7 +6,8 @@ import { createModels, type Provider } from "@earendil-works/pi-ai/models";
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
 import type { AssistantMessage, Context, SimpleStreamOptions, ThinkingContent, TextContent, ToolCall, Usage } from "@earendil-works/pi-ai";
-import { InboxDoc, type ConversationId } from "@earendil-works/pi-durable";
+import { createRegistry, defineExtension, Harness, InboxDoc, type ConversationId, type ToolRegistration } from "@earendil-works/pi-durable";
+import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
 import { Controller } from "../src/controller.js";
@@ -14,11 +15,12 @@ import { lastReply, transcriptMessages } from "../src/model.js";
 import { DurableEngine } from "../src/engine.js";
 import type { Project, Session } from "../src/model.js";
 import { Store } from "../src/store.js";
-import { getCurrentSystemPrompt } from "@earendil-works/pi-ai/utils/transcript";
+import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { InstructionCatalog } from "../src/instructions.js";
 import { image, png } from "./image-fixtures.js";
 import { SkillCatalog } from "../src/skills.js";
 import { UndoDoc } from "../src/undo.js";
+import { createTask, legacyTaskExtension, legacyUpdateTaskParameters, taskExtension, TasksDoc, type TaskOperation } from "../src/tasks.js";
 import { temporary, tick } from "./helpers.js";
 import { pendingQuestion } from "../src/questions.js";
 import { structuredQuestions } from "./question-fixtures.js";
@@ -1865,7 +1867,7 @@ function taskCall(name: string, args: ToolCall["arguments"], id = `${name}-${Dat
   return { type: "toolCall", id, name, arguments: args };
 }
 
-test("checklist tools commit isolated task state, expose the current checklist and reject invalid mutations atomically", async () => {
+test("legacy checklist calls retain isolated state and reject invalid mutations atomically", async () => {
   const prompts: string[] = [];
   const runtime = models({ context: (context) => prompts.push(getCurrentSystemPrompt(context.messages)), reply: (context) => {
     const last = context.messages.at(-1);
@@ -1999,4 +2001,118 @@ test("an interrupted model request resumes with the committed checklist and no d
     assert.match(prompts.at(-1)!, /Recover this task/);
     assert.deepEqual(f.errors, []);
   } finally { await engine.close(); f.cleanup(); }
+});
+
+test("task batches expose only three model tools and publish related changes in one commit", async () => {
+  const offered: string[][] = [];
+  const runtime = models({ context: (context) => offered.push(getCurrentTools(context.messages).filter((tool) => tool.name.startsWith("task_")).map((tool) => tool.name)),
+    reply: (context) => {
+      const last = context.messages.at(-1);
+      return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("tools:")
+        ? JSON.parse(last.content.slice(6)) as ToolCall[] : [{ type: "text", text: "Done" }];
+    },
+  });
+  const f = await undoFixture(runtime); let engine = f.engine;
+  try {
+    const run = async (operations: TaskOperation[]) => {
+      await engine.run(f.s, f.project, toolPrompt(taskCall("task_update", { operations })), () => {});
+      return f.s.messages.findLast((message) => message.tool?.name === "task_update")!.tool!;
+    };
+    const created = await run([
+      { action: "create", subject: "Inspect", ref: "inspect", status: "in_progress" },
+      { action: "create", subject: "Implement", ref: "implement", blockedBy: [{ ref: "inspect" }] },
+      { action: "create", subject: "Test", blockedBy: [{ ref: "implement" }] },
+    ]);
+    assert.equal(created.status, "done");
+    assert.deepEqual(JSON.parse(created.output).results.map((result: { taskId: string }) => result.taskId), ["1", "2", "3"]);
+    assert.deepEqual(f.s.tasks?.map((task) => task.blockedBy), [[], ["1"], ["2"]]);
+    const snapshots: string[][] = [];
+    await engine.run(f.s, f.project, toolPrompt(taskCall("task_update", { operations: [
+      { action: "update", taskId: "2", status: "in_progress" },
+      { action: "update", taskId: "1", status: "completed" },
+    ] })), () => { if (f.s.tasks) snapshots.push(f.s.tasks.map((task) => task.status)); });
+    assert.deepEqual(f.s.tasks?.map((task) => task.status), ["completed", "in_progress", "pending"]);
+    assert.ok(snapshots.every((statuses) => JSON.stringify(statuses) === JSON.stringify(["in_progress", "pending", "pending"])
+      || JSON.stringify(statuses) === JSON.stringify(["completed", "in_progress", "pending"])), "no intermediate task graph is published");
+    const before = structuredClone(f.s.tasks);
+    const failed = await run([{ action: "create", subject: "Do not keep" }, { action: "delete", taskId: "99" }]);
+    assert.equal(failed.status, "error");
+    assert.deepEqual(f.s.tasks, before);
+    const mixed = await run([
+      { action: "delete", taskId: "2" }, { action: "update", taskId: "3", subject: "Still pending" },
+      { action: "create", subject: "Document", blockedBy: ["1"] },
+    ]);
+    assert.equal(mixed.status, "done");
+    assert.deepEqual(JSON.parse(mixed.output).results.map((result: { taskId: string }) => result.taskId), ["2", "3", "4"]);
+    const undoTarget = (await engine.undoCheckpoints(f.s))[0]!.id;
+    const committed = structuredClone(f.s.tasks);
+    await seedCompactableHistory(engine, f.s, f.project);
+    assert.equal(await engine.compact(f.s, undefined, () => {}), "compacted");
+    assert.deepEqual(f.s.tasks, committed);
+    await engine.close();
+    const restored = new Store(f.store.root);
+    engine = await openEngine(restored, { provider: "test", modelId: "mock" }, (error) => f.errors.push(error), undoModels());
+    await engine.restore(() => {});
+    const recovered = restored.state.sessions[0]!;
+    assert.deepEqual(recovered.tasks, committed);
+    await engine.undo(recovered, undoTarget, () => {});
+    assert.deepEqual(recovered.tasks, before, "undo restores every operation in the selected batch");
+    assert.ok(offered.length > 2);
+    assert.ok(offered.every((names) => JSON.stringify(names) === JSON.stringify(["task_update", "task_list", "task_get"])));
+    assert.deepEqual(f.errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("pending legacy and batch tool intents recover across restart without reapplying committed mutations", async () => {
+  for (const scenario of ["legacy-create", "legacy-create-committed", "legacy-update", "batch-committed"]) {
+    const temp = temporary();
+    const store = new Store(join(temp.root, "data")); const project = store.addProject(temp.root);
+    const s = session(project, scenario); store.state.sessions.push(s);
+    let started = false;
+    const base: ToolRegistration = scenario.startsWith("legacy-create") ? legacyTaskExtension.tools![0]!
+      : scenario === "batch-committed" ? taskExtension.tools!.find((tool) => tool.name === "task_update")!
+      : { name: "task_update", description: "Old single-task update", parameters: legacyUpdateTaskParameters, replay: "safe",
+        execute: async () => { throw new Error("This old implementation must never finish before restart"); } };
+    const registry = createRegistry();
+    registry.install(defineExtension({ name: "zz-tasks", tools: [{ ...base, execute: async (args, api, context) => {
+      if (scenario.endsWith("committed")) await base.execute(args, api, context);
+      started = true;
+      await new Promise<void>((resolve) => {
+        if (context.abortSignal?.aborted) resolve();
+        else context.abortSignal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      context.abortSignal?.throwIfAborted();
+      throw new Error("Interrupted smoke tool unexpectedly continued");
+    } }] }));
+    const errors: unknown[] = [];
+    const old = await Harness.open(await openNodeSqliteStorage(join(store.root, "sessions.sqlite")), {
+      registry, models: undoModels(), onReport: (error) => errors.push(error),
+    }, BACKGROUND_CONTEXT);
+    let engine: DurableEngine | undefined;
+    try {
+      const conversation = await old.createConversation({ ownership: { kind: "ownerless" }, agent: { cwd: project.path, model: { provider: "test", modelId: "mock" } },
+        init: async (tx, id) => { if (scenario === "legacy-update") createTask(await tx.doc(TasksDoc, id), { subject: "Existing legacy task" }); },
+      }, BACKGROUND_CONTEXT);
+      s.conversationId = conversation.id; store.save();
+      const args: ToolCall["arguments"] = scenario.startsWith("legacy-create") ? { subject: "Recover legacy create" }
+        : scenario === "legacy-update" ? { taskId: "1", status: "completed" }
+        : { operations: [{ action: "create", subject: "Recover first" }, { action: "create", subject: "Recover second" }] };
+      await conversation.submit({ type: "input", content: toolPrompt(taskCall(base.name, args)) }, BACKGROUND_CONTEXT);
+      await until(() => started);
+      await old.close(BACKGROUND_CONTEXT);
+      const offered: string[][] = [];
+      engine = await openEngine(new Store(store.root), { provider: "test", modelId: "mock" }, (error) => errors.push(error), models({
+        context: (context) => offered.push(getCurrentTools(context.messages).map((tool) => tool.name)),
+      }));
+      await engine.restore(() => {});
+      await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+      const recovered = engine.store.state.sessions[0]!;
+      assert.equal(recovered.status, "completed", scenario);
+      assert.equal(recovered.tasks?.length, scenario === "batch-committed" ? 2 : 1, scenario);
+      assert.equal(recovered.tasks?.[0]?.status, scenario === "legacy-update" ? "completed" : "pending", scenario);
+      assert.equal(recovered.messages.findLast((message) => message.tool)?.tool?.status, "done", scenario);
+      assert.ok(offered.every((names) => !names.includes("task_create")), scenario);
+      assert.deepEqual(errors, [], scenario);
+    } finally { await old.close(BACKGROUND_CONTEXT); await engine?.close(); temp.cleanup(); }
+  }
 });

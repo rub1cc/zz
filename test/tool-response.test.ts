@@ -205,3 +205,18 @@ test("checklist tools keep raw task data out of compact activity but retain expa
     assert.doesNotMatch(render({ ...value, status: "running" }), /Task created|Task updated/);
   }
 });
+
+test("batch task cards show operation counts without exposing raw task data or claiming failed work succeeded", () => {
+  const value = tool({ name: "task_update", arguments: { operations: [
+    { action: "create", subject: "Do not expose" }, { action: "delete", taskId: "4" },
+  ] }, output: '{"results":[{"action":"create","taskId":"5","status":"pending"},{"action":"delete","taskId":"4","status":"deleted"}]}' });
+  assert.match(render(value), /Applied 2 task operations/);
+  assert.doesNotMatch(render(value), /Do not expose|results|taskId/);
+  assert.match(render(value, true), /Do not expose/);
+  assert.match(render(value, true), /results/);
+  for (const status of ["pending", "running", "error", "interrupted"] as const) {
+    assert.doesNotMatch(render({ ...value, status }), /Applied 2/);
+  }
+  assert.match(render({ ...value, status: "error", output: "Dependency cycle" }), /Dependency cycle/);
+  assert.match(render({ ...value, arguments: { operations: [{ action: "delete", taskId: "4" }] } }), /Applied 1 task operation \(/);
+});

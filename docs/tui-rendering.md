@@ -60,7 +60,7 @@ navigation, follow-end scrolling, and explicit scroll-to-bottom remain intact.
 | Direct chat question | Question tool summary and projected question text | Normal composer remains available |
 | Structured questions | Question tool summary, existing inline question composer | Option descriptions, validation, review, submit unchanged |
 | Historical ask_user calls | Compatible tool heading and question handling | Historical structured answers still recognized |
-| Checklist task tools | Create/update/details summary, without raw task JSON | Arguments and output available on expansion; errors remain visible |
+| Checklist task tools | Batch operation count or details summary, without raw task JSON; historical create/single-update summaries remain readable | Arguments and output available on expansion; errors remain visible and never claim a failed batch succeeded |
 | Submitted structured answers | Compact question/answer summary | Model receives the original answer payload unchanged |
 | Unknown tool name / legacy tool-only message | Generic heading/output fallback | All available arguments/output/details inspectable |
 | Image-only user/assistant message | Native image or textual fallback | Existing image caching/conversion unchanged |
@@ -133,14 +133,24 @@ questions continue to work through the existing question tools.
 ## Checklist Coverage
 
 `src/tasks.ts` defines the task policy, validated tools and rewindable durable
-state. `src/engine.ts` observes this custom document separately from Pi's built-in
+state. Its model-facing API is `task_update` (atomic create/update/delete batches),
+`task_list`, and `task_get`. Each batch publishes one final task graph; failed
+batches publish no partial task state. Batch-local references resolve to IDs and
+compact ordered results avoid echoing descriptions. Old create handlers remain
+executable for recovery, but a request hook removes their definitions before
+provider dispatch. Old single-update arguments and stored replay receipts remain
+supported, including execution-phase intents that bypass argument preparation.
+`src/engine.ts` observes this custom document separately from Pi's built-in
 conversation view. `src/task-display.ts` renders only committed presentation
 caches; dependency IDs remain available to the model but are not UI annotations.
 
 `test/tasks.test.ts` covers lifecycle, schemas, cycles, blockers, deletion,
+final-graph validation, atomic rollback, local references, compact ordered results,
 idempotent replay and bounded rendering. `test/engine.test.ts` exercises actual
 SQLite tools, parallel creates, session isolation, compaction, interruption,
-restart, stale caches and undo. `test/dashboard.test.ts` covers live session/peek
+restart, stale caches, undo and the three-tool provider surface. Recovery tests
+reopen persisted old create/update and new batch execution intents, both before
+mutation and after an idempotency receipt was committed. `test/dashboard.test.ts` covers live session/peek
 checklists, dashboard counts and scoped, scrollable `/tasks` details across narrow
 terminals. `test/tool-response.test.ts` verifies compact cards, expanded raw data
 and visible errors; discovery tests cover command availability.

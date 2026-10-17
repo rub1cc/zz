@@ -23,7 +23,7 @@ import { contextEstimate, conversationUsage, sessionStats, sumUsage } from "./us
 import { settleWithin } from "./shutdown.js";
 import { UndoDoc, UndoHistory } from "./undo.js";
 import { askQuestionParameters, askMultipleQuestionsParameters, isQuestionTool, questionnaire, questionText } from "./questions.js";
-import { taskExtension, TasksDoc, type TaskState } from "./tasks.js";
+import { legacyTaskExtension, taskExtension, TasksDoc, type TaskState } from "./tasks.js";
 
 const ctx = BACKGROUND_CONTEXT;
 const SessionMeta = defineDoc<{ sessionId: string; priorUsage?: JsonRepresentation<Usage> }>({
@@ -210,6 +210,7 @@ export class DurableEngine implements Engine {
     const undoHistory = new UndoHistory(store.root);
     registry.install(undoHistory.extension);
     registry.install(taskExtension);
+    registry.install(legacyTaskExtension);
     registry.install(defineExtension({
       name: "zz",
       sections: [

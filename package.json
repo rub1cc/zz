@@ -1,13 +1,17 @@
 {
   "name": "zz",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "private": true,
   "type": "module",
   "description": "Project-grouped durable Pi agent sessions in your terminal",
   "bin": {
     "zz": "dist/cli.js"
   },
-  "files": ["dist", "README.md", "npm-shrinkwrap.json"],
+  "files": [
+    "dist",
+    "README.md",
+    "npm-shrinkwrap.json"
+  ],
   "scripts": {
     "dev": "node --import tsx src/cli.ts",
     "start": "node dist/cli.js",
