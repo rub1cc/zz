@@ -404,9 +404,9 @@ Tasks - 1/3 complete (/tasks)
   active and pending work and show a `more` hint. Empty lists occupy no space.
   The checklist yields space to tall drafts; structured question forms temporarily
   take precedence over it.
-- `/tasks` opens scrollable task titles, statuses and descriptions for the open
-  session or selected dashboard session. It also works directly in a peek reply.
-  It never sends an agent request.
+- `/tasks` opens scrollable active-checklist titles, statuses and descriptions for
+  the open session or selected dashboard session. It also works directly in a peek
+  reply. It never sends an agent request and is not a completed-task archive.
 - Tasks default to `pending`; the agent explicitly marks them `in_progress` and
   then `completed` after required verification. Creation can also set a status.
   Pending tasks use a dim `☐`, active tasks a bold amber `☐`, and completed tasks a
@@ -418,10 +418,24 @@ Tasks - 1/3 complete (/tasks)
   unblocks its dependents without starting them. When reopening a prerequisite,
   return any active/completed dependents to pending in the same batch. Deleting
   an obsolete task removes its dependency references, without completing its dependents.
-- Checklist state is committed to durable SQLite storage and survives compaction,
-  cancellation and restart. `/undo` restores the checklist at the selected
-  conversation checkpoint. The display cache in `state.json` is not authoritative.
-  Mutation receipts prevent an interrupted tool replay from applying twice.
+- While any work remains open, completed tasks stay in the checklist. Once every
+  task is completed, the finished list remains visible for **five seconds**. zz
+  then atomically rechecks and clears the active list, hiding session/peek rows
+  and dashboard counts. New or reopened work cancels cleanup; finishing it starts
+  a fresh grace period. Editing an already-finished list does not extend the timer.
+- After cleanup, `task_list({})` returns `[]`, `/tasks` shows an empty checklist,
+  and `task_get` reports cleared IDs as not found. No model request is made, no
+  IDs are reused, and replay receipts remain intact. Existing tool activity and
+  durable audit history remain; there is no archive screen or `includeCompleted`
+  option. Cleanup does not stop an agent that is still writing its final response.
+- Checklist state and the completion deadline live in durable SQLite storage and
+  survive compaction, cancellation and restart. Reopening uses the remaining
+  grace period, or clears an overdue list immediately. Older completed lists
+  without a saved deadline receive one five-second grace period when loaded.
+  `/undo` restores the checklist at the selected conversation checkpoint; an
+  atomic bookkeeping entry anchors background cleanup for later checkpoints.
+  The display cache in `state.json` is not authoritative. Mutation receipts keep
+  interrupted tool replay from applying twice or recreating cleared tasks.
 - A compact current-state summary and task-use guidance are included in model
   context, even with a custom `.pi/SYSTEM.md`. Full descriptions are available
   through `task_get`. Task ownership/delegation and cross-session lists are not
@@ -461,7 +475,8 @@ forward references within that batch. Refs are not persisted or reusable in a
 later batch. Results follow operation order and contain each action, `taskId`,
 final status, and optional create ref; descriptions are read through `task_get`.
 
-Existing task data and activity remain readable. New provider requests advertise
+Existing unfinished task data and historical tool activity remain readable.
+New provider requests advertise
 only the three tools. A compatibility handler retains old `task_create` execution
 and single-task `task_update` arguments for interrupted calls, with old replay
 receipts preserved. No separate create or delete tool is advertised.
@@ -873,7 +888,10 @@ atomic mixed batches and rollback, forward references, compact batch results,
 concurrent creation, replay receipts, session isolation, compaction, restart and
 interrupted old/new tool recovery, three-tool provider requests, stale cache
 replacement, undo, task details, and narrow session/peek/dashboard rendering
-without dependency annotations.
+without dependency annotations. Cleanup tests cover the five-second grace period,
+atomic state rechecks, reopening/new work, stale and in-flight timers, shutdown,
+remaining/overdue deadlines on restart, old lists without deadlines, replay safety,
+model-context removal, undo boundaries and disappearing UI rows.
 Authentication tests also cover shared Pi credential storage, prompt variants,
 secret masking/redaction, cancellation, logout confirmation and catalog failures.
 Direct-shell tests run real local processes for project/session/peek scoping, pipes,

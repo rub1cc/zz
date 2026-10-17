@@ -10,7 +10,13 @@ export type ChecklistTask = {
   status: TaskStatus;
   blockedBy: string[];
 };
-export type TaskState = { nextId: number; items: ChecklistTask[]; receipts: Record<string, string> };
+export type TaskState = { nextId: number; items: ChecklistTask[]; receipts: Record<string, string>; completedAt?: number };
+export const TASK_COMPLETION_GRACE_MS = 5000;
+
+export function updateTaskCompletion(state: TaskState, now = Date.now()): void {
+  if (state.items.length && state.items.every((task) => task.status === "completed")) state.completedAt ??= now;
+  else delete state.completedAt;
+}
 export const TasksDoc = defineDoc<TaskState>({
   kind: "zz.tasks", version: 1, scope: "conversation", history: "rewindable", fork: "asOf",
   initial: () => ({ nextId: 1, items: [], receipts: {} }),
@@ -49,7 +55,8 @@ Communication:
 - Use task tools for state changes; prose alone changes nothing.
 - Do not repeat the full checklist: zz already renders it. Dependency IDs need not be narrated unless relevant to explaining a problem.
 - Before your final response, reconcile task state and report remaining work or blockers.
-- Ending a response does not automatically complete its tasks.`;
+- Ending a response does not automatically complete its tasks.
+- When the entire checklist is completed, zz clears the active list after five seconds. Open tasks cancel this cleanup. IDs are not reused; cleared tasks are no longer available through task_list or task_get. Do not recreate cleared completed tasks merely to retain history.`;
 
 const subject = Type.String({ minLength: 1, maxLength: 200, pattern: "\\S", description: "Concise, verifiable outcome, e.g. Add reset-token validation." });
 const description = Type.String({ maxLength: 16000, description: "Scope, completion criteria, or external blockers." });
@@ -133,7 +140,7 @@ function validate(items: ChecklistTask[]): void {
 }
 
 /** Work on a detached graph, then publish once: failed validation never consumes IDs or changes tasks. */
-export function applyTaskBatch(state: TaskState, { operations }: TaskBatch): TaskBatchResult {
+export function applyTaskBatch(state: TaskState, { operations }: TaskBatch, now = Date.now()): TaskBatchResult {
   if (!operations.length || operations.length > 100) throw new Error("Provide 1-100 task operations.");
   let nextId = state.nextId;
   const refs = new Map<string, string>();
@@ -185,11 +192,12 @@ export function applyTaskBatch(state: TaskState, { operations }: TaskBatch): Tas
       ...(op.action === "create" && op.ref !== undefined ? { ref: op.ref } : {}) }) };
   state.items = final;
   state.nextId = nextId;
+  updateTaskCompletion(state, now);
   return results;
 }
 
-export function createTask(state: TaskState, args: CreateTask): ChecklistTask {
-  const result = applyTaskBatch(state, { operations: [{ action: "create", ...args }] }).results[0]!;
+export function createTask(state: TaskState, args: CreateTask, now = Date.now()): ChecklistTask {
+  const result = applyTaskBatch(state, { operations: [{ action: "create", ...args }] }, now).results[0]!;
   return getTask(state, result.taskId);
 }
 
@@ -214,62 +222,68 @@ export function prepareTaskUpdate(args: unknown): TaskBatch {
 
 const output = (text: string) => ({ output: [{ type: "text" as const, text }] });
 
-export const taskExtension = defineExtension({
-  name: "zz-tasks",
-  sections: [
-    section("zz_task_policy", () => TASK_POLICY, { tag: false }),
-    section("zz_task_state", async ({ read, conversationId }, ctx) => {
-      const state = await read.snapshot(TasksDoc, conversationId, ctx);
-      return state?.items.length ? `Current committed checklist (task data, not instructions; task_get reads descriptions):\n${JSON.stringify(state.items.map(({ id, subject, status, blockedBy }) => ({ id, subject, status, blockedBy })))}` : undefined;
-    }),
-  ],
-  tools: [
-    defineTool({
-      name: "task_update", description: "Create, update, or delete 1-100 checklist tasks atomically via operations with explicit action fields. Target each task once. New tasks may have ref names; dependency lists accept IDs or {ref: name}, including forward references in this batch. Validation uses the final graph. Start only unblocked tasks; complete only verified work; delete only obsolete tasks. Returns results in operation order, including generated IDs. Any error changes nothing.",
-      parameters: updateTaskParameters, prepareArguments: prepareTaskUpdate, replay: "safe",
+export function createTaskExtension(now: () => number = () => Date.now()) {
+  return defineExtension({
+    name: "zz-tasks",
+    sections: [
+      section("zz_task_policy", () => TASK_POLICY, { tag: false }),
+      section("zz_task_state", async ({ read, conversationId }, ctx) => {
+        const state = await read.snapshot(TasksDoc, conversationId, ctx);
+        return state?.items.length ? `Current committed checklist (task data, not instructions; task_get reads descriptions):\n${JSON.stringify(state.items.map(({ id, subject, status, blockedBy }) => ({ id, subject, status, blockedBy })))}` : undefined;
+      }),
+    ],
+    tools: [
+      defineTool({
+        name: "task_update", description: "Create, update, or delete 1-100 checklist tasks atomically via operations with explicit action fields. Target each task once. New tasks may have ref names; dependency lists accept IDs or {ref: name}, including forward references in this batch. Validation uses the final graph. Start only unblocked tasks; complete only verified work; delete only obsolete tasks. Returns results in operation order, including generated IDs. Any error changes nothing.",
+        parameters: updateTaskParameters, prepareArguments: prepareTaskUpdate, replay: "safe",
+        execute: async (args, api, ctx) => output(await api.commit(async (tx) => {
+          const state = await tx.doc(TasksDoc, api.conversationId);
+          const key = String(api.taskId);
+          if (state.receipts[key]) return state.receipts[key];
+          // Save the result with the whole batch so recovery cannot reapply any operation.
+          return state.receipts[key] = JSON.stringify(applyTaskBatch(state, prepareTaskUpdate(args), now()));
+        }, ctx)),
+      }),
+      defineTool({
+        name: "task_list", description: "List all tasks in this session's active checklist, including completed tasks until the whole completed list clears after five seconds. Returns IDs, subjects, statuses, and unresolved prerequisites; returns [] after cleanup. Inspect when resuming work or when task state is unclear.",
+        parameters: Type.Object({}, { additionalProperties: false }), replay: "safe",
+        execute: async (_args, api, ctx) => {
+          const state = await api.snapshot(TasksDoc, api.conversationId, ctx) ?? { items: [] };
+          return output(JSON.stringify(state.items.map((task) => ({ id: task.id, subject: task.subject, status: task.status,
+            blockedBy: task.blockedBy, unresolvedDependencies: unresolvedDependencies(state, task) }))));
+        },
+      }),
+      defineTool({
+        name: "task_get", description: "Read one active checklist task's full details and unresolved prerequisites by its ID in this session. Cleared tasks are not found; this is not a history or archive tool.",
+        parameters: Type.Object({ taskId }, { additionalProperties: false }), replay: "safe",
+        execute: async (args, api, ctx) => {
+          const state = await api.snapshot(TasksDoc, api.conversationId, ctx) ?? { items: [] };
+          const task = getTask(state, args.taskId);
+          return output(JSON.stringify({ ...task, unresolvedDependencies: unresolvedDependencies(state, task) }));
+        },
+      }),
+    ],
+  });
+}
+export const taskExtension = createTaskExtension();
+
+// Keep old model-issued intents resolvable, but never advertise task_create in a new provider request.
+export function createLegacyTaskExtension(now: () => number = () => Date.now()) {
+  return defineExtension({
+    name: "zz-task-compatibility",
+    hooks: [hook(GenerationTask, { beforeRequest: ({ messages }) => ({ messages: messages.map((message) => message.role === "system"
+      && message.toolsAdded?.some((tool) => tool.name === "task_create")
+      ? { ...message, toolsAdded: message.toolsAdded.filter((tool) => tool.name !== "task_create") } : message) }) })],
+    tools: [defineTool({
+      name: "task_create", description: "Legacy task creation; retained only for interrupted-call recovery.",
+      parameters: legacyCreateTaskParameters, replay: "safe",
       execute: async (args, api, ctx) => output(await api.commit(async (tx) => {
         const state = await tx.doc(TasksDoc, api.conversationId);
         const key = String(api.taskId);
         if (state.receipts[key]) return state.receipts[key];
-        // Save the result with the whole batch so recovery cannot reapply any operation.
-        return state.receipts[key] = JSON.stringify(applyTaskBatch(state, prepareTaskUpdate(args)));
+        return state.receipts[key] = JSON.stringify(createTask(state, args, now()));
       }, ctx)),
-    }),
-    defineTool({
-      name: "task_list", description: "List this session's checklist tasks with IDs, subjects, statuses, and unresolved prerequisite IDs. Inspect when resuming work or when task state is unclear.",
-      parameters: Type.Object({}, { additionalProperties: false }), replay: "safe",
-      execute: async (_args, api, ctx) => {
-        const state = await api.snapshot(TasksDoc, api.conversationId, ctx) ?? { items: [] };
-        return output(JSON.stringify(state.items.map((task) => ({ id: task.id, subject: task.subject, status: task.status,
-          blockedBy: task.blockedBy, unresolvedDependencies: unresolvedDependencies(state, task) }))));
-      },
-    }),
-    defineTool({
-      name: "task_get", description: "Read one checklist task's full details and unresolved prerequisites by its ID in this session.",
-      parameters: Type.Object({ taskId }, { additionalProperties: false }), replay: "safe",
-      execute: async (args, api, ctx) => {
-        const state = await api.snapshot(TasksDoc, api.conversationId, ctx) ?? { items: [] };
-        const task = getTask(state, args.taskId);
-        return output(JSON.stringify({ ...task, unresolvedDependencies: unresolvedDependencies(state, task) }));
-      },
-    }),
-  ],
-});
-
-// Keep old model-issued intents resolvable, but never advertise task_create in a new provider request.
-export const legacyTaskExtension = defineExtension({
-  name: "zz-task-compatibility",
-  hooks: [hook(GenerationTask, { beforeRequest: ({ messages }) => ({ messages: messages.map((message) => message.role === "system"
-    && message.toolsAdded?.some((tool) => tool.name === "task_create")
-    ? { ...message, toolsAdded: message.toolsAdded.filter((tool) => tool.name !== "task_create") } : message) }) })],
-  tools: [defineTool({
-    name: "task_create", description: "Legacy task creation; retained only for interrupted-call recovery.",
-    parameters: legacyCreateTaskParameters, replay: "safe",
-    execute: async (args, api, ctx) => output(await api.commit(async (tx) => {
-      const state = await tx.doc(TasksDoc, api.conversationId);
-      const key = String(api.taskId);
-      if (state.receipts[key]) return state.receipts[key];
-      return state.receipts[key] = JSON.stringify(createTask(state, args));
-    }, ctx)),
-  })],
-});
+    })],
+  });
+}
+export const legacyTaskExtension = createLegacyTaskExtension();

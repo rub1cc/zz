@@ -296,3 +296,24 @@ test("large batch receipts retain every generated ID without echoing long task d
   assert.ok(text.text.length < 16000);
   assert.equal(tasks.items[99]?.description?.length, 16000);
 });
+
+test("completion deadlines start once for a finished checklist and disappear when work reopens or empties", () => {
+  const tasks = state();
+  applyTaskBatch(tasks, { operations: [{ action: "create", subject: "Work" }] }, 100);
+  assert.equal(tasks.completedAt, undefined);
+  applyTaskBatch(tasks, { operations: [{ action: "update", taskId: "1", status: "completed" }] }, 200);
+  assert.equal(tasks.completedAt, 200);
+  applyTaskBatch(tasks, { operations: [{ action: "update", taskId: "1", description: "Verified" }] }, 300);
+  assert.equal(tasks.completedAt, 200, "editing finished work does not extend the grace period");
+  const before = structuredClone(tasks);
+  assert.throws(() => applyTaskBatch(tasks, { operations: [
+    { action: "update", taskId: "1", status: "pending" }, { action: "delete", taskId: "99" },
+  ] }, 400));
+  assert.deepEqual(tasks, before);
+  applyTaskBatch(tasks, { operations: [{ action: "create", subject: "Next work" }] }, 500);
+  assert.equal(tasks.completedAt, undefined);
+  applyTaskBatch(tasks, { operations: [{ action: "update", taskId: "2", status: "completed" }] }, 600);
+  assert.equal(tasks.completedAt, 600);
+  applyTaskBatch(tasks, { operations: [{ action: "delete", taskId: "1" }, { action: "delete", taskId: "2" }] }, 700);
+  assert.equal(tasks.completedAt, undefined);
+});

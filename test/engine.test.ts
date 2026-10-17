@@ -21,6 +21,8 @@ import { image, png } from "./image-fixtures.js";
 import { SkillCatalog } from "../src/skills.js";
 import { UndoDoc } from "../src/undo.js";
 import { createTask, legacyTaskExtension, legacyUpdateTaskParameters, taskExtension, TasksDoc, type TaskOperation } from "../src/tasks.js";
+import type { TaskCleanupClock } from "../src/task-cleanup.js";
+import { ManualTaskClock } from "./task-cleanup-fixtures.js";
 import { temporary, tick } from "./helpers.js";
 import { pendingQuestion } from "../src/questions.js";
 import { structuredQuestions } from "./question-fixtures.js";
@@ -1243,19 +1245,19 @@ function writeCall(path: string, content: string): ToolCall {
 }
 function undoModels() {
   return models({ reply: (context) => {
-    const last = context.messages.at(-1);
+    const last = context.messages.findLast((message) => message.role !== "system");
     return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("tools:")
       ? JSON.parse(last.content.slice(6)) as ToolCall[] : [{ type: "text", text: "Done" }];
   } });
 }
-async function undoFixture(runtime = undoModels()) {
+async function undoFixture(runtime = undoModels(), taskClock?: TaskCleanupClock) {
   const temp = temporary();
   const work = join(temp.root, "work"); mkdirSync(work);
   const store = new Store(join(temp.root, "data"));
   const project = store.addProject(work);
   const s = session(project, "undo-session"); store.state.sessions.push(s);
   const errors: unknown[] = [];
-  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => errors.push(error), runtime);
+  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => errors.push(error), runtime, "off", undefined, undefined, taskClock);
   return { ...temp, work, store, project, s, errors, engine };
 }
 
@@ -1870,7 +1872,7 @@ function taskCall(name: string, args: ToolCall["arguments"], id = `${name}-${Dat
 test("legacy checklist calls retain isolated state and reject invalid mutations atomically", async () => {
   const prompts: string[] = [];
   const runtime = models({ context: (context) => prompts.push(getCurrentSystemPrompt(context.messages)), reply: (context) => {
-    const last = context.messages.at(-1);
+    const last = context.messages.findLast((message) => message.role !== "system");
     return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("tools:")
       ? JSON.parse(last.content.slice(6)) as ToolCall[] : [{ type: "text", text: "Done" }];
   } });
@@ -2115,4 +2117,156 @@ test("pending legacy and batch tool intents recover across restart without reapp
       assert.deepEqual(errors, [], scenario);
     } finally { await old.close(BACKGROUND_CONTEXT); await engine?.close(); temp.cleanup(); }
   }
+});
+
+test("completed checklist cleanup persists after five seconds and removes tasks from tools, caches and routine context", async () => {
+  const clock = new ManualTaskClock();
+  const prompts: string[] = [];
+  const runtime = models({ context: (context) => prompts.push(getCurrentSystemPrompt(context.messages)), reply: (context) => {
+    const last = context.messages.findLast((message) => message.role !== "system");
+    return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("tools:")
+      ? JSON.parse(last.content.slice(6)) as ToolCall[] : [{ type: "text", text: "Done" }];
+  } });
+  const f = await undoFixture(runtime, clock);
+  try {
+    const run = async (name: string, args: ToolCall["arguments"]) => {
+      await f.engine.run(f.s, f.project, toolPrompt(taskCall(name, args)), () => {});
+      return f.s.messages.findLast((message) => message.tool?.name === name)!.tool!;
+    };
+    await run("task_update", { operations: [
+      { action: "create", subject: "Inspect", ref: "inspect", status: "completed" },
+      { action: "create", subject: "Implement", status: "completed", blockedBy: [{ ref: "inspect" }] },
+    ] });
+    const id = f.s.conversationId as ConversationId;
+    const before = (await f.engine.harness.snapshot(TasksDoc, id, BACKGROUND_CONTEXT))!;
+    assert.equal(before.completedAt, 0);
+    assert.equal(JSON.parse((await run("task_list", {})).output).length, 2, "completed tasks remain listed during the grace period");
+    const usage = structuredClone(f.s.usage);
+    await clock.advance(4999); assert.equal(f.s.tasks?.length, 2);
+    await clock.advance(1); assert.equal(f.s.tasks, undefined);
+    const cleared = (await f.engine.harness.snapshot(TasksDoc, id, BACKGROUND_CONTEXT))!;
+    assert.deepEqual(cleared.items, []);
+    assert.equal(cleared.completedAt, undefined);
+    assert.equal(cleared.nextId, 3);
+    assert.deepEqual(cleared.receipts, before.receipts);
+    assert.deepEqual(f.s.usage, usage, "cleanup sends no model request");
+    assert.deepEqual(JSON.parse((await run("task_list", {})).output), []);
+    assert.doesNotMatch(prompts.at(-1)!, /Current committed checklist/);
+    assert.equal((await run("task_get", { taskId: "1" })).status, "error");
+    const conversation = (await f.engine.harness.conversation(id, BACKGROUND_CONTEXT))!;
+    const entries = await conversation.entries({ order: "ascending" }, 100, undefined, BACKGROUND_CONTEXT);
+    const marker = entries.items.find((entry) => entry.kind === "zz.tasks_cleared");
+    assert.ok(marker);
+    assert.equal(marker.model, undefined, "the cleanup marker does not create model or transcript messages");
+    const created = await run("task_update", { operations: [{ action: "create", subject: "Next plan" }] });
+    assert.equal(JSON.parse(created.output).results[0].taskId, "3");
+    assert.equal((f.s as Session).tasks?.[0]?.status, "pending");
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("new or reopened tasks cancel cleanup and a later completion starts a fresh grace period", async () => {
+  for (const reopen of [false, true]) {
+    const clock = new ManualTaskClock(); const f = await undoFixture(undefined, clock);
+    try {
+      const mutate = (operations: TaskOperation[]) => f.engine.run(f.s, f.project, toolPrompt(taskCall("task_update", { operations })), () => {});
+      await mutate([{ action: "create", subject: "First plan", status: "completed" }]);
+      await clock.advance(2000);
+      await mutate([reopen ? { action: "update", taskId: "1", status: "in_progress" }
+        : { action: "create", subject: "New work" }]);
+      assert.equal(clock.scheduled, 0);
+      await clock.advance(10000);
+      assert.equal(f.s.tasks?.length, reopen ? 1 : 2);
+      assert.equal((await f.engine.harness.snapshot(TasksDoc, f.s.conversationId as ConversationId, BACKGROUND_CONTEXT))?.completedAt, undefined);
+      await mutate([{ action: "update", taskId: reopen ? "1" : "2", status: "completed" }]);
+      await clock.advance(4999); assert.equal(f.s.tasks?.length, reopen ? 1 : 2);
+      await clock.advance(1); assert.equal(f.s.tasks, undefined);
+      assert.deepEqual(f.errors, []);
+    } finally { await f.engine.close(); f.cleanup(); }
+  }
+});
+
+test("checklist cleanup resumes the persisted deadline across restart without restarting the grace period", async () => {
+  const clock = new ManualTaskClock(); const f = await undoFixture(undefined, clock); let engine = f.engine;
+  try {
+    await engine.run(f.s, f.project, toolPrompt(taskCall("task_update", { operations: [{ action: "create", subject: "Finished", status: "completed" }] })), () => {});
+    await clock.advance(2000); await engine.close();
+    assert.equal(clock.scheduled, 0);
+    const store = new Store(f.store.root);
+    engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => f.errors.push(error), undoModels(), "off", undefined, undefined, clock);
+    await engine.restore(() => {});
+    const recovered = store.state.sessions[0]!;
+    await clock.advance(2999); assert.equal(recovered.tasks?.length, 1);
+    await clock.advance(1); assert.equal(recovered.tasks, undefined);
+    await engine.close();
+    engine = await openEngine(new Store(f.store.root), { provider: "test", modelId: "mock" }, (error) => f.errors.push(error), undoModels(), "off", undefined, undefined, clock);
+    await engine.restore(() => {});
+    assert.equal(engine.store.state.sessions[0]?.tasks, undefined, "a stale saved display cache cannot resurrect cleared tasks");
+    assert.deepEqual(f.errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("restored overdue checklists clear immediately while older lists without deadlines receive one grace period", async () => {
+  for (const legacy of [false, true]) {
+    const clock = new ManualTaskClock(); const f = await undoFixture(undefined, clock); let engine = f.engine;
+    try {
+      await engine.run(f.s, f.project, toolPrompt(taskCall("task_update", { operations: [{ action: "create", subject: "Finished", status: "completed" }] })), () => {});
+      if (legacy) await engine.harness.commit(async (tx) => { delete (await tx.doc(TasksDoc, f.s.conversationId as ConversationId)).completedAt; }, BACKGROUND_CONTEXT);
+      await engine.close(); await clock.advance(10000);
+      const store = new Store(f.store.root);
+      engine = await openEngine(store, { provider: "test", modelId: "mock" }, (error) => f.errors.push(error), undoModels(), "off", undefined, undefined, clock);
+      await engine.restore(() => {});
+      const recovered = store.state.sessions[0]!;
+      await clock.advance(0);
+      if (legacy) {
+        assert.equal(recovered.tasks?.length, 1);
+        await clock.advance(4999); assert.equal(recovered.tasks?.length, 1);
+        await clock.advance(1);
+      }
+      assert.equal(recovered.tasks, undefined);
+      assert.deepEqual(f.errors, []);
+    } finally { await engine.close(); f.cleanup(); }
+  }
+});
+
+test("undo restores unfinished tasks and preserves an already-cleared state at the next prompt boundary", async () => {
+  for (const clearFirst of [false, true]) {
+    const clock = new ManualTaskClock(); const f = await undoFixture(undefined, clock);
+    try {
+      const run = (operations: TaskOperation[]) => f.engine.run(f.s, f.project, toolPrompt(taskCall("task_update", { operations })), () => {});
+      await run([{ action: "create", subject: "Keep unfinished" }]);
+      await run([{ action: "update", taskId: "1", status: "completed" }]);
+      if (clearFirst) {
+        await clock.advance(5000);
+        assert.equal(f.s.tasks, undefined);
+        await f.engine.run(f.s, f.project, "Unrelated next prompt", () => {});
+        await undoLatest(f.engine, f.s);
+        assert.equal(f.s.tasks, undefined, "the cleanup audit entry anchors the empty state before the unrelated prompt");
+      } else await clock.advance(1000);
+      await undoLatest(f.engine, f.s);
+      assert.equal(f.s.tasks?.[0]?.status, "pending", "undoing the completion restores the previous unfinished checklist");
+      assert.equal(clock.scheduled, 0);
+      await clock.advance(10000);
+      assert.equal(f.s.tasks?.[0]?.status, "pending", "the abandoned conversation's timer must not clear the restored checklist");
+      assert.deepEqual(f.errors, []);
+    } finally { await f.engine.close(); f.cleanup(); }
+  }
+});
+
+test("compaction preserves the completion deadline and cleanup does not touch other sessions", async () => {
+  const clock = new ManualTaskClock(); const f = await undoFixture(undefined, clock);
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("task_update", { operations: [{ action: "create", subject: "Finished plan", status: "completed" }] })), () => {});
+    const other = session(f.project, "unfinished-checklist"); f.store.state.sessions.push(other);
+    await f.engine.run(other, f.project, toolPrompt(taskCall("task_update", { operations: [{ action: "create", subject: "Still working" }] })), () => {});
+    await clock.advance(2000);
+    await seedCompactableHistory(f.engine, f.s, f.project);
+    assert.equal(await f.engine.compact(f.s, undefined, () => {}), "compacted");
+    assert.equal((await f.engine.harness.snapshot(TasksDoc, f.s.conversationId as ConversationId, BACKGROUND_CONTEXT))?.completedAt, 0);
+    await clock.advance(2999); assert.equal(f.s.tasks?.length, 1);
+    await clock.advance(1); assert.equal(f.s.tasks, undefined);
+    assert.equal(other.tasks?.[0]?.status, "pending");
+    assert.equal(other.tasks?.[0]?.subject, "Still working");
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
 });

@@ -23,7 +23,8 @@ import { contextEstimate, conversationUsage, sessionStats, sumUsage } from "./us
 import { settleWithin } from "./shutdown.js";
 import { UndoDoc, UndoHistory } from "./undo.js";
 import { askQuestionParameters, askMultipleQuestionsParameters, isQuestionTool, questionnaire, questionText } from "./questions.js";
-import { legacyTaskExtension, taskExtension, TasksDoc, type TaskState } from "./tasks.js";
+import { createLegacyTaskExtension, createTaskExtension, TasksDoc, updateTaskCompletion, type TaskState } from "./tasks.js";
+import { TaskCleanup, taskCleanupClock, type TaskCleanupClock } from "./task-cleanup.js";
 
 const ctx = BACKGROUND_CONTEXT;
 const SessionMeta = defineDoc<{ sessionId: string; priorUsage?: JsonRepresentation<Usage> }>({
@@ -194,6 +195,7 @@ export class DurableEngine implements Engine {
   private undoing = new Map<string, Promise<UndoResult>>();
   private undoProjects = new Set<string>();
   private undoPending = new Set<string>();
+  private readonly taskCleanup: TaskCleanup;
 
   private constructor(
     readonly store: Store, readonly harness: Harness, readonly models: Models,
@@ -201,16 +203,17 @@ export class DurableEngine implements Engine {
     readonly thinkingLevel: ModelThinkingLevel,
     readonly skills: SkillCatalog,
     readonly undoHistory: UndoHistory,
-  ) {}
+    taskClock: TaskCleanupClock,
+  ) { this.taskCleanup = new TaskCleanup(harness, report, taskClock); }
 
-  static async open(store: Store, model: ModelRef | undefined, report: (error: unknown) => void, models?: Models, thinkingLevel: ModelThinkingLevel = "off", skills = new SkillCatalog(), instructions = new InstructionCatalog()): Promise<DurableEngine> {
+  static async open(store: Store, model: ModelRef | undefined, report: (error: unknown) => void, models?: Models, thinkingLevel: ModelThinkingLevel = "off", skills = new SkillCatalog(), instructions = new InstructionCatalog(), taskClock: TaskCleanupClock = taskCleanupClock): Promise<DurableEngine> {
     models ??= await ModelRuntime.create({ allowModelNetwork: false });
     const registry = createRegistry();
     registry.install(createCodingTools({ images: await getImageProcessor() }));
     const undoHistory = new UndoHistory(store.root);
     registry.install(undoHistory.extension);
-    registry.install(taskExtension);
-    registry.install(legacyTaskExtension);
+    registry.install(createTaskExtension(() => taskClock.now()));
+    registry.install(createLegacyTaskExtension(() => taskClock.now()));
     registry.install(defineExtension({
       name: "zz",
       sections: [
@@ -238,7 +241,7 @@ export class DurableEngine implements Engine {
       }, onReport: report,
     }, ctx);
     undoHistory.harness = harness;
-    const engine = new DurableEngine(store, harness, models, model, report, thinkingLevel, skills, undoHistory);
+    const engine = new DurableEngine(store, harness, models, model, report, thinkingLevel, skills, undoHistory, taskClock);
     void harness.closed.then((end) => { if (end.reason === "failed") report(end.error); });
     return engine;
   }
@@ -364,10 +367,14 @@ export class DurableEngine implements Engine {
     if (this.views.has(session.id)) return;
     // Conversation views mount only built-in docs; observe our checklist separately.
     // Materialize an empty document for older conversations as well as new ones.
-    await conversation.commit(async (tx) => { await tx.doc(TasksDoc, conversation.id); }, ctx);
+    await conversation.commit(async (tx) => {
+      updateTaskCompletion(await tx.doc(TasksDoc, conversation.id), this.taskCleanup.clock.now());
+    }, ctx);
     const tasks = (await this.harness.documentState(TasksDoc, conversation.id, ctx))!;
     const syncTasks = (state: Readonly<TaskState> | null): void => {
       session.tasks = state?.items.length ? structuredClone(state.items) : undefined;
+      this.taskCleanup.watch(conversation.id, state,
+        () => this.closing || this.undoing.has(session.id) || this.undoPending.has(session.id));
     };
     syncTasks(tasks.value);
     tasks.subscribe((value) => { syncTasks(value); changed(); });
@@ -403,7 +410,9 @@ export class DurableEngine implements Engine {
       if (value.entries !== entries) { entries = value.entries; void refresh(); }
       changed();
     });
-    this.views.set(session.id, { get value() { return view.value; }, dispose: () => { view.dispose(); tasks.dispose(); } });
+    this.views.set(session.id, { get value() { return view.value; }, dispose: () => {
+      this.taskCleanup.forget(conversation.id); view.dispose(); tasks.dispose();
+    } });
     await refresh();
   }
 
@@ -703,8 +712,9 @@ export class DurableEngine implements Engine {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
     for (const title of this.titles.values()) title.abort.abort();
-    // Let an admitted filesystem restore finish its conversation commit before sealing storage.
-    const durableClose = Promise.allSettled([...this.undoing.values()]).then(() => this.harness.close(ctx));
+    // Finish admitted restores and checklist resets before sealing storage; stop all cleanup timers now.
+    const cleanup = this.taskCleanup.close();
+    const durableClose = Promise.allSettled([...this.undoing.values(), cleanup]).then(() => this.harness.close(ctx));
     this.closePromise = (async () => {
       try {
         await durableClose;

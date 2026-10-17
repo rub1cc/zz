@@ -111,7 +111,10 @@ are not grouped or hidden.
 | Long checklist | Active/pending work prioritized, remaining-count hint; `/tasks` opens scrollable full details |
 | Dashboard checklist | Completed/total count on session rows, including narrow wrapped rows |
 | Empty checklist / question wizard | No checklist rows; structured questions retain composer precedence |
-| Checklist restart/compaction/undo | Committed state persists; undo restores checkpoint state rather than guessing from activity |
+| All tasks completed | Finished checklist remains for five seconds, then an atomic reset removes panel rows and dashboard counts |
+| Work added/reopened during grace | Cleanup cancels; completed rows remain alongside open work |
+| Cleared checklist details | `/tasks` shows an empty list; task tools have no archive or completed-only filter |
+| Checklist restart/compaction/undo | Unfinished state and completion deadline persist; overdue lists clear on restore; undo respects the cleanup audit boundary |
 | Local !command | Prompt marker, explicitly local shell heading, full retained inline output |
 | Local shell running/stopping | Waiting/output text and shell lifecycle status |
 | Local shell done/failed | Actual exit code/error, including empty output |
@@ -141,8 +144,14 @@ executable for recovery, but a request hook removes their definitions before
 provider dispatch. Old single-update arguments and stored replay receipts remain
 supported, including execution-phase intents that bypass argument preparation.
 `src/engine.ts` observes this custom document separately from Pi's built-in
-conversation view. `src/task-display.ts` renders only committed presentation
-caches; dependency IDs remain available to the model but are not UI annotations.
+conversation view. `src/task-cleanup.ts` schedules from the persisted completion
+deadline and rechecks the list in one transaction before clearing it. It preserves
+ID counters and replay receipts, cancels for open work, pauses during undo, and
+stops timers before shutdown. The reset appends a model-free `zz.tasks_cleared`
+entry in the same commit so the next prompt's undo checkpoint sees the empty
+state rather than resurrecting completed tasks. `src/task-display.ts` renders only
+committed presentation caches; dependency IDs remain available to the model but
+are not UI annotations.
 
 `test/tasks.test.ts` covers lifecycle, schemas, cycles, blockers, deletion,
 final-graph validation, atomic rollback, local references, compact ordered results,
@@ -152,7 +161,11 @@ restart, stale caches, undo and the three-tool provider surface. Recovery tests
 reopen persisted old create/update and new batch execution intents, both before
 mutation and after an idempotency receipt was committed. `test/dashboard.test.ts` covers live session/peek
 checklists, dashboard counts and scoped, scrollable `/tasks` details across narrow
-terminals. `test/tool-response.test.ts` verifies compact cards, expanded raw data
+terminals. `test/task-cleanup.test.ts` uses a manual clock to cover five-second
+timing, stale timers, blocked restores, transaction races, shutdown and replay;
+engine tests exercise real SQLite persistence, remaining/overdue deadlines,
+legacy deadline initialization, routine-context removal and undo on both sides
+of cleanup. `test/tool-response.test.ts` verifies compact cards, expanded raw data
 and visible errors; discovery tests cover command availability.
 
 ## Claude Code Research
@@ -182,6 +195,23 @@ version's exact rendering or internal grouping algorithm.
   Pi durable 1.3.0's Bash schema has command/timeout, not that description field.
   zz therefore uses a generic honest shell summary instead of guessing a
   description, requesting another model summary, or changing execution schemas.
+
+### Completed Checklist Cleanup Research
+
+The installed Claude Code 2.1.301 executable's bundled task-list controller and
+storage helper were inspected without launching an authenticated model request.
+The interactive controller keeps an all-complete list visible for approximately
+five seconds, then rechecks and resets the active list under a lock. Its reset
+retains the highest task ID. `TaskList` itself returns a snapshot of all current
+non-internal tasks, including completed ones before reset; it has no
+`includeCompleted` parameter. After reset it returns no tasks, rather than
+providing an archive accessible through `TaskGet`.
+
+The [official TaskList reference](https://code.claude.com/docs/en/agent-sdk/typescript#tasklist)
+and installed `sdk-tools.d.ts` corroborate the empty input and current-list output
+shapes. The five-second reset is version-specific implementation evidence, not
+a timing promise in the public documentation. zz adopts the completion grace and
+active-list reset, while preserving its own durable audit and undo semantics.
 
 ### Code Change Visibility Research
 

@@ -2311,3 +2311,28 @@ test("structured questions take precedence over checklist rows without changing 
     assert.equal(f.engine.calls.length, 0);
   } finally { await f.cleanup(); }
 });
+
+test("cleared checklists disappear from sessions, peeks and dashboard counts while /tasks shows an empty list", async () => {
+  const f = setup();
+  const screen = () => { f.tui.renderNow(); return f.tui.getScreenLines().map(stripTerminalSequences).join("\n"); };
+  try {
+    f.c.send("Finished checklist"); await tick();
+    const session = f.store.state.sessions[0]!;
+    const completed = [{ id: "1", subject: "Finished item", status: "completed" as const, blockedBy: [] }];
+    session.tasks = completed; f.c.open(); f.c.changed();
+    assert.match(screen(), /Tasks - 1\/1 complete/);
+    session.tasks = undefined; f.c.changed();
+    assert.doesNotMatch(screen(), /Tasks -|Finished item/);
+    f.c.back(); f.c.select(`session:${session.id}`);
+    session.tasks = completed; f.c.changed(); assert.match(screen(), /1\/1 tasks/);
+    session.tasks = undefined; f.c.changed(); assert.doesNotMatch(screen(), /1\/1 tasks/);
+    session.tasks = completed; f.c.peek(); assert.match(screen(), /Tasks - 1\/1 complete/);
+    session.tasks = undefined; f.c.changed(); assert.doesNotMatch(screen(), /Tasks -|Finished item/);
+    f.terminal.onInput("\x1b");
+    session.tasks = completed; f.c.showTasks(); assert.match(screen(), /Finished item/);
+    session.tasks = undefined; f.c.changed();
+    assert.match(screen(), /No checklist tasks/);
+    assert.doesNotMatch(screen(), /Finished item/);
+    assert.equal(f.engine.calls.length, 1, "cleanup display updates never send a prompt");
+  } finally { await f.cleanup(); }
+});
