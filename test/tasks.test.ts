@@ -144,21 +144,22 @@ test("checklist rendering is bounded, safe and never displays dependency annotat
   createTask(tasks, { subject: "Run tests", description: "Verify tokens\nincluding expiry", blockedBy: ["2"] });
   updateTask(tasks, { taskId: "1", status: "completed" });
   updateTask(tasks, { taskId: "2", status: "in_progress" });
-  assert.equal(taskProgress(tasks.items), "1/3");
+  assert.equal(taskProgress(tasks.items), "3 tasks (1 done, 1 in progress, 1 open)");
   assert.equal(taskProgress([]), undefined);
   const colored = taskChecklist(tasks.items, 100).join("\n");
   const rendered = stripTerminalSequences(colored);
-  assert.match(rendered, /\u2612 #1 Inspect auth/);
-  assert.match(rendered, /\u2610 #2 Implementing auth/);
-  assert.match(rendered, /\u2610 #3 Run tests/);
+  assert.match(rendered, /\u2612 Inspect auth/);
+  assert.match(rendered, /\u25a0 Implementing auth/);
+  assert.match(rendered, /^3 tasks \(1 done, 1 in progress, 1 open\) \(\/tasks\)/);
+  assert.match(rendered, /\u2610 Run tests/);
   assert.doesNotMatch(rendered, /\[>\]|\[x\]|\[ \]/);
-  assert.match(colored, /\x1b\[32m  \u2612 #1 Inspect auth/);
-  assert.match(colored, /\x1b\[1m\x1b\[38;5;214m  \u2610 #2 Implementing auth/);
-  assert.match(colored, /\x1b\[2m  \u2610 #3 Run tests/);
-  assert.doesNotMatch(rendered, /blocked|blockedBy|depends/);
+  assert.match(colored, /\x1b\[32m  \u2612 Inspect auth/);
+  assert.ok(colored.includes("  \x1b[38;5;214m\u25a0\x1b[39m \x1b[1m\x1b[30mImplementing auth\x1b[39m\x1b[22m"));
+  assert.match(colored, /\x1b\[2m  \u2610 Run tests/);
+  assert.doesNotMatch(rendered, /blocked|blockedBy|depends|#\d+/);
   const details = taskDetails(tasks.items, 100).map(stripTerminalSequences).join("\n");
   assert.match(details, /including expiry/);
-  assert.doesNotMatch(details, /blocked|blockedBy|depends/);
+  assert.doesNotMatch(details, /blocked|blockedBy|depends|#\d+/);
   createTask(tasks, { subject: "Unsafe\x1b[2J\r\n" + "\u754c".repeat(40) });
   for (let i = 0; i < 10; i++) createTask(tasks, { subject: `Later ${i}` });
   for (const width of [1, 8, 24, 80]) {
@@ -171,7 +172,7 @@ test("checklist rendering is bounded, safe and never displays dependency annotat
   }
   const short = taskChecklist(tasks.items, 80, 4).map(stripTerminalSequences).join("\n");
   assert.match(short, /Implementing auth/);
-  assert.match(short, /more/);
+  assert.match(short, /\u2026 \+\d+ pending/);
   assert.deepEqual(taskChecklist([], 80), []);
   assert.match(taskDetails([], 80)[0]!, /No checklist/);
 });
@@ -316,4 +317,22 @@ test("completion deadlines start once for a finished checklist and disappear whe
   assert.equal(tasks.completedAt, 600);
   applyTaskBatch(tasks, { operations: [{ action: "delete", taskId: "1" }, { action: "delete", taskId: "2" }] }, 700);
   assert.equal(tasks.completedAt, undefined);
+});
+
+test("task summaries count all statuses even when checklist rows are truncated", () => {
+  const tasks = state();
+  for (let i = 0; i < 6; i++) createTask(tasks, { subject: `Work ${i + 1}` });
+  updateTask(tasks, { taskId: "1", status: "in_progress" });
+  const summary = "6 tasks (0 done, 1 in progress, 5 open)";
+  assert.equal(taskProgress(tasks.items), summary);
+  assert.equal(stripTerminalSequences(taskChecklist(tasks.items, 80, 3)[0]!), `${summary} (/tasks)`);
+  assert.match(taskChecklist(tasks.items, 80, 3).map(stripTerminalSequences).join("\n"), /\+5 pending/);
+  assert.equal(taskProgress(undefined), undefined);
+  for (const [status, counts] of [
+    ["pending", "0 done, 0 in progress, 1 open"],
+    ["in_progress", "0 done, 1 in progress, 0 open"],
+    ["completed", "1 done, 0 in progress, 0 open"],
+  ] as const) {
+    assert.equal(taskProgress([{ ...tasks.items[0]!, status }]), `1 task (${counts})`);
+  }
 });

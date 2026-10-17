@@ -15,8 +15,10 @@ import { QuestionComposer } from "../src/question-composer.js";
 import { pendingQuestion } from "../src/questions.js";
 import { waitingSession } from "./question-fixtures.js";
 import { FakeEngine, FakeTerminal, temporary, tick } from "./helpers.js";
+import type { TaskDisplayClock } from "../src/task-display.js";
+import { ManualTaskClock } from "./task-cleanup-fixtures.js";
 
-function setup(writeClipboard?: (text: string) => Promise<void>) {
+function setup(writeClipboard?: (text: string) => Promise<void>, taskClock?: TaskDisplayClock) {
   const temp = temporary();
   const a = join(temp.root, "alpha"); const b = join(temp.root, "beta");
   mkdirSync(a); mkdirSync(b);
@@ -26,10 +28,10 @@ function setup(writeClipboard?: (text: string) => Promise<void>) {
   const c = new Controller(store, engine, undefined, writeClipboard);
   const terminal = new FakeTerminal();
   const tui = new TuiAltScreen(terminal, false, undefined, { scrollToEndIndicator });
-  const app = new Dashboard(c, tui, () => {});
+  const app = new Dashboard(c, tui, () => {}, taskClock);
   tui.setLayoutRoot(app); tui.setFocus(app); tui.start(); app.sync(); tui.renderNow();
   return { ...temp, store, pa, pb, engine, c, terminal, tui, app,
-    async cleanup() { await c.close(); tui.stop(); temp.cleanup(); } };
+    async cleanup() { app.dispose(); await c.close(); tui.stop(); temp.cleanup(); } };
 }
 
 function assertFullyHighlighted(line: string, width: number): void {
@@ -1395,7 +1397,8 @@ test("settings opens without model lookup, reports save errors and never reopens
   } finally { release?.(); await f.cleanup(); }
 });
 
-test("mixed queued modes retain truthful labels after changing the busy-reply setting", async () => {
+test("mixed queued modes retain truthful labels after changing the busy-reply setting", async (t) => {
+  const now = Date.now(); t.mock.method(Date, "now", () => now);
   const f = setup();
   try {
     f.c.send("task"); await tick(); f.c.open();
@@ -2209,15 +2212,15 @@ test("session and peek checklists show live task state without dependency annota
     ];
     f.c.open(); f.c.changed(); f.tui.renderNow();
     const screen = () => f.tui.getScreenLines().map(stripTerminalSequences).join("\n");
-    assert.match(screen(), /Tasks - 1\/3 complete/);
-    assert.match(screen(), /\u2610 #2 Implementing reset/);
-    assert.match(screen(), /\u2610 #3 Test reset/);
+    assert.match(screen(), /3 tasks \(1 done, 1 in progress, 1 open\)/);
+    assert.match(screen(), /\u25a0 Implementing reset/);
+    assert.match(screen(), /\u2610 Test reset/);
     assert.doesNotMatch(screen(), /blocked|blockedBy|depends/);
     session.tasks[1]!.status = "completed";
     session.tasks[2]!.status = "in_progress";
     f.c.changed(); f.tui.renderNow();
-    assert.match(screen(), /Tasks - 2\/3 complete/);
-    assert.match(screen(), /\u2610 #3 Test reset/);
+    assert.match(screen(), /3 tasks \(2 done, 1 in progress, 0 open\)/);
+    assert.match(screen(), /\u25a0 Test reset/);
     assert.doesNotMatch(screen(), /Implementing reset/);
     for (const width of [8, 16, 24, 80]) {
       for (const height of [12, 24, 32]) {
@@ -2226,25 +2229,26 @@ test("session and peek checklists show live task state without dependency annota
         const lines = f.tui.getScreenLines().map(stripTerminalSequences);
         assert.equal(lines.length, height);
         assert.ok(lines.every((line) => visibleWidth(line) <= width));
-        assert.ok(lines.some((line) => line.startsWith("Tasks")), `checklist at ${width}x${height}`);
+        assert.ok(lines.some((line) => line.startsWith("3 tas")), `checklist at ${width}x${height}`);
         assert.ok(lines.at(-1)?.startsWith("test/"), "model status stays visible");
         assert.doesNotMatch(lines.join("\n"), /blockedBy|blocked by/);
       }
     }
     f.terminal.columns = 24; f.terminal.rows = 12; f.terminal.onResize();
     f.app.composer.setValue("draft line\n".repeat(5)); f.tui.renderNow();
-    assert.doesNotMatch(screen(), /Tasks -/, "the checklist yields space to tall drafts");
+    assert.doesNotMatch(screen(), /\d+ tasks? \(\d+ done/, "the checklist yields space to tall drafts");
     f.app.composer.setValue("");
     f.terminal.columns = 120; f.terminal.rows = 32; f.terminal.onResize();
     f.c.back(); f.c.select(`session:${session.id}`); f.c.changed(); f.tui.renderNow();
-    assert.match(screen(), /2\/3 tasks/);
-    assert.doesNotMatch(screen(), /Tasks -/);
+    assert.match(screen(), /3 tasks \(2 done, 1 in progress, 0 open\)/);
+    assert.doesNotMatch(screen(), /[\u2610\u2612\u25a0] /, "dashboard shows a summary, not checklist rows");
     f.c.peek(); f.tui.renderNow();
-    assert.match(screen(), /Tasks - 2\/3 complete/);
+    assert.match(screen(), /3 tasks \(2 done, 1 in progress, 0 open\)/);
     assert.doesNotMatch(screen(), /blockedBy|blocked by/);
     f.terminal.onInput("/tasks"); f.terminal.onInput("\r"); f.tui.renderNow();
     assert.equal(f.c.dialog?.kind, "tasks");
     assert.match(screen(), /Session tasks/);
+    assert.doesNotMatch(screen(), /#\d+/);
     f.terminal.onInput("\x1b");
     assert.equal(f.engine.calls.length, 1);
   } finally { await f.cleanup(); }
@@ -2304,10 +2308,10 @@ test("structured questions take precedence over checklist rows without changing 
     f.store.state.sessions.push(session);
     f.c.select(`session:${session.id}`); f.c.open(); f.c.changed(); f.tui.renderNow();
     assert.equal(f.c.questionForm?.sessionId, session.id);
-    assert.doesNotMatch(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Tasks -/);
+    assert.doesNotMatch(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /\d+ tasks? \(\d+ done/);
     assert.equal(session.tasks[0]?.status, "in_progress");
     f.terminal.onInput("\x1b"); f.tui.renderNow();
-    assert.match(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Tasks - 0\/1 complete/);
+    assert.match(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /1 task \(0 done, 1 in progress, 0 open\)/);
     assert.equal(f.engine.calls.length, 0);
   } finally { await f.cleanup(); }
 });
@@ -2320,14 +2324,14 @@ test("cleared checklists disappear from sessions, peeks and dashboard counts whi
     const session = f.store.state.sessions[0]!;
     const completed = [{ id: "1", subject: "Finished item", status: "completed" as const, blockedBy: [] }];
     session.tasks = completed; f.c.open(); f.c.changed();
-    assert.match(screen(), /Tasks - 1\/1 complete/);
+    assert.match(screen(), /1 task \(1 done, 0 in progress, 0 open\)/);
     session.tasks = undefined; f.c.changed();
-    assert.doesNotMatch(screen(), /Tasks -|Finished item/);
+    assert.doesNotMatch(screen(), /1 task \(|Finished item/);
     f.c.back(); f.c.select(`session:${session.id}`);
-    session.tasks = completed; f.c.changed(); assert.match(screen(), /1\/1 tasks/);
-    session.tasks = undefined; f.c.changed(); assert.doesNotMatch(screen(), /1\/1 tasks/);
-    session.tasks = completed; f.c.peek(); assert.match(screen(), /Tasks - 1\/1 complete/);
-    session.tasks = undefined; f.c.changed(); assert.doesNotMatch(screen(), /Tasks -|Finished item/);
+    session.tasks = completed; f.c.changed(); assert.match(screen(), /1 task \(1 done, 0 in progress, 0 open\)/);
+    session.tasks = undefined; f.c.changed(); assert.doesNotMatch(screen(), /1 task \(1 done, 0 in progress, 0 open\)/);
+    session.tasks = completed; f.c.peek(); assert.match(screen(), /1 task \(1 done, 0 in progress, 0 open\)/);
+    session.tasks = undefined; f.c.changed(); assert.doesNotMatch(screen(), /1 task \(|Finished item/);
     f.terminal.onInput("\x1b");
     session.tasks = completed; f.c.showTasks(); assert.match(screen(), /Finished item/);
     session.tasks = undefined; f.c.changed();
@@ -2428,5 +2432,59 @@ test("fast session wheel gestures accelerate, preserve Alt scaling and reset bet
     f.terminal.onInput("\x1b"); f.tui.renderNow();
     assert.equal(wheel(950), 3, "Dismissing a dialog starts a fresh gesture");
     assert.equal(f.engine.calls.length, 1);
+  } finally { await f.cleanup(); }
+});
+
+test("session and peek share completion recency and redraw idle overflow at thirty seconds even with reduced motion", async (t) => {
+  const clock = new ManualTaskClock(); const f = setup(undefined, clock);
+  const motion = process.env.ZZ_REDUCED_MOTION; process.env.ZZ_REDUCED_MOTION = "1";
+  const screen = () => { f.tui.renderNow(); return f.tui.getScreenLines().map(stripTerminalSequences).join("\n"); };
+  try {
+    f.terminal.columns = 100; f.terminal.rows = 32; f.terminal.onResize();
+    f.c.send("Preview ordering"); await tick();
+    const session = f.store.state.sessions[0]!;
+    session.tasks = Array.from({ length: 6 }, (_, i) => ({ id: String(i + 1), subject: `Visual task ${i + 1}`,
+      status: i === 0 ? "in_progress" : "pending", blockedBy: [] }));
+    f.c.open(); f.c.changed(); screen();
+    session.tasks[0]!.status = "completed"; session.tasks[1]!.status = "in_progress"; f.c.changed();
+    assert.match(screen(), /Visual task 1/); assert.doesNotMatch(screen(), /Visual task 6/);
+    assert.match(screen(), /\+1 pending/); assert.equal(clock.scheduled, 1);
+    await clock.advance(29_999);
+    f.c.back(); f.c.select(`session:${session.id}`); f.c.peek();
+    assert.match(screen(), /Visual task 1/); assert.doesNotMatch(screen(), /Visual task 6/);
+    assert.equal(clock.scheduled, 1, "switching to peek must not restart recency");
+    const requests = t.mock.method(f.tui, "requestRender");
+    await clock.advance(1);
+    assert.ok(requests.mock.calls.length > 0, "expiry requests rendering without a prompt or controller change");
+    assert.doesNotMatch(screen(), /Visual task 1/); assert.match(screen(), /Visual task 6/);
+    assert.match(screen(), /\+1 completed/);
+    assert.match(screen(), /6 tasks \(1 done, 1 in progress, 4 open\)/);
+    f.terminal.onInput("\x1b"); f.c.open();
+    assert.doesNotMatch(screen(), /Visual task 1/); assert.match(screen(), /Visual task 6/);
+    assert.equal(f.engine.calls.length, 1);
+    session.tasks[2]!.status = "completed"; f.c.changed(); assert.equal(clock.scheduled, 1);
+    f.app.dispose(); assert.equal(clock.scheduled, 0);
+  } finally {
+    if (motion === undefined) delete process.env.ZZ_REDUCED_MOTION; else process.env.ZZ_REDUCED_MOTION = motion;
+    await f.cleanup();
+  }
+});
+
+test("checklists normally show five tasks, shrink with terminal height, and keep the composer safe", async () => {
+  const f = setup();
+  try {
+    f.c.send("Preview task capacity"); await tick();
+    const session = f.store.state.sessions[0]!;
+    session.tasks = Array.from({ length: 6 }, (_, i) => ({ id: String(i + 1), subject: `Capacity task ${i + 1}`, status: "pending", blockedBy: [] }));
+    f.c.open(); f.c.changed();
+    for (const [height, count] of [[32, 5], [24, 5], [18, 4], [17, 3], [10, 0]] as const) {
+      f.terminal.columns = 100; f.terminal.rows = height; f.terminal.onResize(); f.tui.renderNow();
+      const lines = f.tui.getScreenLines().map(stripTerminalSequences);
+      const screen = lines.join("\n");
+      assert.equal((screen.match(/Capacity task \d+/g) ?? []).length, count, `capacity at ${height} rows`);
+      if (count) assert.match(screen, new RegExp(`\\+${6 - count} pending`));
+      assert.ok(lines.at(-1)?.startsWith("test/"));
+      assert.ok(lines.every((line) => visibleWidth(line) <= 100));
+    }
   } finally { await f.cleanup(); }
 });

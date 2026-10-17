@@ -19,7 +19,7 @@ import { pendingQuestion } from "./questions.js";
 import { Composer } from "./composer.js";
 import { composerCommands } from "./discovery.js";
 import { composerStatus, usageDetails } from "./usage.js";
-import { taskChecklist, taskDetails, taskProgress } from "./task-display.js";
+import { TaskDisplay, taskDetails, taskProgress, taskVisibleLimit, type TaskDisplayClock } from "./task-display.js";
 
 export const scrollToEndIndicator = () => accent("[ Scroll to bottom (/bottom) ]");
 
@@ -98,7 +98,7 @@ class SessionList extends Dynamic {
           this.renameHeight = rowLines.length;
         } else {
           const progress = taskProgress(session.tasks);
-          const time = `${progress ? `${progress} tasks  ` : ""}${age(activityTimestamp(session))}`;
+          const time = `${progress ? `${progress}  ` : ""}${age(activityTimestamp(session))}`;
           const title = oneLine(session.title);
           const titleWidth = titleWidths.get(row.project.id)!;
           const label = status === "completed" ? "Done" : status === "needs-input" ? "Needs input"
@@ -178,6 +178,7 @@ export class Dashboard extends VStack implements Focusable {
   readonly listScroll: ScrollView;
   private readonly bodyHost = new VStack();
   private readonly wheelScroll = new AdaptiveWheelScroll();
+  private readonly taskDisplay: TaskDisplay;
   get scroll(): ScrollView { return this.controller.mode === "session" ? this.chatScroll : this.listScroll; }
   private overlay?: OverlayHandle;
   private activeDialog?: Controller["dialog"];
@@ -201,8 +202,9 @@ export class Dashboard extends VStack implements Focusable {
     if (this.questionComposer) this.questionComposer.focused = this.focused && !this.controller.dialog;
   }
 
-  constructor(readonly controller: Controller, readonly tui: TuiAltScreen, readonly quit: () => void) {
+  constructor(readonly controller: Controller, readonly tui: TuiAltScreen, readonly quit: () => void, taskClock?: TaskDisplayClock) {
     super();
+    this.taskDisplay = new TaskDisplay(() => tui.requestRender(), taskClock);
     // The viewport handles this binding before dashboard input; use /bottom instead.
     const keybindings = getKeybindings();
     keybindings.setUserBindings({ ...keybindings.getUserBindings(), "tui.altScreen.bottom": [] });
@@ -303,16 +305,19 @@ export class Dashboard extends VStack implements Focusable {
     const notice = !this.questionComposer && !this.body.rename && c.notice ? [warning(oneLine(c.notice))] : [];
     const input = this.questionComposer ? this.questionComposer.render(width, Math.max(1, this.tui.terminal.rows - this.header(width).length - 3))
       : this.composer.render(width);
-    const taskBudget = Math.max(0, Math.min(6, Math.floor(this.tui.terminal.rows / 4),
+    const taskBudget = Math.max(0, Math.min(taskVisibleLimit(this.tui.terminal.rows) + 2,
       this.tui.terminal.rows - this.header(width).length - input.length - notice.length - 3));
     return ["",
-      ...(!this.questionComposer && c.mode === "session" ? taskChecklist(c.opened?.tasks, width, taskBudget) : []),
+      ...(!this.questionComposer && c.mode === "session" ? this.taskDisplay.render(c.opened, width, taskBudget, this.tui.terminal.rows) : []),
       ...notice, ...input,
       composerStatus(c.configuration, c.engine.stats(c.mode === "session" ? c.opened : undefined))];
   }
 
+  dispose(): void { this.taskDisplay.close(); }
+
   sync(): void {
     const c = this.controller;
+    this.taskDisplay.sync(c.store.state.sessions);
     if (c.dialog || c.mode !== this.previousMode || c.openedSessionId !== this.previousSessionId) this.wheelScroll.reset();
     if (c.mode !== this.previousMode || c.openedSessionId !== this.previousSessionId) {
       this.composer.setHistory(promptHistory(c.mode === "session" ? c.opened : undefined));
@@ -389,7 +394,7 @@ export class Dashboard extends VStack implements Focusable {
           if (c.mode === "session" && c.openedSessionId === undoSessionId && !this.composer.hasContent) {
             this.composer.setValue(result.prompt); c.changed();
           }
-        }) : c.dialog.kind === "settings" ? new SettingsPage(c, this.tui, c.dialog) : new DialogView(c, this.tui), {
+        }) : c.dialog.kind === "settings" ? new SettingsPage(c, this.tui, c.dialog) : new DialogView(c, this.tui, this.taskDisplay), {
         width: "88%", maxHeight: "85%", margin: 1,
       });
     }
@@ -498,7 +503,7 @@ class DialogView implements Component, Focusable {
   get focused(): boolean { return this._focused; }
   set focused(value: boolean) { this._focused = value; this.input.focused = value; }
 
-  constructor(readonly controller: Controller, readonly tui: TuiAltScreen) {
+  constructor(readonly controller: Controller, readonly tui: TuiAltScreen, private readonly taskDisplay: TaskDisplay) {
     this.input = controller.dialog?.kind === "peek"
       ? new Composer(tui, "reply to this session", (error) => controller.fail(error))
       : new Input({ placeholder: "/path/to/project", placeholderStyle: dim });
@@ -616,8 +621,8 @@ class DialogView implements Component, Focusable {
       ...(hint ? [dim(hint)] : []),
       composerStatus(c.engine.configuration(session), c.engine.stats(session)),
     ];
-    const checklist = taskChecklist(session?.tasks, inner, Math.max(0, Math.min(4, Math.floor(this.tui.terminal.rows / 5),
-      Math.floor(this.tui.terminal.rows * 0.85) - 7 - inputLines.length - belowComposer.length - (c.notice ? 1 : 0))));
+    const checklist = this.taskDisplay.render(session, inner, Math.max(0, Math.min(taskVisibleLimit(this.tui.terminal.rows) + 2,
+      Math.floor(this.tui.terminal.rows * 0.85) - 7 - inputLines.length - belowComposer.length - (c.notice ? 1 : 0))), this.tui.terminal.rows);
     const available = Math.max(1, Math.floor(this.tui.terminal.rows * 0.85)
       - 6 - inputLines.length - checklist.length - belowComposer.length - (c.notice ? 1 : 0));
     const lines = replyLines;

@@ -73,12 +73,14 @@ async function main(): Promise<void> {
   let engine: DurableEngine | undefined;
   let controller: Controller | undefined;
   let tui: TuiAltScreen | undefined;
+  let app: Dashboard | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
   let editorClosed = Promise.resolve();
   const shutdown = createShutdown({
     prepare: () => {
       if (tui) editorClosed = cancelExternalEditor(tui);
       if (controller) { controller.notice = "Pausing running work..."; controller.changed(); }
+      app?.dispose();
       if (timer) clearInterval(timer);
     },
     close: async () => {
@@ -113,7 +115,7 @@ async function main(): Promise<void> {
     controller = new Controller(store, engine, auth);
     if (!model) controller.notice = "No Pi login found. Use /login, then /model to choose a provider and model.";
     tui = new TuiAltScreen(new ProcessTerminal(), false, root, { mouse: true, scrollToEndIndicator });
-    const app = new Dashboard(controller, tui, () => shutdown.request());
+    app = new Dashboard(controller, tui, () => shutdown.request());
     tui.setLayoutRoot(app);
     tui.setFocus(app);
     // Keep ctrl+c available even when an overlay owns focus.

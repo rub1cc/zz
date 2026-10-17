@@ -393,25 +393,36 @@ questions and one-step edits do not need a checklist. Tasks belong to their
 session, not the whole project.
 
 ```text
-Tasks - 1/3 complete (/tasks)
-  ☒ #1 Inspect authentication
-  ☐ #2 Implementing password reset
-  ☐ #3 Test password reset
+3 tasks (1 done, 1 in progress, 1 open) (/tasks)
+  ☒ Inspect authentication
+  ■ Implementing password reset
+  ☐ Test password reset
 ```
 
 - A live, height-bounded checklist appears above the session or peek composer;
-  dashboard session rows show the completed/total count. Longer lists prioritize
-  active and pending work and show a `more` hint. Empty lists occupy no space.
-  The checklist yields space to tall drafts; structured question forms temporarily
-  take precedence over it.
+  dashboard session rows show the same total, done, in-progress and open counts.
+  For example: `6 tasks (0 done, 1 in progress, 5 open)`. Normally up to five tasks
+  are visible; shorter terminals show three or four, with only the summary at ten
+  rows or fewer. Tall drafts can reduce the visible count further to protect the
+  composer. Empty lists occupy no space; structured question forms temporarily
+  take precedence. Task IDs stay available to tools but have no visible prefixes.
+- When every task fits, rows stay in creation order. On overflow, tasks completed
+  during this run remain prioritized for **30 seconds**, followed by in-progress
+  tasks, unblocked pending tasks, blocked pending tasks, and older completed tasks.
+  Each group stays in creation order. Hidden rows are counted by status, such as
+  `... +2 pending, 1 completed`; `/tasks` always shows the full list in creation
+  order. Newly completed rows can therefore move after the grace period expires.
+  Session and peek views share these presentation timers and refresh even while
+  idle or with reduced motion. Already-completed tasks on initial load are not
+  treated as newly finished; display recency is not persisted or restored by undo.
 - `/tasks` opens scrollable active-checklist titles, statuses and descriptions for
   the open session or selected dashboard session. It also works directly in a peek
   reply. It never sends an agent request and is not a completed-task archive.
 - Tasks default to `pending`; the agent explicitly marks them `in_progress` and
   then `completed` after required verification. Creation can also set a status.
-  Pending tasks use a dim `☐`, active tasks a bold amber `☐`, and completed tasks a
-  green `☒`. `activeForm` supplies ongoing wording. Ending a response, stopping
-  work or closing zz does not complete tasks.
+  Pending tasks use a dim `☐`; active tasks use an amber `■` followed by bold
+  black text; completed tasks use a green `☒`. `activeForm` supplies ongoing
+  wording. Ending a response, stopping work or closing zz does not complete tasks.
 - Dependencies are functional but are not annotated in the checklist or details
   view. Task tools expose prerequisites to the agent; the backend rejects missing
   IDs, cycles and starting/completing blocked tasks. Completing a prerequisite
@@ -897,7 +908,10 @@ replacement, undo, task details, and narrow session/peek/dashboard rendering
 without dependency annotations. Cleanup tests cover the five-second grace period,
 atomic state rechecks, reopening/new work, stale and in-flight timers, shutdown,
 remaining/overdue deadlines on restart, old lists without deadlines, replay safety,
-model-context removal, undo boundaries and disappearing UI rows.
+model-context removal, undo boundaries and disappearing UI rows. Task display
+coverage also checks five-task capacity, status-based overflow counts, numeric
+creation order, ready/blocked priority, exact 30-second recency, idle/reduced-motion
+refresh, shared session/peek timing, initial-load behavior and timer cancellation.
 Authentication tests also cover shared Pi credential storage, prompt variants,
 secret masking/redaction, cancellation, logout confirmation and catalog failures.
 Direct-shell tests run real local processes for project/session/peek scoping, pipes,

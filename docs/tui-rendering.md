@@ -107,9 +107,11 @@ are not grouped or hidden.
 | Queued follow-ups / steering / mixed queue | Separate numbered queue, delivery modes and image counts |
 | Manual/automatic/overflow compaction | Existing reason, blocking/retry status, failure text |
 | Saved compaction summary | Compact tool summary, expandable content |
-| Session/peek checklist | Height-bounded completed/total summary and task statuses above composer; no dependency annotations |
-| Long checklist | Active/pending work prioritized, remaining-count hint; `/tasks` opens scrollable full details |
-| Dashboard checklist | Completed/total count on session rows, including narrow wrapped rows |
+| Session/peek checklist | Height-bounded total/done/in-progress/open summary above composer; amber `■` with bold black active text; no dependency annotations |
+| Long checklist | Up to five tasks normally; recent completions prioritized for 30 seconds, then active/ready/blocked/older-completed work; hidden counts by status |
+| Dashboard checklist | Same total/done/in-progress/open summary on session rows, including narrow wrapped rows |
+| Fitting checklist / full details | Numeric creation order, no task ID prefixes; full details never use overflow priority |
+| Checklist recency expiry | Session/peek share conversation-scoped presentation timers; idle/reduced-motion views redraw at 30 seconds; reopened/cleared/deleted/undone state cancels obsolete timers |
 | Empty checklist / question wizard | No checklist rows; structured questions retain composer precedence |
 | All tasks completed | Finished checklist remains for five seconds, then an atomic reset removes panel rows and dashboard counts |
 | Work added/reopened during grace | Cleanup cancels; completed rows remain alongside open work |
@@ -150,8 +152,11 @@ ID counters and replay receipts, cancels for open work, pauses during undo, and
 stops timers before shutdown. The reset appends a model-free `zz.tasks_cleared`
 entry in the same commit so the next prompt's undo checkpoint sees the empty
 state rather than resurrecting completed tasks. `src/task-display.ts` renders only
-committed presentation caches; dependency IDs remain available to the model but
-are not UI annotations.
+committed presentation caches and tracks newly observed completions separately
+for display priority. This presentation-only 30-second grace is independent of
+the durable five-second all-complete reset. Initial completed rows have no fresh
+display grace; undo forks and restarts do not restore it. Dependency IDs affect
+ready-versus-blocked overflow priority but are not UI annotations.
 
 `test/tasks.test.ts` covers lifecycle, schemas, cycles, blockers, deletion,
 final-graph validation, atomic rollback, local references, compact ordered results,
@@ -165,7 +170,11 @@ terminals. `test/task-cleanup.test.ts` uses a manual clock to cover five-second
 timing, stale timers, blocked restores, transaction races, shutdown and replay;
 engine tests exercise real SQLite persistence, remaining/overdue deadlines,
 legacy deadline initialization, routine-context removal and undo on both sides
-of cleanup. `test/tool-response.test.ts` verifies compact cards, expanded raw data
+of cleanup. `test/task-display.test.ts` covers capacity, ordering, readiness,
+hidden status counts, exact recency expiry, old restored rows, reopening, stale
+timers, per-session isolation and shutdown. Dashboard tests exercise shared
+session/peek recency and idle redraw under reduced motion with a manual clock.
+`test/tool-response.test.ts` verifies compact cards, expanded raw data
 and visible errors; discovery tests cover command availability.
 
 ## Claude Code Research
@@ -195,6 +204,22 @@ version's exact rendering or internal grouping algorithm.
   Pi durable 1.3.0's Bash schema has command/timeout, not that description field.
   zz therefore uses a generic honest shell summary instead of guessing a
   description, requesting another model summary, or changing execution schemas.
+
+### Checklist Ordering Research
+
+The installed Claude Code 2.1.301 executable's bundled checklist renderer was
+inspected without starting a model request. It chooses zero visible tasks at ten
+terminal rows or fewer, otherwise `min(5, max(3, rows - 14))`. A fitting list is
+sorted by numeric task ID. On overflow it orders recently observed completions
+(first 30 seconds), in-progress tasks, pending tasks with no unfinished blockers,
+pending tasks with unfinished blockers, and older completions. IDs order tasks
+inside each priority group. Hidden counts are shown by status. Completed rows
+present at initial mount are not given fresh recency.
+
+zz follows that capacity and ordering while retaining its own summary styling,
+number-free rows, icons/colors and composer-safe space budget. Very constrained
+layouts or tall drafts may leave room for fewer items. Session and peek share
+presentation recency; the 30-second timer does not mutate durable task state.
 
 ### Completed Checklist Cleanup Research
 
