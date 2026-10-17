@@ -124,7 +124,8 @@ test("shell starts fresh per invocation and saved responses do not replay after 
   } finally { await restored?.close(); await f.cleanup(); }
 });
 
-test("Escape stops the direct shell without stopping an agent; cancelled output stays inline", async () => {
+for (const stop of ["Escape", "/stop"] as const) {
+test(`${stop} cancels shell and agent with output kept inline`, async () => {
   const f = fixture();
   try {
     f.c.select(`project:${f.pa.id}`); f.c.send("agent work"); await tick(); f.c.open();
@@ -133,11 +134,30 @@ test("Escape stops the direct shell without stopping an agent; cancelled output 
     const run = f.run(); await until(() => run.output.text.includes("STARTED"));
     await until(() => session.shellResponses?.[0]?.text.includes("STARTED") === true);
     assert.match(f.screen(), /STARTED/); assert.equal(f.c.dialog, undefined);
-    f.terminal.onInput("\x1b"); await run.done;
+    if (stop === "Escape") f.terminal.onInput("\x1b");
+    else { f.app.composer.setValue("/stop"); f.terminal.onInput("\r"); }
+    await run.done; await tick();
     assert.equal(run.phase, "cancelled"); assert.doesNotMatch(run.output.text, /SHOULD_NOT_FINISH/);
-    assert.equal(session.status, "working"); assert.equal(f.engine.cancelled.length, 0);
-    assert.equal(session.shellResponses?.[0]?.status, "cancelled"); assert.match(f.screen(), /Shell command cancelled/);
+    assert.equal(session.status, "paused"); assert.deepEqual(f.engine.cancelled, [session.id]);
+    assert.equal(session.shellResponses?.[0]?.status, "cancelled"); assert.match(f.screen(), /Shell command (?:cancelled|stopped)/);
     assert.equal(f.c.mode, "session");
+  } finally { await f.cleanup(); }
+});
+}
+
+test("Escape closes a peek without stopping its shell command", async () => {
+  const f = fixture();
+  try {
+    f.c.send("task"); await tick(); f.c.peek();
+    f.terminal.onInput("!printf 'READY\\n'; sleep 30"); f.terminal.onInput("\r");
+    const run = f.run(); await until(() => run.output.text.includes("READY"));
+    assert.equal(f.c.dialog?.kind, "peek");
+    f.terminal.onInput("\x1b"); await tick();
+    assert.equal(f.c.dialog, undefined);
+    assert.equal(run.running, true);
+    assert.deepEqual(f.engine.cancelled, []);
+    await f.c.cancel();
+    assert.equal(run.phase, "cancelled");
   } finally { await f.cleanup(); }
 });
 
@@ -192,13 +212,13 @@ test("peek shows shell output as its response without replacing the existing pee
     const session = f.store.state.sessions[0]!;
     writeFileSync(join(f.pa.path, "sample.png"), png()); f.c.peek(); const peek = f.c.dialog;
     f.terminal.onInput('\x1b[200~"sample.png"\x1b[201~');
-    await until(() => f.screen().includes("Image 1: sample.png"));
+    await until(() => f.screen().includes("[Image #1]"));
     f.c.selection = `project:${f.pb.id}`;
     f.terminal.onInput("!pwd"); f.terminal.onInput("\r");
     const run = f.run(); await run.done;
     assert.equal(run.output.text.trim(), realpathSync(f.pa.path));
     assert.equal(f.c.dialog, peek); assert.equal(f.c.mode, "sessions");
-    assert.match(f.screen(), /Exit code 0/); assert.match(f.screen(), /Image 1: sample.png/);
+    assert.match(f.screen(), /Exit code 0/); assert.match(f.screen(), /\[Image #1\]/);
     f.terminal.onInput("describe image"); f.terminal.onInput("\r"); await tick();
     assert.equal(f.engine.calls.length, 2); assert.equal(f.engine.calls[1]?.session.id, session.id);
     assert.equal(f.engine.calls[1]?.images?.length, 1);

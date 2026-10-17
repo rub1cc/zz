@@ -158,7 +158,7 @@ test("shutdown cancels an open editor without restarting the dashboard", async (
   } finally { f.cleanup(); }
 });
 
-test("suggestions accept without submitting, dismiss without losing drafts, and fit narrow terminals", async () => {
+test("Tab fills suggestions without submitting, Escape keeps drafts, and menus fit narrow terminals", async () => {
   const { input } = composer();
   input.setDiscovery({ cwd: process.cwd(), commands: true, session: false });
   input.onSubmit = () => { assert.fail("Accepting a suggestion must not submit"); };
@@ -167,7 +167,7 @@ test("suggestions accept without submitting, dismiss without losing drafts, and 
   for (const width of [1, 4, 10, 24, 120]) {
     assert.ok(input.render(width).every((line) => visibleWidth(line) <= width));
   }
-  input.handleInput("\r");
+  input.handleInput("\t");
   assert.equal(input.getValue(), "/thinking ");
   assert.equal(input.showingSuggestions, false);
   input.setValue(""); input.handleInput("/mo"); await delay(20);
@@ -179,6 +179,74 @@ test("suggestions accept without submitting, dismiss without losing drafts, and 
   input.setDiscovery({ cwd: process.cwd(), commands: true, session: true });
   assert.equal(input.showingSuggestions, false, "Changing completion scope discards the old menu");
   assert.equal(input.getValue(), "/");
+});
+
+test("Enter executes the selected slash command; Tab only fills until Enter is pressed", async () => {
+  const { input } = composer();
+  const sent: string[] = [];
+  input.setDiscovery({ cwd: process.cwd(), commands: true, session: false });
+  input.onSubmit = (text) => { sent.push(text); return "command"; };
+  input.handleInput("/"); await delay(20);
+  input.handleInput("\x1b[B"); // Select thinking instead of the first command (model).
+  assert.equal(input.handleDiscoveryInput("\r"), true);
+  assert.deepEqual(sent, ["/thinking"]);
+  assert.equal(input.getValue(), "");
+  assert.equal(input.showingSuggestions, false);
+
+  input.handleInput("/mo"); await delay(20);
+  input.handleInput("\t");
+  assert.equal(input.getValue(), "/model ");
+  assert.deepEqual(sent, ["/thinking"]);
+  input.handleInput("\r");
+  assert.deepEqual(sent, ["/thinking", "/model"]);
+  assert.equal(input.getValue(), "");
+});
+
+test("Enter completion keeps file paths and command drafts with extra text fill-only", async () => {
+  const temp = temporary();
+  try {
+    writeFileSync(join(temp.root, "example.txt"), "");
+    writeFileSync(join(temp.root, "example-two.txt"), "");
+    for (const commands of [true, false]) {
+      for (const draft of ["./exam", join(temp.root, "exam"), "@exam"]) {
+        const { input } = composer();
+        input.setDiscovery({ cwd: temp.root, commands, session: true });
+        input.onSubmit = () => { assert.fail("File completion must not submit"); };
+        input.handleInput(draft);
+        if (draft.startsWith("@")) await delay(350);
+        else { input.handleInput("\t"); await delay(20); }
+        assert.equal(input.showingSuggestions, true, draft);
+        input.handleInput("\r");
+        assert.match(input.getValue(), /example.*\.txt/);
+        assert.equal(input.showingSuggestions, false);
+      }
+    }
+    const { input } = composer();
+    input.setDiscovery({ cwd: temp.root, commands: true, session: true });
+    input.onSubmit = () => { assert.fail("Completing within a prompt must not submit"); };
+    input.setValue("/m\nkeep this draft");
+    input.handleInput("\x01"); input.handleInput("\x1b[A"); input.handleInput("\x05");
+    input.handleInput("o"); await delay(20);
+    assert.equal(input.showingSuggestions, true);
+    input.handleInput("\r");
+    assert.equal(input.getValue(), "/model \nkeep this draft");
+  } finally { temp.cleanup(); }
+});
+
+test("Enter completion restores rejected commands and does not submit while images load", async () => {
+  const { input } = composer();
+  input.setDiscovery({ cwd: process.cwd(), commands: true, session: false });
+  const sent: string[] = [];
+  input.onSubmit = (text) => { sent.push(text); return false; };
+  input.handleInput("/mo"); await delay(20);
+  input.handleInput("\r");
+  assert.deepEqual(sent, ["/model"]);
+  assert.equal(input.getValue(), "/model ");
+  input.setValue(""); input.handleInput("/th"); await delay(20);
+  input.attachmentLoading = true;
+  assert.equal(input.handleDiscoveryInput("\r"), true);
+  assert.equal(input.getValue(), "/thinking ");
+  assert.deepEqual(sent, ["/model"]);
 });
 
 test("Escape cancels a debounced @ query before it can open a late menu", async () => {
@@ -250,4 +318,45 @@ test("multiline history is editable and suggestion arrows take precedence over r
   assert.equal(input.showingSuggestions, true);
   input.handleInput("\x1b[A"); input.handleInput("\x1b[B");
   assert.equal(input.getValue(), "/", "Menu navigation does not replace the draft with history");
+});
+
+test("typing $ opens scoped skill autocomplete; Enter and Tab fill without sending, including peeks", async () => {
+  const temp = temporary();
+  try {
+    const dir = join(temp.root, ".pi", "skills", "zz-autocomplete-fixture");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "SKILL.md"), "---\nname: zz-autocomplete-fixture\ndescription: A manual autocomplete fixture\ndisable-model-invocation: true\n---\n\nFollow this skill.\n");
+    for (const commands of [true, false]) {
+      const { input } = composer();
+      const sent: string[] = [];
+      input.setDiscovery({ cwd: temp.root, commands, session: !commands });
+      input.onSubmit = (text) => { sent.push(text); return true; };
+      input.handleInput("$");
+      for (let i = 0; i < 100 && !input.showingSuggestions; i++) await delay(20);
+      assert.equal(input.showingSuggestions, true);
+      assert.ok(input.render(80).map(stripTerminalSequences).join("\n").includes("$"));
+      input.handleInput("zz-autocomplete");
+      for (let i = 0; i < 100; i++) {
+        await delay(20);
+        if (input.render(80).map(stripTerminalSequences).join("\n").includes("$zz-autocomplete-fixture")) break;
+      }
+      input.handleInput("\r");
+      assert.equal(input.getValue(), "$zz-autocomplete-fixture ");
+      assert.equal(input.showingSuggestions, false);
+      assert.deepEqual(sent, []);
+      input.handleInput("check this project"); input.handleInput("\r");
+      assert.deepEqual(sent, ["$zz-autocomplete-fixture check this project"]);
+
+      input.handleInput("$zz-autocomplete"); input.handleInput("\t");
+      for (let i = 0; i < 100 && input.getValue() !== "$zz-autocomplete-fixture "; i++) await delay(20);
+      assert.equal(input.getValue(), "$zz-autocomplete-fixture ");
+      assert.equal(sent.length, 1);
+
+      input.setValue(""); input.handleInput("$");
+      assert.equal(input.handleDiscoveryInput("\x1b"), true);
+      await delay(350);
+      assert.equal(input.showingSuggestions, false);
+      assert.equal(input.getValue(), "$");
+    }
+  } finally { temp.cleanup(); }
 });

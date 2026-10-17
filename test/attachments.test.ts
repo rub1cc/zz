@@ -52,7 +52,7 @@ test("invalid, oversized, truncated and non-regular images are refused without s
   } finally { f.cleanup(); }
 });
 
-function composer(file = async () => image) {
+function composer(file: (path: string, cwd: string) => Promise<ImageAttachment> = async () => image) {
   const errors: unknown[] = [];
   const tui = new TuiAltScreen(new FakeTerminal());
   const input = new Composer(tui, "describe a task", (error) => errors.push(error), async (text) => text,
@@ -61,22 +61,24 @@ function composer(file = async () => image) {
   return { input, tui, errors };
 }
 
-test("clipboard and dragged paths stage images; sends clear them, failures preserve them, and empty-draft Backspace removes them", async () => {
+test("clipboard and dragged paths insert image tags; sends clear them, rejections preserve them, and Backspace removes whole tags", async () => {
   const { input, errors } = composer();
   const sent: { text: string; images: ImageAttachment[] }[] = [];
   input.onSubmit = (text, images = []) => { sent.push({ text, images }); return false; };
   input.handleInput("\x16"); await until(() => !input.attachmentLoading);
   assert.equal(input.images.length, 1); assert.equal(sent.length, 0);
+  assert.equal(input.getValue(), "[Image #1]");
   input.handleInput("\x16"); await until(() => !input.attachmentLoading);
   assert.equal(input.images.length, 2);
+  assert.equal(input.getValue(), "[Image #1][Image #2]");
   input.setValue("explain this"); input.handleInput("\r");
-  assert.equal(input.getValue(), "explain this"); assert.equal(input.images.length, 2);
+  assert.equal(input.getValue(), "explain this [Image #1] [Image #2]"); assert.equal(input.images.length, 2);
   input.onSubmit = (text, images = []) => { sent.push({ text, images }); return true; };
   input.handleInput("\r"); assert.equal(input.images.length, 0);
   input.handleInput('\x1b[200~"/tmp/space image.png"\x1b[201~'); await until(() => !input.attachmentLoading);
-  assert.equal(input.images.length, 1); assert.equal(input.getValue(), "");
-  input.setValue("caption"); input.handleInput("\x7f");
-  assert.equal(input.getValue(), "captio"); assert.equal(input.images.length, 1, "Text editing must not remove images");
+  assert.equal(input.images.length, 1); assert.equal(input.getValue(), "[Image #1]");
+  input.handleInput("caption"); input.handleInput("\x7f");
+  assert.equal(input.getValue(), "[Image #1]captio"); assert.equal(input.images.length, 1, "Text editing must not remove images");
   input.setValue(""); input.handleInput("\x7f"); assert.equal(input.images.length, 0);
   await input.attachFile("sample.png"); await input.attachFile("sample.png");
   input.handleInput("\x7f"); assert.equal(input.images.length, 1);
@@ -186,4 +188,185 @@ test("Wayland clipboard images and text stay on the active backend, never stale 
 
 test("unavailable clipboard reports image reference guidance rather than silently dropping the paste", async () => {
   await assert.rejects(readClipboard(process.cwd(), { platform: "linux", native: null, env: {}, command: async () => undefined }), /Clipboard unavailable.*@image/);
+});
+
+test("image tags insert at the cursor among multiline captions and send images in reference order", async () => {
+  const { input, errors } = composer(async (name) => ({ ...image, name }));
+  input.handleInput("while i am typing like this: ");
+  await input.attachFile("first.png");
+  input.handleInput(" and also can add multiple line like this");
+  input.handleInput("\x0a"); input.handleInput("\x0a");
+  await input.attachFile("second.png");
+  input.handleInput("\x0a"); input.handleInput("\x0a");
+  input.handleInput("above is the second attached image.");
+  const text = "while i am typing like this: [Image #1] and also can add multiple line like this\n\n[Image #2]\n\nabove is the second attached image.";
+  assert.equal(input.getValue(), text);
+  assert.match(input.render(100).map(stripTerminalSequences).join("\n"), /\[Image #2\]/);
+  assert.doesNotMatch(input.render(100).map(stripTerminalSequences).join("\n"), /attached \/|Image 1:/);
+  input.onSubmit = (prompt, images) => {
+    assert.equal(prompt, text);
+    assert.deepEqual(images?.map((image) => image.name), ["first.png", "second.png"]);
+    return true;
+  };
+  input.handleInput("\r");
+  assert.equal(input.getValue(), ""); assert.deepEqual(input.images, []);
+  assert.deepEqual(errors, []);
+});
+
+test("Backspace removes a middle image tag and payload atomically; undo restores both and the caret", async () => {
+  const { input } = composer(async (name) => ({ ...image, name }));
+  input.handleInput("before "); await input.attachFile("first.png");
+  input.handleInput(" after"); input.handleInput("\x0a"); await input.attachFile("second.png");
+  input.handleInput(" end");
+  input.handleInput("\x01"); input.handleInput("\x1b[D"); // End of the preceding line.
+  for (let i = 0; i < " after".length; i++) input.handleInput("\x1b[D");
+  input.handleInput("\x7f");
+  assert.equal(input.getValue(), "before  after\n[Image #2] end");
+  assert.deepEqual(input.images.map((image) => image.name), ["second.png"]);
+  input.handleInput("X");
+  assert.equal(input.getValue(), "before X after\n[Image #2] end");
+  input.handleInput("\x1f"); input.handleInput("\x1f");
+  assert.equal(input.getValue(), "before [Image #1] after\n[Image #2] end");
+  assert.deepEqual(input.images.map((image) => image.name), ["first.png", "second.png"]);
+  input.handleInput("\x7f");
+  assert.equal(input.getValue(), "before  after\n[Image #2] end");
+});
+
+test("arrows cross image tags as units, forward delete removes them, and unbound literal tags stay normal text", async () => {
+  const { input } = composer();
+  input.handleInput("left "); await input.attachFile("sample.png"); input.handleInput(" right");
+  for (let i = 0; i < " right".length; i++) input.handleInput("\x1b[D");
+  input.handleInput("\x1b[D"); input.handleInput("!");
+  assert.equal(input.getValue(), "left ![Image #1] right");
+  input.handleInput("\x1b[C"); input.handleInput("?");
+  assert.equal(input.getValue(), "left ![Image #1]? right");
+  input.handleInput("\x7f"); input.handleInput("\x1b[D"); input.handleInput("\x1b[3~");
+  assert.equal(input.getValue(), "left ! right"); assert.deepEqual(input.images, []);
+  input.setValue("literal [Image #99]"); input.handleInput("\x7f");
+  assert.equal(input.getValue(), "literal [Image #99");
+});
+
+test("inline image insertion in the middle of text is one undoable operation", async () => {
+  const { input } = composer();
+  input.setValue("before after");
+  for (let i = 0; i < "after".length; i++) input.handleInput("\x1b[D");
+  await input.attachFile("sample.png");
+  assert.equal(input.getValue(), "before [Image #1]after");
+  input.handleInput("\x1f");
+  assert.equal(input.getValue(), "before after"); assert.deepEqual(input.images, []);
+  await input.attachFile("sample.png");
+  assert.equal(input.getValue(), "before [Image #2]after");
+  assert.equal(input.images.length, 1);
+});
+
+test("image tag deletion preserves collapsed multiline paste content and Unicode, including through undo", async () => {
+  const { input } = composer();
+  const pasted = Array.from({ length: 30 }, (_, i) => `line ${i} \u65e5\u672c\u8a9e \u{1f9d1}\u200d\u{1f4bb}`).join("\n");
+  input.handleInput(`\x1b[200~${pasted}\x1b[201~`);
+  input.handleInput("\x0a"); await input.attachFile("sample.png");
+  input.handleInput(" suffix");
+  for (let i = 0; i < " suffix".length; i++) input.handleInput("\x1b[D");
+  input.handleInput("\x7f");
+  assert.equal(input.getValue(), `${pasted}\n suffix`); assert.deepEqual(input.images, []);
+  input.handleInput("!");
+  assert.equal(input.getValue(), `${pasted}\n! suffix`);
+  input.handleInput("\x1f"); input.handleInput("\x1f");
+  assert.equal(input.getValue(), `${pasted}\n[Image #1] suffix`);
+  assert.equal(input.images.length, 1);
+});
+
+test("scope changes restore complete inline drafts and never share image payloads or undo history", async () => {
+  const { input } = composer(async (name) => ({ ...image, name }));
+  input.setAttachmentScope("session:a");
+  input.handleInput("A "); await input.attachFile("a.png");
+  input.setAttachmentScope("session:b");
+  assert.equal(input.getValue(), ""); assert.equal(input.images.length, 0);
+  input.handleInput("\x1f"); assert.equal(input.getValue(), "");
+  input.handleInput("B"); input.handleInput("\x0a"); await input.attachFile("b.png");
+  input.setAttachmentScope("session:a");
+  assert.equal(input.getValue(), "A [Image #1]");
+  assert.deepEqual(input.images.map((image) => image.name), ["a.png"]);
+  input.setAttachmentScope("session:b");
+  assert.equal(input.getValue(), "B\n[Image #1]");
+  assert.deepEqual(input.images.map((image) => image.name), ["b.png"]);
+});
+
+test("commands omit image tags but restore them afterward; image-only sends retain the default request", async () => {
+  const { input } = composer();
+  await input.attachFile("sample.png");
+  const sent: string[] = [];
+  input.onSubmit = (text) => { sent.push(text.trim()); return "command"; };
+  input.handleInput("!pwd"); input.handleInput("\r");
+  assert.deepEqual(sent, ["!pwd"]);
+  assert.equal(input.getValue(), "[Image #1]"); assert.equal(input.images.length, 1);
+  input.setValue("/model"); input.handleInput("\r");
+  assert.deepEqual(sent, ["!pwd", "/model"]);
+  assert.equal(input.getValue(), "[Image #1]");
+  input.onSubmit = (text, images) => {
+    assert.equal(text.trim(), ""); assert.equal(images?.length, 1); return true;
+  };
+  input.handleInput("\r");
+  assert.equal(input.getValue(), ""); assert.deepEqual(input.images, []);
+});
+
+test("removing tags in the external editor removes attachments, and undo can restore them", async () => {
+  const tui = new TuiAltScreen(new FakeTerminal());
+  const input = new Composer(tui, "describe a task", (error) => { throw error; },
+    async (text) => text.replace("[Image #1]", ""),
+    { file: async () => image, clipboard: async () => ({}) });
+  input.handleInput("caption "); await input.attachFile("sample.png");
+  await input.openEditor();
+  assert.equal(input.getValue(), "caption "); assert.deepEqual(input.images, []);
+  input.handleInput("\x1f");
+  assert.equal(input.getValue(), "caption [Image #1]"); assert.equal(input.images.length, 1);
+});
+
+test("image limits count active tags, failed loads preserve drafts, and literal tags never bind to new images", async () => {
+  const { input, errors } = composer(async (name) => {
+    if (name === "bad.png") throw new Error("Could not decode");
+    return { ...image, name };
+  });
+  input.handleInput("literal [Image #1] ");
+  await input.attachFile("first.png");
+  assert.equal(input.getValue(), "literal [Image #1] [Image #2]");
+  await input.attachFile("bad.png");
+  assert.equal(input.getValue(), "literal [Image #1] [Image #2]"); assert.equal(input.images.length, 1);
+  for (let i = 0; i < 7; i++) await input.attachFile(`${i}.png`);
+  const draft = input.getValue();
+  await input.attachFile("overflow.png");
+  assert.equal(input.getValue(), draft); assert.equal(input.images.length, 8);
+  input.handleInput("\x7f"); assert.equal(input.images.length, 7);
+  await input.attachFile("replacement.png"); assert.equal(input.images.length, 8);
+  assert.equal(errors.length, 2);
+});
+
+test("multiple clipboard images insert together and follow tag order when submitted", async () => {
+  const tui = new TuiAltScreen(new FakeTerminal());
+  const input = new Composer(tui, "describe a task", (error) => { throw error; }, async (text) => text,
+    { file: async () => image, clipboard: async () => ({ images: [{ ...image, name: "first.png" }, { ...image, name: "second.png" }] }) });
+  input.handleInput("compare ");
+  await input.pasteClipboard();
+  assert.equal(input.getValue(), "compare [Image #1] [Image #2]");
+  input.handleInput("\x1f");
+  assert.equal(input.getValue(), "compare "); assert.equal(input.images.length, 0);
+  await input.pasteClipboard();
+  input.setValue("[Image #4] is above [Image #3]");
+  input.onSubmit = (text, images) => {
+    assert.equal(text, "[Image #4] is above [Image #3]");
+    assert.deepEqual(images?.map((image) => image.name), ["second.png", "first.png"]);
+    return true;
+  };
+  input.handleInput("\r");
+});
+
+test("submission navigation never clears or restores tags into a different scope", async () => {
+  const { input } = composer(async (name) => ({ ...image, name }));
+  input.setAttachmentScope("session:b"); input.handleInput("B "); await input.attachFile("b.png");
+  input.setAttachmentScope("session:a"); input.handleInput("A "); await input.attachFile("a.png");
+  input.onSubmit = () => { input.setAttachmentScope("session:b"); return true; };
+  input.handleInput("\r");
+  assert.equal(input.getValue(), "B [Image #1]");
+  assert.deepEqual(input.images.map((image) => image.name), ["b.png"]);
+  input.setAttachmentScope("session:a");
+  assert.equal(input.getValue(), ""); assert.equal(input.images.length, 0);
 });

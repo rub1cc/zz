@@ -101,7 +101,7 @@ directory**, not the directory where zz happened to launch:
   wins: `AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`.
   Pi's resolver handles duplicate paths and nested linked-worktree shadowing.
 - `.pi/SYSTEM.md` in the project replaces the default coding preamble; otherwise
-  the agent directory's `SYSTEM.md` is used. zz's operational `ask_user` policy
+  the agent directory's `SYSTEM.md` is used. zz's operational question-tool policy
   remains present so questions still pause the session for your reply.
 - `.pi/APPEND_SYSTEM.md` in the project takes precedence over the agent
   directory's `APPEND_SYSTEM.md`. This is independent of `SYSTEM.md`; the two
@@ -125,9 +125,11 @@ files. Coding-agent extensions and MCP remain disabled.
   not install clipboard utilities. If clipboard access is unavailable, use an
   `@image.png` reference or paste an image path. OS/terminal clipboard permissions
   can still prevent a paste.
-- With empty draft text, **Backspace** removes the last staged image; repeat to
-  clear more images. With text present, Backspace edits text normally. This works
-  in task, session and peek composers without attachment slash commands.
+- Pasted or dragged images insert inline `[Image #1]`, `[Image #2]`, etc. tags at
+  the composer cursor. Place tags among captions or on separate lines with
+  **Ctrl+J**. Arrow keys cross a tag as one unit; **Backspace** immediately after
+  a tag (or **Delete** before it) removes the whole tag and its attachment.
+  Undo restores both. This works in task, session and peek composers.
 - Dragging/pasting a complete, quoted or shell-escaped local image path stages it.
   `@image.png` or `@"path with spaces/image.png"` in a prompt attaches the image
   when sent. Ordinary text-file `@` references remain paths, not file attachments.
@@ -139,8 +141,10 @@ files. Coding-agent extensions and MCP remain disabled.
 - Enter sends staged images even without text (with a short default image request).
   Preparing images blocks sending until preparation finishes. Rejected submissions
   retain their draft; UI commands such as `/model` do not discard staged images.
-  Draft images are isolated by project/new-task composer and session, and are
-  in-memory only until sent. Switching scope cancels late attachment additions.
+  Draft text and inline images are isolated by project/new-task composer and
+  session, and are in-memory only until sent. Switching scope restores that
+  scope's draft and cancels late attachment additions. Image numbers remain
+  stable while editing; removing an earlier image does not relabel later tags.
 - Accepted image bytes are saved with prepared input and durable context. Queued
   follow-ups/steering and restart recovery use those bytes, not a mutable file
   path. Supported terminals display inline images; others show a readable image
@@ -151,8 +155,7 @@ files. Coding-agent extensions and MCP remain disabled.
   streaming. Click or select a block to collapse/expand it; `/expand` and
   `/collapse` also apply. **Show reasoning** in `/settings` shows/hides all
   thinking blocks and saves that global display preference. It does **not** change
-  the model's thinking level;
-  Ctrl+T and `/thinking` retain their existing level-picker behavior.
+  the model's thinking level; `/thinking` opens the level picker.
   Redacted thinking gets a placeholder; opaque signatures are never displayed or
   copied into the presentation cache. Providers that return no thinking have
   nothing to show.
@@ -190,11 +193,8 @@ save immediately in zz's data directory; no restart is needed.
 
 ## Model And Thinking
 
-- `/model` or Ctrl+L opens a searchable model picker using your logged-in Pi providers.
-- `/thinking` or Ctrl+T shows only levels supported by the current model.
-- Shift+Tab cycles those supported levels directly, wrapping at the end and
-  preserving your draft. In a running session it affects the next model request,
-  not the request already in flight.
+- `/model` opens a searchable model picker using your logged-in Pi providers.
+- `/thinking` shows only levels supported by the current model.
 - On the dashboard, these set defaults for **new sessions**, even if a session row
   is selected. Open a session first to change **that session's next reply**.
 - New-session defaults are saved in zz's data directory, not Pi's settings.
@@ -202,8 +202,8 @@ save immediately in zz's data directory; no restart is needed.
   session to finish; thinking changes can be made during a run. A status line below
   the composer always shows the effective model and thinking.
 - Pickers support arrows, Ctrl+N/P, Enter, Escape, and mouse selection. Type to
-  filter models by provider, ID, or display name; unsent composer text is preserved
-  when opening a picker with its shortcut.
+  filter models by provider, ID, or display name. Slash commands preserve staged
+  images; finish or save draft text before entering a command.
 
 Initial thinking follows Pi's per-model preference or `defaultThinkingLevel`.
 After that, zz remembers its own defaults. CLI flags/environment variables take
@@ -251,8 +251,8 @@ npm run dev -- --model openai/gpt-5.4 --thinking high
   Output retains only the last 256 KiB / 2000 lines per response, with an omission
   notice when truncated. Redirect to a file if you need a full log. Command text
   and output may contain secrets, so treat this saved history as sensitive.
-- Escape stops the current session's shell first, without stopping its agent;
-  `/stop` cancels both when both are active. Navigation or opening settings does
+- `/stop` or Escape in an open session cancels its shell and agent when both are active.
+  Escape dismisses suggestions/dialogs first. Navigation or opening settings does
   not cancel a shell in the background. Deleting its session or closing zz stops
   the active command. A crash leaves a readable interrupted response on restart,
   not a re-executed command.
@@ -340,7 +340,7 @@ caches are saved with zz's session metadata. Context warnings start above 70%.
   followed by the retained recent messages. Older messages remain in SQLite's
   audit history; they are no longer part of the active transcript/model context.
   Compaction never resets usage/cost totals, and summarization usage is included.
-- Escape in an open session, or `/stop` for an open/selected session, cancels active
+- `/stop` for an open/selected session cancels active
   summarization as well as any running response. Cancelling only a compaction does
   not mark an otherwise idle conversation stopped. Already committed summaries
   are not undone. Closing zz checkpoints unfinished compactions for restart.
@@ -386,28 +386,86 @@ Undo is session-level recovery, not a replacement for Git or backups.
 
 ## Compact Activity
 
-Tool calls and results are combined into one collapsed row, showing the tool,
-path/command, running/done/error status, and duration when available. `read` calls
-for `SKILL.md` are labeled `Skill <directory name>`; that reports a skill-file
-read, not a guarantee that every instruction was followed.
+The conversation uses `❯` for user prompts, `●` for assistant replies and tool
+headings, and `⎿` for results. Sent user prompts use literal text on a full-width
+light-grey background with dark text, including wrapped and blank lines. Assistant
+replies keep the terminal background and Markdown formatting, including code
+fences, lists and tables. Tool calls
+and results stay paired in one compact block, updating in place while running.
 
 ```text
-    [+] Skill frontend-design                  done 12ms
-    [+] bash npm test                          running
+❯ Fix greet() for empty names and add a test.
+
+✻ Thinking...
+
+● I'll check the function and add a test.
+
+● Read(src/greet.ts)
+  ⎿ Read 3 lines
+
+● Update(src/greet.ts)
+  ⎿ Added 1 line, removed 1 line
+     1 export function greet(name: string) {
+    -2   return name;
+    +2   return name.trim() || "World";
+     3 }
+
+● Write(src/greet.test.ts)
+  ⎿ Wrote 3 lines
+      1 test("empty names", () => {
+      2   expect(greet("")).toBe("World");
+      3 });
+
+● Bash
+  ⎿ Ran 1 shell command (/expand)
+
+● Fixed empty names and added a regression test. Tests: 1 passed.
 ```
 
+Edit diffs come from the SDK result, not guessed changes; additions are green and
+removals red, including wrapped continuation rows. Successful writes show all
+numbered content; every edit diff hunk stays visible without expansion. Collapsing
+a tool hides only its extra details, never its code changes. Older edits without
+SDK diff metadata show their applied replacement fragments when retained, with
+no invented file context or line numbers. Agent Bash/PowerShell commands and stdout stay hidden
+until expansion, including while running; a long heredoc never becomes a heading.
+Errors, interruptions, pending/running states, truncation and continuation
+messages remain explicit. Failed/interrupted mutations never get a success preview.
+`read` calls for `SKILL.md` are labeled `Skill <directory name>`; that reports a
+skill-file read, not a guarantee that every instruction was followed.
+The [response inventory](docs/tui-rendering.md) documents every currently supported
+message, tool, question, shell and session-state scenario and its test coverage.
+
+Adjacent routine reads and shell calls fold into one expandable line:
+
+```text
+● Read 1 file, ran 1 shell command (/expand)
+● Read 2 files, running 1 shell command (/expand)
+```
+
+Groups do not cross assistant/user/thinking messages, edits, writes, skills,
+questions, compaction, images, warnings, errors or interruptions. File counts
+use distinct path strings; shell counts are tool invocations, not the individual
+commands inside a script. Grouping is not a read-only/safety classification.
+Errors leave the group and remain visible. Tool headings stay on one row;
+compact diagnostics prioritize errors/warnings and show at most two short lines.
+User-entered `!command` output remains visible as local shell history.
+See [research and differences from Claude Code](docs/tui-rendering.md#claude-code-research)
+for the official sources behind this display policy.
+
 Inside a session:
-- Click a tool row to expand/collapse its arguments, output, and details.
-- Tab or Ctrl+N/P selects a tool; Space or Enter toggles it with an
+- Click a tool heading, preview, or group to expand/collapse its arguments, output, and details.
+- Tab or Ctrl+N/P selects a tool or group; Space or Enter toggles it with an
   empty composer. Right expands; Space/Enter collapses again. Left or Ctrl+H with an empty
   composer returns to the dashboard without cancelling work. Text in the composer still
   behaves as ordinary text and Enter sends it.
 - `/expand` and `/collapse` show/hide all tool details. Page Up/Down scrolls long
-  output. Expansion survives streaming updates and resets when switching sessions.
+  output. Expanding a group reveals all its member calls. Expansion survives
+  streaming updates and resets when switching sessions.
 
-Activity is presentation only: collapsed output is still retained for the model.
+Activity is presentation only: compact previews do not change retained output or model context.
 
-The transcript ends with a shimmering `✻ Working` while a task runs. On completion,
+The transcript ends with a shimmering working/thinking, retry, or stopping indicator while a task runs. On completion,
 it shows e.g. `✻ Worked for 3s · done 3:22 PM`, using your local time. Timing is
 saved per session and resets with each idle-session reply; queued follow-ups keep
 the current work timer running until the queue finishes. Failures and input requests are
@@ -426,28 +484,33 @@ labelled accordingly. Set `ZZ_REDUCED_MOTION=1` to disable shimmer animation
   `/help` lists the current view's commands plus the shortcut reference;
   `/skills` opens the skill picker. Manually entering a transcript command outside
   an open session shows a notice instead of starting a task.
+- Type `$` at the start of a prompt to search skills for that project. Arrows or
+  Ctrl+N/P select; Tab or Enter fills `$skill-name ` without sending. Add your
+  request, then press Enter to invoke it. This also works in peek replies.
 - Type `@` to find files in the selected project's directory. Recursive search
   uses an existing `fd` / `fdfind` on PATH or Pi's installed copy; zz never downloads
   it. Without fd, `@` still completes directory/file prefixes (e.g. `@src/`).
 - Press Tab to complete a path at the cursor, including `./`, `../`, `~/`, absolute
   paths, and quoted paths with spaces. Peek replies use that session's project.
-- With suggestions open, arrows or Ctrl+N/P select; Tab or Enter fills the draft
-  **without sending**. Press Enter again to run a command or send the prompt.
-  Escape dismisses suggestions first, preserving the draft, before leaving the view.
+- With suggestions open, arrows or Ctrl+N/P select; Tab fills the draft
+  **without sending**. Enter immediately runs the selected slash command.
+  Skill and file/path suggestions only fill the draft; press Enter again to send the prompt.
+  Escape dismisses suggestions first, preserving the draft without stopping work.
   Outside completion, existing project and tool navigation shortcuts are unchanged.
 
 Text-file references insert paths, not file contents; ask the agent to read them
 when needed. Explicit `@` image references attach image content on send. Peek
-replies offer file/path completion and clipboard images, not dashboard commands.
+replies offer skill/file/path completion and clipboard images, not dashboard commands.
 
 ## Skills
 
 - `/skills` opens a searchable picker for the selected project (or open session).
-  Selecting a skill fills `/skill:name ` in the composer; add your request and
+  Selecting a skill fills `$skill-name ` in the composer; add your request and
   press Enter to load it.
-- `/skill:name [request]` explicitly loads the skill instructions into the model's
+- `$skill-name [request]` explicitly loads the skill instructions into the model's
   input, including skills marked `disable-model-invocation`. The transcript keeps
   your short command and a collapsed skill card with the loaded text.
+  `/skill:name [request]` remains supported as a compatibility alias.
 - Available skill names, descriptions, and paths are also advertised to the model
   automatically. It can read a matching skill as needed. Disabled automatic
   invocation skills are excluded from this advertisement.
@@ -467,7 +530,7 @@ Opening a chat starts at the bottom. While you remain there, new messages and
 streamed text keep the viewport at the end. Scrolling up with the wheel, scrollbar,
 or Page Up pauses following so new output does not move what you are reading.
 
-Click **Scroll to bottom**, press Ctrl+End, or enter `/bottom` to jump to the end
+Click **Scroll to bottom** or enter `/bottom` to jump to the end
 and resume following. Scrolling back to the bottom manually also resumes following.
 The jump control appears only when a chat is scrolled away from the end. Project
 and session lists never follow chat output.
@@ -511,7 +574,7 @@ and session lists never follow chat output.
   The transcript shows queued messages separately until they enter the conversation;
   the reply footer and peek show the queue count. Queued replies survive restart,
   including replies sent while the initial conversation is still starting.
-  Escape in the session or `/stop` cancels the active work and withdraws queued replies.
+  `/stop` cancels the active work and withdraws queued replies.
   If a run fails, Pi retains the queue until another reply resumes processing.
 - In an open session or peek reply, ↑ recalls earlier sent prompts from that
   session; ↓ moves forward and restores your unsent draft after the newest entry.
@@ -524,20 +587,27 @@ and session lists never follow chat output.
   Save and exit (`:wq` in Vim) to return the text to the composer without sending.
   Use a waiting command for GUI editors (for example, `EDITOR="code --wait"`).
   Editor failures leave the original draft intact; temporary draft files are removed.
-- Ctrl+O switches to project management. `a` adds an existing directory;
-  Enter selects a project and returns to sessions. `~` paths are supported.
+- `/projects` opens project management. `a` adds an existing directory;
+  Enter selects a project and returns to sessions; Escape returns without changing
+  the project. `~` paths are supported.
+- Shift+Up/Down moves the selected dashboard session within its project. The first
+  move saves that project's visible session order, which remains stable as session
+  statuses change and survives restart. New sessions appear above the saved order.
+- Ctrl+R edits the selected dashboard session's name inline, with the cursor at the
+  end. Enter saves; Escape cancels. Your task draft stays intact. Names survive
+  restart and are not overwritten by background title generation.
 - Ctrl+X on a session replaces its row preview with **ctrl+x again to delete** in red (no popup).
   Any other key cancels. Deleting stops its active work and removes it from the list.
 - Ctrl+X on a project marks only its session rows for deletion in red; the project header stays unchanged.
   Ctrl+X again stops and deletes all its sessions, keeping the project in the list.
   This also works in project management. Any other key cancels. Project files are never deleted.
-- Escape dismisses suggestions/dialogs first. In a session it stops active model
-  and tool work, preserves history and your draft, and stays in the session.
+- Escape dismisses suggestions/dialogs first; otherwise, in an open session it
+  triggers `/stop`, preserving history and your draft and staying in the session.
 - Left Arrow or Ctrl+H returns to the dashboard only when the composer is empty.
   With text, normal editing behavior is preserved. Going back does not stop a running task.
-- `/stop` stops the open or selected session without deleting it. Repeated Escape
-  while stopping does not leave the session. Reply when stopped to continue with
-  the same conversation; stopped work is not automatically resumed on restart.
+- `/stop` stops the open or selected session without deleting it. Reply when stopped
+  to continue with the same conversation; stopped work is not automatically resumed
+  on restart.
 - Page Up/Down scrolls transcripts and peeks. Model, thinking, context and cost
   stay below the composer; important notices stay above it. `?` is ordinary draft
   text, not a shortcut toggle. `/help` opens the full shortcut reference.
@@ -550,11 +620,88 @@ happened. Once idle, `/undo` lets you choose a checkpoint to restore tracked fil
 edits and conversation; shell-command changes and external effects remain.
 
 `*` means working, `?` needs input, `.` completed, `!` failed, and `-` paused.
-Agents are instructed to use the explicit `ask_user` tool whenever they expect an
-answer, including conversational/random questions, clarification, decisions, and
-approval requests. These all enter `needs-input` until you reply. Rhetorical,
-quoted, or example questions do not require the tool; a question mark in ordinary
-prose alone does not change the session state.
+Agents use `ask_question` by default whenever they expect a conversational answer,
+including clarification, decisions, approval requests, and casual questions. It
+shows the question in chat and keeps the normal composer available for your reply.
+
+Use `ask_multiple_questions` for structured choices or related questions that
+benefit from a wizard. Only this tool replaces the composer with a question form.
+Both tools enter `needs-input` and pause work until you reply. Rhetorical, quoted,
+or example questions do not require either tool; a question mark in ordinary prose
+alone does not change the session state.
+
+### Question Wizard
+
+Opening or peeking a session awaiting an `ask_multiple_questions` response opens
+its wizard in place of the composer, not in a popup. A direct `ask_question` never
+opens the wizard. The transcript stays visible and scrollable above it. The wizard
+collects one or more structured questions with these controls:
+
+- `radio`: numbered single choices, with required descriptions on indented lines underneath.
+- `select`: an alias for the same single-choice list; no searching or filtering.
+- `multiselect`: numbered `[x]` / `[ ]` checkboxes; Space toggles options, and a separate `Next` action continues.
+- `input`: a free-text answer.
+
+Each choice question has at most five options total, including the editable custom
+answer row. With `allowOther` enabled (the default), supply up to four listed
+options; with it disabled, supply up to five. Every listed option needs a concise,
+nonempty `description`. The composer grows to show all options and descriptions
+at once instead of using a scrollable option viewport. On shorter terminals it
+removes blank spacing first, never option descriptions. Older saved options that
+lack descriptions show `No description provided.` rather than invented details.
+
+Use arrows to browse and Enter to choose or activate an action. Tab moves to the
+next question; Shift+Tab (or Ctrl+B) goes back, preserving answers and drafts.
+These keys navigate the wizard instead of completing text.
+You may skip questions with Tab, but unanswered questions are flagged on the final
+`Submit` step and prevent submission. That last step reviews every answer and
+provides explicit `Submit answers` and `Cancel` choices. Arrows or Ctrl+N/Ctrl+P
+select between those choices; Enter activates the selected action. Tab never sends
+answers; only activating `Submit answers` sends them together to the same session.
+No model requests run between steps. Submitted answers appear in the transcript
+as a compact question-and-answer summary using option labels, not a raw JSON user
+message. The structured input sent to the agent remains unchanged; saved replies
+use the same readable rendering after reopening.
+
+Choice questions include an inline `type something` row unless the agent sets
+`allowOther: false`. Move to or click that row and type directly without opening a
+separate input screen. A multiselect custom answer automatically checks when it
+has text and unchecks when cleared. Move away and back to use Space to toggle its
+checkbox without deleting its text; spaces entered while typing remain ordinary
+spaces.
+
+Escape returns to the normal composer without answering or stopping the session;
+any unsent composer draft is kept. `/answer` reopens the inline wizard for the open
+or selected session; question drafts survive closing and reopening
+within this zz instance (up to 20 recent forms), not a restart. You can also reply
+normally instead of using the form. Unanswered questions survive restart through
+the durable tool history. Questions in other sessions never steal focus.
+
+`ask_question` accepts `{ "question": "Your question?" }` and waits for a plain chat
+reply. `ask_multiple_questions` requires a title and one to twelve uniquely
+identified steps. The old `ask_user` tool is no longer advertised, but its saved
+history remains readable: old plain questions stay in chat, and old structured
+question sets still open their wizard.
+
+Example `ask_multiple_questions` arguments:
+
+```json
+{
+  "question": "Build preferences",
+  "questions": [
+    {
+      "id": "target",
+      "question": "What should I build?",
+      "type": "radio",
+      "options": [
+        { "value": "cli", "label": "CLI", "description": "A terminal app" },
+        { "value": "web", "label": "Website", "description": "A browser app" }
+      ]
+    },
+    { "id": "name", "question": "Project name?", "type": "input" }
+  ]
+}
+```
 
 ## Persistence And Execution
 
@@ -629,7 +776,7 @@ npm test
 Tests cover project scoping, peek/reply/open, project removal and restoration,
 double-confirm deletion, narrow and wide-character rendering, real durable
 storage and tools with an offline test provider, interrupted-run recovery, skill
-discovery/loading, thinking cycling, follow-end/jump-to-bottom scrolling, and
+discovery/loading, slash-command model/thinking controls, follow-end/jump-to-bottom scrolling, and
 context/usage accounting, title overhead, restore, and narrow usage dialogs.
 Compaction tests cover manual instructions, no-ops, concurrent responses, history
 and spend retention, cancellation, restart, background/blocking thresholds, overflow

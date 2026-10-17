@@ -28,25 +28,27 @@ Usage: zz [project-directory] [--model provider/model-id] [--thinking level] [--
 New tasks run in the selected project. Up/down or ctrl+p/ctrl+n navigates the list.
 With an empty composer: enter opens a session; space peeks and lets you reply.
 ctrl+j inserts a newline; enter sends. ctrl+g edits the draft in $VISUAL/$EDITOR (default vim).
-ctrl+o manages projects. ctrl+x twice deletes a session or all sessions in the selected project. ctrl+c quits.
+/projects manages projects; Escape returns to the dashboard.
+On the dashboard, shift+up/down reorders sessions within a project; ctrl+r renames the selected session.
+ctrl+x twice deletes a session or all sessions in the selected project. ctrl+c quits.
 If shutdown stalls, press ctrl+c again to force exit (automatic after 5 seconds).
-Inside a session, Escape stops running work and stays in the session.
+Escape dismisses suggestions and dialogs without stopping running work; use /stop.
 Left Arrow returns to the dashboard when the composer is empty; work continues.
 /settings (or /config) configures busy replies, reasoning display and auto-compaction token budgets.
 /stop cancels the open or selected session without deleting its history.
 /copy [N] copies the Nth-latest assistant or shell response from the open or selected session (default 1).
 !command runs a local shell in this project (e.g. !pwd), without sending it to the model.
-Shell output streams inline as a saved response. Escape stops the shell; /stop stops all work in that session.
+Shell output streams inline as a saved response. /stop stops all work in that session.
 /compact [instructions] summarizes older context, even with auto-compaction Off in /settings.
 /undo opens a checkpoint picker; Enter restores the selection, Escape cancels (not shell effects).
 
 Uses your existing Pi login and saved default model. No separate API key needed.
 Model override: --model or ZZ_MODEL (provider/model-id).
 Thinking override: --thinking or ZZ_THINKING (off/minimal/low/medium/high/xhigh/max).
-In the UI: /model (ctrl+l), /thinking (ctrl+t). Open a session to change it;
+In the UI: /model, /thinking. Open a session to change it;
 on the dashboard these controls change defaults for new sessions.
-Shift+Tab cycles thinking. /skills lists skills; /skill:name [task] loads one.
-Ctrl+End or /bottom jumps to the newest chat output and resumes following it.
+/skills lists skills; $skill-name [task] loads one (type $ to autocomplete).
+/bottom jumps to the newest chat output and resumes following it.
 /login [provider] signs in; /logout [provider] removes credentials shared with Pi.
 Ctrl+V or dragged paths stage images; @image.png attaches on send.
 Backspace with empty draft text removes the last staged image.

@@ -82,6 +82,8 @@ export type SessionStatus = "working" | "needs-input" | "completed" | "failed" |
 export interface Project {
   id: string;
   path: string;
+  /** Manual dashboard order; newly created sessions appear before these IDs. */
+  sessionOrder?: string[];
 }
 
 export interface Message {
@@ -142,6 +144,8 @@ export interface Session {
   agent?: AgentSettings;
   projectId: string;
   title: string;
+  /** Protects explicitly saved names from pending automatic title generation. */
+  titleRenamed?: boolean;
   status: SessionStatus;
   /** Explicit cancellation is not checkpoint recovery: wait for the user's next reply. */
   stopped?: boolean;
@@ -187,13 +191,17 @@ const order: Record<SessionStatus, number> = {
 };
 
 export function rows(state: State, projectsOnly = false): Row[] {
-  return state.projects.flatMap((project): Row[] => [
-    { kind: "project", project },
-    ...(projectsOnly ? [] : state.sessions
-      .filter((session) => session.projectId === project.id)
-      .sort((a, b) => order[displayStatus(a)] - order[displayStatus(b)] || b.createdAt - a.createdAt)
-      .map((session): Row => ({ kind: "session", project, session }))),
-  ]);
+  return state.projects.flatMap((project): Row[] => {
+    const manual = new Map(project.sessionOrder?.map((id, index) => [id, index]));
+    return [
+      { kind: "project", project },
+      ...(projectsOnly ? [] : state.sessions
+        .filter((session) => session.projectId === project.id)
+        .sort((a, b) => (manual.get(a.id) ?? -1) - (manual.get(b.id) ?? -1)
+          || order[displayStatus(a)] - order[displayStatus(b)] || b.createdAt - a.createdAt)
+        .map((session): Row => ({ kind: "session", project, session }))),
+    ];
+  });
 }
 
 export function rowId(row: Row): string {

@@ -2,12 +2,14 @@ import { access } from "node:fs/promises";
 import { constants } from "node:fs";
 import { delimiter, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { CombinedAutocompleteProvider, type AutocompleteProvider, type SlashCommand } from "@earendil-works/pi-tui";
+import { CombinedAutocompleteProvider, fuzzyFilter, type AutocompleteProvider, type SlashCommand } from "@earendil-works/pi-tui";
 import { oneLine } from "./format.js";
+import { SkillCatalog } from "./skills.js";
+import type { SkillOption } from "./model.js";
 
 export interface DiscoveryContext {
   cwd: string;
-  /** Peek replies offer files, but do not dispatch dashboard commands. */
+  /** Peek replies offer files and skills, but do not dispatch dashboard commands. */
   commands: boolean;
   session: boolean;
   /** A session row is selected on the dashboard (not a project header). */
@@ -20,9 +22,11 @@ export function composerCommands(session: boolean, selectedSession = false): Sla
     { name: "thinking", description: session ? "Choose this session's thinking level" : "Choose the thinking level for new tasks" },
     { name: "skills", description: "Find and load a skill" },
     { name: "settings", description: "Configure replies, model, reasoning and auto-compaction" },
+    { name: "projects", description: "Manage project directories" },
     { name: "login", description: "Sign in to a provider (credentials shared with Pi)" },
     { name: "logout", description: "Remove stored provider credentials from zz and Pi" },
     ...(session || selectedSession ? [
+      { name: "answer", description: "Reopen the pending question form" },
       { name: "copy", description: "Copy response text (/copy [N], 1 = latest)" },
       { name: "session", description: `Context, tokens, cache and estimated cost for the ${session ? "open" : "selected"} session` },
       { name: "compact", description: `Summarize older context in the ${session ? "open" : "selected"} session (optional instructions)` },
@@ -52,27 +56,45 @@ export async function findFd(): Promise<string | null> {
 
 /** Pi supplies filtering, quoting, cancellation and completion insertion. */
 export class ComposerDiscovery implements AutocompleteProvider {
+  readonly triggerCharacters = ["$"];
   private readonly provider: CombinedAutocompleteProvider;
   private readonly fd: Promise<string | null>;
   private files?: CombinedAutocompleteProvider;
+  private skillOptions?: Promise<SkillOption[]>;
   pending = false;
   onRequest?: () => void;
 
-  constructor(readonly context: DiscoveryContext, fd: Promise<string | null> = findFd()) {
+  constructor(readonly context: DiscoveryContext, fd: Promise<string | null> = findFd(),
+    private readonly skills: Pick<SkillCatalog, "list"> = new SkillCatalog()) {
     this.provider = new CombinedAutocompleteProvider(context.commands ? composerCommands(context.session, context.selectedSession) : [], context.cwd);
     this.fd = fd;
   }
+
+  resetSkills(): void { this.skillOptions = undefined; }
 
   async getSuggestions(...args: Parameters<AutocompleteProvider["getSuggestions"]>) {
     const [lines, line, col, options] = args;
     this.pending = true;
     this.onRequest?.();
     try {
-      // Only resolve fd for @ search; command discovery never waits for filesystem discovery.
+      // Only resolve fd for @ search; command and skill discovery never wait for it.
       const before = (lines[line] ?? "").slice(0, col);
+      const skillPrefix = line === 0 ? /^\s*(\$[^\s]*)$/.exec(before)?.[1] : undefined;
       const at = /(?:^|[\s([<{`])(@(?:"[^"]*|[^\s"]*))$/.exec(before)?.[1];
       let suggestions;
-      if (at) {
+      if (skillPrefix) {
+        // Refresh on a new $ menu, then reuse its catalog while filtering.
+        if (!this.skillOptions || skillPrefix === "$") {
+          this.skillOptions = this.skills.list(this.context.cwd).catch((error: unknown) => {
+            this.skillOptions = undefined;
+            throw error;
+          });
+        }
+        const matches = fuzzyFilter(await this.skillOptions, skillPrefix.slice(1), (skill) => skill.name);
+        suggestions = matches.length ? { prefix: skillPrefix, items: matches.map((skill) => ({
+          value: `$${skill.name}`, label: `$${skill.name}`, description: skill.description,
+        })) } : null;
+      } else if (at) {
         const fd = await this.fd;
         if (options.signal.aborted) return null;
         if (fd) {
@@ -107,6 +129,12 @@ export class ComposerDiscovery implements AutocompleteProvider {
 
   applyCompletion(...args: Parameters<AutocompleteProvider["applyCompletion"]>) {
     const [lines, cursorLine, cursorCol, item, prefix] = args;
+    if (prefix.startsWith("$")) {
+      const copy = [...lines];
+      const before = (lines[cursorLine] ?? "").slice(0, cursorCol - prefix.length);
+      copy[cursorLine] = before + item.value + " " + (lines[cursorLine] ?? "").slice(cursorCol);
+      return { lines: copy, cursorLine, cursorCol: before.length + item.value.length + 1 };
+    }
     // Pi's inserter treats /foo at column zero as a command even when it is a path.
     if (prefix.startsWith("/") && (item.value.startsWith("/") || item.value.startsWith('"/'))) {
       const copy = [...lines];
@@ -119,6 +147,8 @@ export class ComposerDiscovery implements AutocompleteProvider {
   }
 
   shouldTriggerFileCompletion(...args: Parameters<NonNullable<AutocompleteProvider["shouldTriggerFileCompletion"]>>) {
+    const [lines, line, col] = args;
+    if (line === 0 && /^\s*\$[^\s]*$/.test((lines[line] ?? "").slice(0, col))) return true;
     return this.provider.shouldTriggerFileCompletion(...args);
   }
 }

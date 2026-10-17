@@ -20,6 +20,10 @@ import { image, png } from "./image-fixtures.js";
 import { SkillCatalog } from "../src/skills.js";
 import { UndoDoc } from "../src/undo.js";
 import { temporary, tick } from "./helpers.js";
+import { pendingQuestion } from "../src/questions.js";
+import { structuredQuestions } from "./question-fixtures.js";
+import { Transcript } from "../src/transcript.js";
+import { stripTerminalSequences } from "@earendil-works/pi-tui";
 
 async function until(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 3000;
@@ -125,9 +129,9 @@ function models(options: { pause?: boolean; finish?: (done: (failure?: string, c
         : last?.content === "long-shell"
           ? [{ type: "toolCall", id: "sleep-call", name: "bash", arguments: { command: "printf 'SHELL_STARTED\\n'; sleep 30; printf 'SHOULD_NOT_FINISH\\n'" } }]
         : last?.content === "Ask a random question"
-          ? [{ type: "toolCall", id: "random-question", name: "ask_user", arguments: { question: "What is your favorite useless skill?" } }]
+          ? [{ type: "toolCall", id: "random-question", name: "ask_question", arguments: { question: "What is your favorite useless skill?" } }]
         : typeof last?.content === "string" && last.content.includes("ask")
-          ? [{ type: "toolCall", id: `ask-${Date.now()}`, name: "ask_user", arguments: { question: "Retry or stop?" } }]
+          ? [{ type: "toolCall", id: `ask-${Date.now()}`, name: "ask_question", arguments: { question: "Retry or stop?" } }]
           : typeof last?.content === "string" && last.content.includes("read")
             ? [{ type: "toolCall", id: `read-${Date.now()}`, name: "read", arguments: { path: "marker.txt" } }]
             : [{ type: "text", text: "Recovered answer" }]);
@@ -187,23 +191,75 @@ test("durable conversations execute tools concurrently in their own cwd and reta
   } finally { await engine.close(); temp.cleanup(); }
 });
 
-test("ask_user marks needs input and a reply resumes the same conversation", async () => {
+test("ask_question waits in chat, restores without a form, and resumes the same conversation", async () => {
   const temp = temporary();
   const store = new Store(temp.root); const project = store.addProject(temp.root);
   const s = session(project, "question"); store.state.sessions.push(s);
-  const engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models());
+  let engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models());
   try {
     await engine.run(s, project, "ask", () => {});
     assert.equal(s.status, "needs-input");
     assert.ok(s.work?.finishedAt);
     assert.equal(s.messages.at(-1)?.text, "Retry or stop?");
-    await engine.run(s, project, "retry", () => {});
-    assert.equal(s.status, "completed");
-    assert.equal(s.messages.filter((m) => m.role === "user").length, 2);
+    assert.equal(pendingQuestion(s), undefined);
+    const conversationId = s.conversationId;
+    await engine.close();
+    const restored = new Store(store.root);
+    engine = await openEngine(restored, { provider: "test", modelId: "mock" }, () => {}, models());
+    await engine.restore(() => {});
+    const loaded = restored.state.sessions[0]!;
+    assert.equal(loaded.status, "needs-input");
+    assert.equal(pendingQuestion(loaded), undefined);
+    assert.equal(lastReply(loaded), "Retry or stop?");
+    await engine.run(loaded, project, "retry", () => {});
+    assert.equal(loaded.status, "completed");
+    assert.equal(loaded.conversationId, conversationId);
+    assert.equal(loaded.messages.filter((m) => m.role === "user").length, 2);
   } finally { await engine.close(); temp.cleanup(); }
 });
 
-test("conversational questions are instructed to use ask_user and wait for a reply", async () => {
+test("ask_multiple_questions persists all steps and resumes after a single answer submission", async () => {
+  const temp = temporary();
+  const store = new Store(temp.root); const project = store.addProject(temp.root);
+  const s = session(project, "structured"); store.state.sessions.push(s);
+  const requests: Context[] = [];
+  const provider = models({ context: (context) => requests.push(context), reply: (context) => context.messages.at(-1)?.content === "Build"
+    ? [{ type: "toolCall", id: "preferences", name: "ask_multiple_questions", arguments: structuredQuestions }]
+    : [{ type: "text", text: "Ready to build" }] });
+  let engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, provider);
+  try {
+    await engine.run(s, project, "Build", () => {});
+    assert.equal(s.status, "needs-input");
+    assert.deepEqual(pendingQuestion(s)?.questions, structuredQuestions.questions);
+    assert.match(lastReply(s), /CLI: A terminal app/);
+    const id = pendingQuestion(s)!.id;
+    await engine.close();
+    const restored = new Store(store.root);
+    engine = await openEngine(restored, { provider: "test", modelId: "mock" }, () => {}, provider);
+    await engine.restore(() => {});
+    const loaded = restored.state.sessions[0]!;
+    assert.equal(pendingQuestion(loaded)?.id, id);
+    assert.deepEqual(pendingQuestion(loaded)?.questions, structuredQuestions.questions);
+    const controller = new Controller(restored, engine);
+    assert.equal(controller.answerQuestions(loaded.id, id, { target: "cli", language: "ts", features: ["tests"], name: "builder" }), true);
+    await until(() => loaded.status === "completed");
+    assert.equal(pendingQuestion(loaded), undefined);
+    assert.equal(loaded.messages.filter((message) => message.role === "user").length, 2);
+    assert.equal(lastReply(loaded), "Ready to build");
+    const input = requests.at(-1)!.messages.findLast((message) => message.role === "user")!.content;
+    assert.equal(input, loaded.messages.findLast((message) => message.role === "user")!.text);
+    assert.match(String(input), /Answers to: Build preferences/);
+    assert.match(String(input), /"answer": "cli"/);
+    controller.mode = "session"; controller.openedSessionId = loaded.id;
+    const rendered = new Transcript(controller, () => {}).render(160).map(stripTerminalSequences).join("\n");
+    assert.match(rendered, /User answered the agent's questions:/);
+    assert.match(rendered, /What should I build\? \u2192 CLI/);
+    assert.doesNotMatch(rendered, /Answers to:|"answer"/);
+    await controller.close();
+  } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("conversational questions are instructed to use ask_question and wait for a reply", async () => {
   const temp = temporary();
   const store = new Store(temp.root); const project = store.addProject(temp.root);
   const s = session(project, "random-question"); store.state.sessions.push(s);
@@ -217,11 +273,14 @@ test("conversational questions are instructed to use ask_user and wait for a rep
     const system = contexts[0]!.messages.filter((m) => m.role === "system");
     const instructions = [contexts[0]!.systemPrompt,
       ...system.flatMap((m) => [m.content, ...Object.values(m.sections ?? {})])].join("\n");
-    assert.match(instructions, /Use ask_user whenever you ask the user a question and expect an answer/);
+    assert.match(instructions, /Use ask_question whenever you ask the user a question and expect an ordinary conversational answer/);
     assert.match(instructions, /including conversational or random questions/);
-    assert.match(instructions, /Do not use ask_user for rhetorical questions, quoted questions, or examples/);
-    const tool = [...(contexts[0]!.tools ?? []), ...system.flatMap((m) => m.toolsAdded ?? [])]
-      .find((tool) => tool.name === "ask_user");
+    assert.match(instructions, /Do not use ask_question or ask_multiple_questions for rhetorical questions, quoted questions, or examples/);
+    const tools = [...(contexts[0]!.tools ?? []), ...system.flatMap((m) => m.toolsAdded ?? [])];
+    const tool = tools.find((tool) => tool.name === "ask_question");
+    assert.deepEqual([...new Set(tools.filter((tool) => tool.name.startsWith("ask_")).map((tool) => tool.name))].sort(), ["ask_multiple_questions", "ask_question"]);
+    assert.match(instructions, /Use ask_multiple_questions only when structured choices/);
+    assert.match(tool?.description ?? "", /normal composer stays available/);
     assert.match(tool?.description ?? "", /including conversational or random questions/);
     assert.match(tool?.description ?? "", /needs-input/);
     assert.equal(s.status, "needs-input");
@@ -421,11 +480,11 @@ test("skills are advertised to the model and explicit loads are compact durable 
   const contexts: Context[] = [];
   let engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models({ context: (context) => contexts.push(context) }), "off", skills);
   try {
-    await engine.run(s, project, "/skill:fixture summarize", () => {});
+    await engine.run(s, project, "$fixture summarize", () => {});
     assert.equal(s.status, "completed");
     assert.match(JSON.stringify(contexts[0]), /available_skills/);
     assert.match(JSON.stringify(contexts[0]), /ALPHA_INSTRUCTION/);
-    assert.equal(s.messages.find((m) => m.role === "user")?.text, "/skill:fixture summarize");
+    assert.equal(s.messages.find((m) => m.role === "user")?.text, "$fixture summarize");
     const card = s.messages.find((m) => m.tool?.name === "load_skill")!;
     assert.equal(card.tool?.arguments.name, "fixture");
     assert.match(card.tool!.output, /ALPHA_INSTRUCTION/);
@@ -517,6 +576,40 @@ test("new sessions receive a persisted short title without adding title prompts 
     await engine.run(restored.state.sessions[0]!, project, "another reply", () => {});
     assert.equal(restored.state.sessions[0]?.title, "Improve session naming");
   } finally { await engine.close(); temp.cleanup(); }
+});
+
+test("manual session names are not overwritten by pending or future title generation", { timeout: 5000 }, async () => {
+  for (const renameBeforeRun of [false, true]) {
+    const temp = temporary();
+    const store = new Store(temp.root); const project = store.addProject(temp.root);
+    const s = session(project, "fallback"); store.state.sessions.push(s);
+    let finishTitle: (() => void) | undefined;
+    let titleRequests = 0;
+    const engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models({
+      title: { pause: true, ignoreAbort: true, context: () => { titleRequests++; }, finish: (done) => { finishTitle = done; } },
+    }));
+    const controller = new Controller(store, engine);
+    const rename = () => {
+      controller.select(`session:${s.id}`);
+      // Saving even the unchanged fallback explicitly claims the name from the generator.
+      assert.equal(controller.renameSession(s.id, "fallback"), true);
+    };
+    try {
+      if (renameBeforeRun) rename();
+      await engine.run(s, project, "hello", () => {});
+      if (!renameBeforeRun) {
+        assert.ok(finishTitle);
+        rename();
+        finishTitle();
+        await until(() => !!s.titleUsage);
+        await tick();
+      }
+      assert.equal(titleRequests, renameBeforeRun ? 0 : 1);
+      assert.equal(s.title, "fallback");
+      assert.equal(new Store(temp.root).state.sessions[0]?.title, "fallback");
+      assert.equal(s.titleRenamed, true);
+    } finally { finishTitle?.(); await controller.close(); temp.cleanup(); }
+  }
 });
 
 test("title output is bounded and title errors or empty output retain the fallback", async () => {
@@ -1495,7 +1588,7 @@ test("durable requests load per-project instruction files, refresh edits/removal
     assert.match(requests[0]!, /GLOBAL_CONTEXT/); assert.match(requests[0]!, /CONTEXT_A_FIRST/);
     assert.match(requests[0]!, /CUSTOM_A_SYSTEM/); assert.match(requests[0]!, /CUSTOM_A_APPEND/);
     assert.doesNotMatch(requests[0]!, /CONTEXT_B_ONLY|GLOBAL_APPEND|Inspect before editing/);
-    assert.match(requests[0]!, /Use ask_user whenever/);
+    assert.match(requests[0]!, /Use ask_question whenever/);
     await engine.run(sessions[1]!, projects[1]!, "second", () => {});
     assert.match(requests[1]!, /CONTEXT_B_ONLY/); assert.match(requests[1]!, /GLOBAL_APPEND/);
     assert.doesNotMatch(requests[1]!, /CONTEXT_A_FIRST|CUSTOM_A_SYSTEM/);
@@ -1746,4 +1839,24 @@ test("manual compaction still runs when Off and uses configured recent-context a
     assert.equal(s.messages.find((m) => m.tool?.name === "compact")?.tool?.arguments.reason, "manual");
     assert.equal(s.status, "completed");
   } finally { await c.close(); temp.cleanup(); }
+});
+
+test("malformed direct questions and missing structured steps fail without pausing for a reply", async () => {
+  for (const [name, arguments_] of [["ask_question", { question: " " }], ["ask_multiple_questions", { question: "Missing steps" }]] as const) {
+    const temp = temporary();
+    const store = new Store(temp.root); const project = store.addProject(temp.root);
+    const s = session(project, name); store.state.sessions.push(s);
+    const engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models({
+      reply: (context) => context.messages.at(-1)?.role === "user"
+        ? [{ type: "toolCall", id: "invalid", name, arguments: arguments_ }]
+        : [{ type: "text", text: "Invalid question rejected." }],
+    }));
+    try {
+      await engine.run(s, project, "invalid tool arguments", () => {});
+      assert.equal(s.status, "completed");
+      assert.equal(pendingQuestion(s), undefined);
+      assert.ok(s.messages.some((message) => message.tool?.name === name && message.tool.status === "error"));
+      assert.equal(lastReply(s), "Invalid question rejected.");
+    } finally { await engine.close(); temp.cleanup(); }
+  }
 });

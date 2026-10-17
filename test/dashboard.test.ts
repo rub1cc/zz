@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import type { CompactionResult as DurableCompactionResult, TaskId } from "@earendil-works/pi-durable";
 import { stripTerminalSequences, TuiAltScreen, visibleWidth } from "@earendil-works/pi-tui";
 import { Controller } from "../src/controller.js";
@@ -10,6 +11,9 @@ import { rows, rowId, type CompactResult } from "../src/model.js";
 import { Store } from "../src/store.js";
 import { Dashboard, scrollToEndIndicator } from "../src/ui.js";
 import { UndoDialog } from "../src/undo-dialog.js";
+import { QuestionComposer } from "../src/question-composer.js";
+import { pendingQuestion } from "../src/questions.js";
+import { waitingSession } from "./question-fixtures.js";
 import { FakeEngine, FakeTerminal, temporary, tick } from "./helpers.js";
 
 function setup(writeClipboard?: (text: string) => Promise<void>) {
@@ -44,6 +48,35 @@ function assertFullyHighlighted(line: string, width: number): void {
   assert.equal(highlighted, false, "Highlight must not leak into the next row");
   assert.ok(line.endsWith("\x1b[39m\x1b[49m"), "Selection must restore default colors");
 }
+
+test("dashboard uses terminal edges for headers, composer and footer in every view", async () => {
+  const f = setup();
+  try {
+    f.c.send("Edge-to-edge layout"); await tick();
+    const session = f.store.state.sessions[0]!;
+    for (const mode of ["sessions", "projects", "session"] as const) {
+      f.c.mode = mode;
+      f.c.openedSessionId = mode === "session" ? session.id : undefined;
+      f.c.changed();
+      for (const width of [12, 24, 80, 120]) {
+        for (const height of [12, 24, 32]) {
+          f.terminal.columns = width; f.terminal.rows = height;
+          f.terminal.onResize(); f.tui.renderNow();
+          const lines = f.tui.getScreenLines().map(stripTerminalSequences);
+          assert.equal(lines.length, height);
+          assert.ok(lines.every((line) => visibleWidth(line) <= width));
+          const heading = mode === "projects" ? "Projects" : mode === "session" ? session.title : "0 awaiting";
+          assert.ok(lines[0]!.startsWith(heading.slice(0, 8)), `${mode} ${width}x${height}: ${JSON.stringify(lines[0])}`);
+          assert.ok(lines.at(-1)!.startsWith(mode === "projects" ? "Ctrl+x" : "test/mock"), `${mode} ${width}x${height}: ${JSON.stringify(lines.at(-1))}`);
+          const border = mode === "projects" ? "-".repeat(width)
+            : stripTerminalSequences(f.app.composer.render(width)[0]!);
+          assert.equal(visibleWidth(border), width);
+          assert.ok(lines.includes(border), "Divider must span the full terminal width");
+        }
+      }
+    }
+  } finally { await f.cleanup(); }
+});
 
 test("session titles stay complete and selected rows stay highlighted through wrapping and preview truncation", async () => {
   const f = setup();
@@ -230,7 +263,7 @@ test("empty composer space peeks and replies to the same session; enter opens", 
   } finally { await f.cleanup(); }
 });
 
-test("Escape stops once and stays in the session; Left only goes back with an empty composer", async () => {
+test("Escape triggers /stop once, preserves drafts, and Left requires an empty composer", async () => {
   const f = setup();
   try {
     f.c.send("running task"); await tick(); f.c.open();
@@ -241,6 +274,10 @@ test("Escape stops once and stays in the session; Left only goes back with an em
     const pending = new Promise<void>((resolve) => { finish = resolve; });
     f.engine.cancel = async (id) => { f.engine.cancelled.push(id); await pending; };
     f.terminal.onInput("\x1b");
+    assert.deepEqual(f.engine.cancelled, [session.id]);
+    assert.equal(session.status, "working");
+    assert.equal(f.app.composer.getValue(), "keep this draft");
+    assert.equal(f.app.composer.onSubmit?.("/stop"), "command");
     assert.equal(f.c.mode, "session"); assert.equal(f.c.notice, "Stopping...");
     f.terminal.onInput("\x1b");
     assert.deepEqual(f.engine.cancelled, [session.id]);
@@ -254,6 +291,30 @@ test("Escape stops once and stays in the session; Left only goes back with an em
     f.terminal.onInput("\x1b"); assert.equal(f.c.mode, "session");
     f.terminal.onInput("\x1b[D"); assert.equal(f.c.mode, "session");
     f.app.composer.setValue(""); f.terminal.onInput("\x1b[D"); assert.equal(f.c.mode, "sessions");
+  } finally { await f.cleanup(); }
+});
+
+test("Escape dismisses session suggestions and dialogs before stopping work", async () => {
+  const f = setup();
+  try {
+    f.c.send("running task"); await tick(); f.c.open();
+    const session = f.c.opened!; session.status = "working";
+    f.terminal.onInput("/he"); await delay(20);
+    assert.equal(f.app.composer.showingSuggestions, true);
+    f.terminal.onInput("\x1b");
+    assert.equal(f.app.composer.showingSuggestions, false);
+    assert.equal(f.app.composer.getValue(), "/he");
+    assert.deepEqual(f.engine.cancelled, []);
+    assert.equal(f.app.composer.onSubmit?.("/help"), "command");
+    assert.equal(f.c.dialog?.kind, "help");
+    f.terminal.onInput("\x1b");
+    assert.equal(f.c.dialog, undefined);
+    assert.deepEqual(f.engine.cancelled, []);
+    assert.equal(session.status, "working");
+    f.terminal.onInput("\x1b"); await tick();
+    assert.deepEqual(f.engine.cancelled, [session.id]);
+    assert.equal(f.app.composer.getValue(), "/he");
+    assert.equal(f.c.mode, "session");
   } finally { await f.cleanup(); }
 });
 
@@ -368,7 +429,7 @@ test("ctrl+n and ctrl+p navigate sessions and projects without changing the comp
     f.terminal.onInput("\x10"); assert.equal(f.c.selection, `project:${f.pa.id}`);
     f.terminal.onInput("\x10"); assert.equal(f.c.selection, `project:${f.pa.id}`);
     assert.equal(f.app.composer.getValue(), "draft task");
-    f.terminal.onInput("\x0f"); assert.equal(f.c.mode, "projects");
+    f.app.composer.onSubmit?.("/projects"); assert.equal(f.c.mode, "projects");
     f.terminal.onInput("\x0e"); assert.equal(f.c.project?.id, f.pb.id);
     f.terminal.onInput("\x10"); assert.equal(f.c.project?.id, f.pa.id);
     assert.equal(f.app.composer.getValue(), "draft task");
@@ -390,12 +451,13 @@ test("model/thinking pickers change new-session defaults or just the open sessio
     assert.equal(f.c.dialog, undefined);
     f.c.send("use configured model"); await tick();
     f.c.open(); f.tui.renderNow();
-    f.terminal.onInput("\x14"); await tick(); // ctrl+t
+    f.terminal.onInput("/thinking"); f.terminal.onInput("\r"); await tick();
     assert.equal(dialogKind(), "thinking");
     f.terminal.onInput("\x10"); f.terminal.onInput("\r"); await tick(); // wrap off -> high
     assert.equal(f.c.opened?.agent?.thinkingLevel, "high");
     assert.equal(f.engine.configuration().thinkingLevel, "off");
-    f.terminal.onInput("draft reply"); f.terminal.onInput("\x0c"); await tick(); // ctrl+l
+    f.terminal.onInput("draft reply");
+    assert.equal(f.app.composer.onSubmit?.("/model"), "command"); await tick();
     f.terminal.onInput("mock"); f.terminal.onInput("\r"); await tick();
     assert.equal(f.c.opened?.agent?.model?.modelId, "mock");
     assert.equal(f.engine.configuration().model?.modelId, "reasoner");
@@ -406,23 +468,25 @@ test("model/thinking pickers change new-session defaults or just the open sessio
   } finally { await f.cleanup(); }
 });
 
-test("shift+tab cycles supported thinking levels without losing drafts, including during a run", async () => {
+test("removed model/thinking shortcuts do not change settings or consume drafts", async () => {
   const f = setup();
   try {
     await f.c.configure({ model: { provider: "test", modelId: "reasoner" } });
-    f.terminal.onInput("keep this draft");
-    f.terminal.onInput("\x1b[Z"); await tick();
-    assert.equal(f.c.configuration.thinkingLevel, "low");
-    f.terminal.onInput("\x1b[Z"); f.terminal.onInput("\x1b[Z"); await tick();
-    assert.equal(f.c.configuration.thinkingLevel, "off");
-    assert.equal(f.app.composer.getValue(), "keep this draft");
-    assert.equal(f.c.dialog, undefined);
-    f.app.composer.setValue(""); f.c.send("start"); await tick(); f.c.open();
-    f.c.opened!.status = "working";
-    f.terminal.onInput("\x1b[Z"); await tick();
-    assert.equal(f.c.opened?.agent?.thinkingLevel, "low");
-    assert.equal(f.engine.configuration().thinkingLevel, "off");
-    assert.match(f.c.notice, /next model request/);
+    f.c.send("start"); await tick();
+    for (const mode of ["sessions", "projects", "session"] as const) {
+      f.c.mode = mode;
+      f.c.openedSessionId = mode === "session" ? f.store.state.sessions[0]!.id : undefined;
+      if (f.c.opened) f.c.opened.status = "working";
+      f.c.changed();
+      f.app.composer.setValue("keep this draft");
+      const configuration = structuredClone(f.c.configuration);
+      for (const key of ["\x0c", "\x14", "\x1b[Z"]) {
+        f.terminal.onInput(key); await tick();
+        assert.deepEqual(f.c.configuration, configuration);
+        assert.equal(f.app.composer.getValue(), "keep this draft");
+        assert.equal(f.c.dialog, undefined);
+      }
+    }
   } finally { await f.cleanup(); }
 });
 
@@ -432,15 +496,15 @@ test("skills picker fills an explicit skill command without creating a session",
     f.terminal.onInput("/skills"); f.terminal.onInput("\r"); await tick();
     assert.equal(f.c.dialog?.kind, "skills");
     f.terminal.onInput("test"); f.terminal.onInput("\r"); await tick();
-    assert.equal(f.app.composer.getValue(), "/skill:testing ");
+    assert.equal(f.app.composer.getValue(), "$testing ");
     assert.equal(f.store.state.sessions.length, 0);
     f.terminal.onInput("check these tests"); f.terminal.onInput("\r"); await tick();
-    assert.equal(f.engine.calls.at(-1)?.prompt, "/skill:testing check these tests");
+    assert.equal(f.engine.calls.at(-1)?.prompt, "$testing check these tests");
     assert.equal(f.engine.calls.at(-1)?.project.id, f.pb.id);
   } finally { await f.cleanup(); }
 });
 
-test("chat follows output only at the end and offers clickable and keyboard jump-to-bottom controls", async () => {
+test("chat follows output only at the end and offers click and /bottom instead of Ctrl+End", async () => {
   const f = setup();
   try {
     f.c.send("long conversation"); await tick();
@@ -467,7 +531,13 @@ test("chat follows output only at the end and offers clickable and keyboard jump
     assert.doesNotMatch(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Scroll to bottom/);
     f.terminal.onInput("\x1b[<64;4;6M"); f.tui.renderNow();
     assert.equal(f.app.scroll.isFollowingEnd, false);
-    f.terminal.onInput("\x1b[1;5F"); f.tui.renderNow();
+    const beforeRemovedShortcut = f.app.scroll.scrollTop;
+    for (const key of ["\x1b[1;5F", "\x1b[70;5u"]) {
+      f.terminal.onInput(key); f.tui.renderNow();
+      assert.equal(f.app.scroll.scrollTop, beforeRemovedShortcut);
+      assert.equal(f.app.scroll.isFollowingEnd, false);
+    }
+    f.app.composer.setValue("/bottom"); f.terminal.onInput("\r"); f.tui.renderNow();
     assert.equal(f.app.scroll.isFollowingEnd, true);
     f.terminal.rows = 24; f.terminal.onResize(); f.tui.renderNow();
     const resized = f.app.scroll.scrollTop;
@@ -487,7 +557,7 @@ test("chat follows output only at the end and offers clickable and keyboard jump
   } finally { await f.cleanup(); }
 });
 
-test("transcript wraps user messages in light grey without speaker labels or agent backgrounds", async () => {
+test("transcript uses prompt and response markers, literal user text, and Markdown assistant text", async () => {
   const f = setup();
   try {
     f.c.send("inspect project"); await tick(); f.c.open();
@@ -497,36 +567,35 @@ test("transcript wraps user messages in light grey without speaker labels or age
       { role: "assistant", text: "Here is the **summary**.", timestamp: 2 },
       { role: "error", text: "Something failed", timestamp: 3 },
     ];
-    const background = "\x1b[48;2;238;238;238m";
     const transcript = f.app.body.transcript;
     for (const width of [1, 4, 10, 24, 50, 120]) {
       const lines = transcript.render(width);
       assert.ok(lines.every((line) => visibleWidth(line) <= width));
-      if (width < 10) continue;
+      const background = "\x1b[48;2;238;238;238m";
       const userLines = lines.filter((line) => line.includes(background));
-      assert.ok(userLines.length >= 4);
+      assert.ok(userLines.length > 0);
       for (const line of userLines) {
-        assert.ok(line.startsWith(`  ${background}`));
-        assert.ok(line.endsWith("\x1b[49m"));
-        assert.equal(visibleWidth(line), width - 2);
+        assert.ok(line.startsWith(`${background}\x1b[38;2;32;32;32m`));
+        assert.ok(line.endsWith("\x1b[39m\x1b[49m"), "User styling must not leak into later rows");
+        assert.equal(visibleWidth(line), width, "Background covers wrapped and blank rows to the terminal edge");
       }
-      assert.equal(stripTerminalSequences(userLines[0]!).trim(), "");
-      assert.equal(stripTerminalSequences(userLines.at(-1)!).trim(), "");
-      assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /^\s*(You|Agent)\s*$/m);
+      const lastUser = lines.findLastIndex((line) => line.includes(background));
+      assert.ok(lines.slice(lastUser + 1).every((line) => !line.includes("\x1b[48;")), "Assistant/error rows keep the terminal background");
+      if (width < 50) continue;
+      const text = lines.map(stripTerminalSequences).join("\n");
+      assert.match(text, /^❯ Please inspect \*\*this project\*\*/);
+      assert.match(text, /● Here is the summary\./);
+      assert.match(text, /● Error\n  ⎿ Something failed/);
+      assert.doesNotMatch(text, /^\s*(You|Agent)\s*$/m);
     }
-    const lines = transcript.render(120);
-    assert.match(lines.find((line) => line.includes("Please inspect"))!, /\x1b\[38;2;32;32;32m/);
-    assert.equal(lines.find((line) => line.includes("Here is"))?.includes(background), false);
-    assert.match(lines.map(stripTerminalSequences).join("\n"), /Here is the summary\.[\s\S]*Error\n  Something failed/);
     session.messages[1]!.text += " More detail.";
     assert.match(transcript.render(120).map(stripTerminalSequences).join("\n"), /More detail\./);
-    // Replacing a projected message must not reuse styling from its previous role.
     session.messages[0]!.role = "assistant";
-    assert.ok(transcript.render(120).every((line) => !line.includes(background)));
+    assert.ok(transcript.render(120).every((line) => !stripTerminalSequences(line).startsWith("❯") && !line.includes("\x1b[48;")));
   } finally { await f.cleanup(); }
 });
 
-test("tool and skill activity is collapsed, keyboard and mouse expandable, and stable across updates", async () => {
+test("tool previews are compact, keyboard and mouse expandable, and stable across updates", async () => {
   const f = setup();
   try {
     f.c.send("inspect project"); await tick(); f.c.open();
@@ -538,8 +607,9 @@ test("tool and skill activity is collapsed, keyboard and mouse expandable, and s
       id: "run-tests", name: "bash", arguments: { command: "npm test" }, output: "Tests passed\n14 tests", status: "done", durationMs: 1100,
     } });
     const render = () => f.app.body.render(f.terminal.columns).map(stripTerminalSequences).join("\n");
-    assert.match(render(), /\[\+\] Skill frontend-design/);
-    assert.doesNotMatch(render(), /skill instructions|Tests passed/);
+    assert.match(render(), /● Skill frontend-design/);
+    assert.match(render(), /Ran 1 shell command/);
+    assert.doesNotMatch(render(), /skill instructions|Arguments|Tests passed|npm test/);
     f.terminal.onInput("\t"); f.terminal.onInput(" ");
     assert.match(render(), /skill instructions that should stay hidden/);
     // Durable replaces projected message objects on each update; the call ID owns expansion.
@@ -551,7 +621,8 @@ test("tool and skill activity is collapsed, keyboard and mouse expandable, and s
     transcript.handleMouse({ type: "click", button: "left", x: 5, y, screenX: 5, screenY: y, width: 120, height: 32, shift: false, ctrl: false, alt: false });
     assert.match(render(), /Tests passed/);
     f.terminal.onInput("/collapse"); f.terminal.onInput("\r");
-    assert.doesNotMatch(render(), /skill instructions|Tests passed/);
+    assert.doesNotMatch(render(), /skill instructions|Arguments|Tests passed|npm test/);
+    assert.match(render(), /Ran 1 shell command/);
     f.terminal.onInput("/expand"); f.terminal.onInput("\r");
     assert.match(render(), /Tests passed/);
     for (const width of [10, 24, 50, 120]) assert.ok(f.app.body.render(width).every((line) => visibleWidth(line) <= width));
@@ -696,7 +767,7 @@ for (const mode of ["sessions", "projects"] as const) {
       f.c.send("other project task"); await tick();
       const other = f.store.state.sessions.at(-1)!;
       f.c.select(`project:${f.pb.id}`);
-      if (mode === "projects") f.terminal.onInput("\x0f");
+      if (mode === "projects") f.app.composer.onSubmit?.("/projects");
       assert.equal(f.c.mode, mode);
       const before = f.app.body.render(120);
       const header = before[f.app.body.positions.get(`project:${f.pb.id}`)!]!;
@@ -734,7 +805,7 @@ for (const mode of ["sessions", "projects"] as const) {
       const restored = new Store(f.store.root);
       assert.deepEqual(restored.state.sessions.map((s) => s.id), [other.id]);
       assert.deepEqual(restored.state.projects, [f.pa, f.pb]);
-      if (mode === "projects") f.terminal.onInput("\x0f");
+      if (mode === "projects") f.terminal.onInput("\x1b");
       assert.equal(f.c.project?.path, f.pb.path);
       assert.equal(rows(f.store.state).filter((r) => r.kind === "session" && r.project.id === f.pb.id).length, 0);
       assert.equal(f.c.send("new task in the same project"), true); await tick();
@@ -916,6 +987,7 @@ test("help lists only the current view's commands and explains their scope", asy
   const help = () => {
     f.app.composer.onSubmit?.("/help"); f.tui.renderNow();
     const text = f.tui.getScreenLines().map(stripTerminalSequences).join("\n");
+    assert.doesNotMatch(text, /ctrl\+l|ctrl\+t|ctrl\+end|shift\+tab|esc\s+stop/i);
     f.terminal.onInput("\x1b");
     return text;
   };
@@ -1019,7 +1091,7 @@ test("composer status always shows below the editor with no shortcut toggle or h
   const render = () => f.app.render(120).map(stripTerminalSequences);
   const belowComposer = () => {
     const lines = render();
-    const border = stripTerminalSequences(f.app.composer.render(116).at(-1)!).trim();
+    const border = stripTerminalSequences(f.app.composer.render(120).at(-1)!).trim();
     const bottom = lines.findLastIndex((line) => line.trim() === border);
     assert.ok(bottom >= 0);
     return lines.slice(bottom + 1).map((line) => line.trim()).filter(Boolean);
@@ -1104,7 +1176,7 @@ test("/compact targets the open or selected session, passes instructions, and ne
   } finally { await f.cleanup(); }
 });
 
-test("compaction activity supports Escape cancellation without marking an idle session stopped", async () => {
+test("Escape stops compaction without marking an idle session stopped", async () => {
   const f = setup();
   try {
     f.c.send("task"); await tick(); f.c.open();
@@ -1116,7 +1188,7 @@ test("compaction activity supports Escape cancellation without marking an idle s
     assert.match(f.c.notice, /already compacting/);
     assert.equal(f.c.canStop(session), true);
     f.app.composer.setValue("unsent draft");
-    f.c.escape(); await tick();
+    f.terminal.onInput("\x1b"); await tick();
     assert.deepEqual(f.engine.cancelled, [session.id]);
     assert.equal(session.status, "completed");
     assert.equal(session.stopped, undefined);
@@ -1733,5 +1805,394 @@ test("/settings edits compaction budgets inline, validates counts, and cancels u
     assert.equal(f.c.dialog, undefined);
     assert.equal(f.app.composer.getValue(), "keep session draft");
     assert.deepEqual(f.c.configuration, configuration); assert.equal(f.engine.calls.length, calls);
+  } finally { await f.cleanup(); }
+});
+
+test("question wizard supports radio, plain select, multiple choices, input and review before sending", async () => {
+  const f = setup();
+  const screen = () => { f.tui.renderNow(); return f.tui.getScreenLines().map(stripTerminalSequences).join("\n"); };
+  try {
+    const session = waitingSession(); session.projectId = f.pa.id;
+    f.store.state.sessions.push(session);
+    f.c.select(`session:${session.id}`); f.c.open();
+    assert.ok(f.c.questionForm);
+    assert.equal(f.c.dialog, undefined);
+    assert.match(screen(), /Question 1 of 4/);
+    assert.match(screen(), /What should I build/);
+    f.terminal.onInput("\x1b[B"); f.terminal.onInput("\r");
+    assert.match(screen(), /Question 2 of 4/);
+    assert.doesNotMatch(screen(), /Filter options/);
+    assert.match(screen(), /TypeScript/);
+    f.terminal.onInput("\x1b[B"); f.terminal.onInput("\r");
+    assert.match(screen(), /Question 3 of 4/);
+    f.terminal.onInput("\x1b[A"); f.terminal.onInput("\r");
+    assert.match(screen(), /Select at least one option/);
+    f.terminal.onInput("\x1b[B"); f.terminal.onInput(" "); f.terminal.onInput("\x1b[B"); f.terminal.onInput(" ");
+    assert.match(screen(), /\[x\] Tests/);
+    assert.match(screen(), /\[x\] Documentation/);
+    f.terminal.onInput("\t");
+    assert.match(screen(), /my-project/);
+    f.terminal.onInput("\r");
+    assert.match(screen(), /Enter an answer to continue/);
+    f.terminal.onInput("my-builder"); f.terminal.onInput("\r");
+    assert.match(screen(), /Review your answers/);
+    assert.equal(f.engine.calls.length, 0, "No model calls between steps or on entering review");
+    assert.equal(session.status, "needs-input");
+    f.terminal.onInput("\x02");
+    assert.match(screen(), /my-builder/);
+    f.terminal.onInput("\r"); f.terminal.onInput("\r"); await tick();
+    assert.equal(f.engine.calls.length, 1);
+    assert.equal(f.engine.calls[0]!.session.id, session.id);
+    const prompt = f.engine.calls[0]!.prompt;
+    const answers = JSON.parse(prompt.slice(prompt.indexOf("\n") + 1));
+    assert.deepEqual(answers.map((answer: { answer: unknown }) => answer.answer), ["web", "go", ["tests", "docs"], "my-builder"]);
+    assert.equal(f.c.dialog, undefined);
+  } finally { await f.cleanup(); }
+});
+
+test("closing questions preserves drafts on /answer and never blocks a normal text reply", async () => {
+  const f = setup();
+  const screen = () => { f.tui.renderNow(); return f.tui.getScreenLines().map(stripTerminalSequences).join("\n"); };
+  try {
+    const session = waitingSession(); session.projectId = f.pa.id;
+    f.store.state.sessions.push(session);
+    f.c.select(`session:${session.id}`); f.c.peek();
+    assert.ok(f.c.questionForm, "Peek opens the pending questions inline too");
+    assert.equal(f.c.dialog, undefined);
+    // Custom answers remain available even when choices don't cover the user's intent.
+    f.terminal.onInput("\x1b[A"); f.terminal.onInput("\r"); f.terminal.onInput("A different target");
+    f.terminal.onInput("\x1b");
+    assert.equal(f.c.dialog, undefined);
+    assert.equal(session.status, "needs-input");
+    assert.equal(f.engine.calls.length, 0);
+    f.c.changed(); assert.equal(f.c.dialog, undefined, "An unrelated render must not reopen a dismissed question");
+    f.app.composer.onSubmit?.("/answer");
+    assert.ok(f.c.questionForm);
+    assert.equal(f.c.dialog, undefined);
+    assert.match(screen(), /A different target/);
+    f.terminal.onInput("\x1b");
+    f.c.open();
+    f.app.composer.onSubmit?.("Skip the form, just build a CLI"); await tick();
+    assert.equal(f.engine.calls.length, 1);
+    assert.equal(f.engine.calls[0]!.prompt, "Skip the form, just build a CLI");
+  } finally { await f.cleanup(); }
+});
+
+test("question arrivals do not steal other sessions' focus and stale answers cannot be submitted", async () => {
+  const f = setup();
+  try {
+    f.c.send("Another task"); await tick(); f.c.open();
+    const active = f.c.opened!;
+    const session = waitingSession(); session.projectId = f.pb.id;
+    f.store.state.sessions.push(session); f.c.changed();
+    assert.equal(f.c.dialog, undefined);
+    f.c.dialog = { kind: "help" }; f.c.changed();
+    active.status = "needs-input";
+    active.messages.push(...session.messages);
+    f.c.changed();
+    assert.equal(f.c.dialog.kind, "help");
+    f.c.dialog = undefined; f.c.changed();
+    assert.ok(f.c.questionForm);
+    assert.equal(f.c.dialog, undefined);
+    const id = pendingQuestion(active)!.id;
+    active.status = "completed";
+    const calls = f.engine.calls.length;
+    assert.equal(f.c.answerQuestions(active.id, id, {}), false);
+    assert.equal(f.engine.calls.length, calls);
+    assert.match(f.c.notice, /no longer waiting/);
+    assert.equal(f.c.dialog, undefined);
+  } finally { await f.cleanup(); }
+});
+
+test("question composers fit narrow widths, sanitize model text and keep long reviews scrollable", async () => {
+  const f = setup();
+  try {
+    const session = waitingSession(); session.projectId = f.pa.id;
+    session.messages[1]!.tool!.arguments = { question: "Title\x1b[2J", questions: [{ id: "answer", question: "Long question ".repeat(10), type: "input" }] };
+    f.store.state.sessions.push(session);
+    const dialog = new QuestionComposer(f.c, f.tui, { sessionId: session.id, request: pendingQuestion(session)! });
+    for (const width of [10, 24, 40, 80]) {
+      const lines = dialog.render(width);
+      assert.ok(lines.every((line) => visibleWidth(line) <= width));
+      assert.ok(lines.every((line) => !line.includes("\x1b[2J")));
+    }
+    dialog.handleInput("long answer ".repeat(100)); dialog.handleInput("\r");
+    const before = dialog.render(40).map(stripTerminalSequences).join("\n");
+    assert.match(before, /Review your answers/);
+    for (let i = 0; i < 20; i++) dialog.handleInput("\x1b[6~");
+    const after = dialog.render(40).map(stripTerminalSequences).join("\n");
+    assert.notEqual(before, after);
+    assert.match(after, /Enter send/);
+    assert.equal(f.engine.calls.length, 0);
+  } finally { await f.cleanup(); }
+});
+
+test("custom multiselect answers stay visible and removable when going back", async () => {
+  const f = setup();
+  try {
+    const session = waitingSession(); session.projectId = f.pa.id;
+    session.messages[1]!.tool!.arguments = { question: "Features", questions: [{ id: "features", question: "Which features?", type: "multiselect", options: [
+      { value: "tests", label: "Tests" }, { value: "docs", label: "Docs" },
+    ] }] };
+    f.store.state.sessions.push(session);
+    const dialog = new QuestionComposer(f.c, f.tui, { sessionId: session.id, request: pendingQuestion(session)! });
+    dialog.handleInput(" "); // Select Tests.
+    dialog.handleInput("\x1b[B"); dialog.handleInput("\x1b[B"); // Inline custom answer.
+    dialog.handleInput("Offline mode"); dialog.handleInput("\t");
+    assert.match(dialog.render(80).map(stripTerminalSequences).join("\n"), /Tests, Offline mode/);
+    dialog.handleInput("\x1b[Z");
+    assert.match(dialog.render(80).map(stripTerminalSequences).join("\n"), /\[x\] Offline mode/);
+    dialog.handleInput("\x15");
+    assert.doesNotMatch(dialog.render(80).map(stripTerminalSequences).join("\n"), /Offline mode/);
+    dialog.handleInput("\t"); dialog.handleInput("\r"); await tick();
+    assert.match(f.engine.calls[0]!.prompt, /"tests"/);
+    assert.doesNotMatch(f.engine.calls[0]!.prompt, /Offline mode/);
+  } finally { await f.cleanup(); }
+});
+
+test("question choices support mouse selection and keep descriptions at every terminal height", async () => {
+  const f = setup();
+  try {
+    const session = waitingSession(); session.projectId = f.pa.id;
+    session.messages[1]!.tool!.arguments = { question: "Target", questions: [{ id: "target", question: "Choose a target", type: "radio", allowOther: false, options: [
+      { value: "cli", label: "CLI" }, { value: "web", label: "Website" },
+    ] }] };
+    f.store.state.sessions.push(session);
+    const dialog = new QuestionComposer(f.c, f.tui, { sessionId: session.id, request: pendingQuestion(session)! });
+    const lines = dialog.render(80).map(stripTerminalSequences);
+    const y = lines.findIndex((line) => line.includes("Website"));
+    assert.equal(dialog.handleMouse({ type: "click", button: "left", x: 6, y, screenX: 6, screenY: y,
+      width: 80, height: 32, shift: false, ctrl: false, alt: false })?.render, true);
+    assert.match(dialog.render(80).map(stripTerminalSequences).join("\n"), /Review your answers/);
+    assert.equal(f.engine.calls.length, 0, "A click must not submit the form");
+    const request = pendingQuestion(session)!;
+    request.questions[0]!.question = "A long wrapped question ".repeat(12);
+    request.questions[0]!.type = "select";
+    const small = new QuestionComposer(f.c, f.tui, { sessionId: session.id, request });
+    for (const height of [12, 16, 20, 32]) {
+      f.terminal.rows = height;
+      const compact = small.render(32);
+      assert.ok(compact.every((line) => visibleWidth(line) <= 32));
+      assert.match(compact.map(stripTerminalSequences).join("\n"), /Website/);
+      assert.match(compact.map(stripTerminalSequences).join("\n"), /No description provided/);
+      assert.match(compact.map(stripTerminalSequences).join("\n"), /Enter next/);
+    }
+  } finally { await f.cleanup(); }
+});
+
+test("questions replace the composer without an overlay and keep the transcript visible", async () => {
+  const f = setup();
+  const screen = () => { f.tui.renderNow(); return f.tui.getScreenLines().map(stripTerminalSequences); };
+  try {
+    const session = waitingSession(); session.projectId = f.pa.id;
+    session.messages.at(-1)!.text = "Transcript stays visible above the questions";
+    f.store.state.sessions.push(session);
+    f.c.select(`session:${session.id}`); f.c.open();
+    assert.equal(f.tui.hasOverlay(), false);
+    assert.equal(f.app.composer.focused, false);
+    const lines = screen();
+    const transcript = lines.findIndex((line) => line.includes("Transcript stays visible"));
+    const form = lines.findIndex((line) => line.includes("Question 1 of 4"));
+    assert.ok(transcript >= 0 && form > transcript);
+    assert.doesNotMatch(lines.join("\n"), /describe a task for a new session|\+---/);
+    assert.match(lines.at(-1)!, /test\/mock/);
+    const choice = lines.findIndex((line) => line.includes("Website"));
+    assert.ok(choice >= 0);
+    f.terminal.onInput(`\x1b[<0;6;${choice + 1}M`);
+    f.terminal.onInput(`\x1b[<0;6;${choice + 1}m`);
+    assert.match(screen().join("\n"), /Question 2 of 4/);
+    assert.equal(f.tui.hasOverlay(), false);
+    assert.equal(f.engine.calls.length, 0);
+    for (const [width, height] of [[40, 16], [80, 24], [120, 32]]) {
+      f.terminal.columns = width!; f.terminal.rows = height!; f.terminal.onResize();
+      const resized = screen();
+      assert.ok(resized.every((line) => visibleWidth(line) <= width!));
+      assert.ok(f.app.chatScroll.viewportHeight >= 1, "The transcript retains its own viewport");
+      assert.match(resized.join("\n"), /Question 2 of 4/);
+    }
+  } finally { await f.cleanup(); }
+});
+
+test("inline questions preserve the composer draft, survive dialogs and restore focus on dismissal", async () => {
+  const f = setup();
+  const screen = () => { f.tui.renderNow(); return f.tui.getScreenLines().map(stripTerminalSequences).join("\n"); };
+  try {
+    const session = waitingSession(); session.projectId = f.pa.id;
+    session.status = "completed";
+    f.store.state.sessions.push(session);
+    f.c.select(`session:${session.id}`); f.c.open();
+    f.app.composer.setValue("keep this unsent reply");
+    session.status = "needs-input"; f.c.changed();
+    assert.ok(f.c.questionForm);
+    assert.equal(f.tui.hasOverlay(), false);
+    assert.equal(f.app.composer.getValue(), "keep this unsent reply");
+    assert.doesNotMatch(screen(), /keep this unsent reply/);
+    f.terminal.onInput("\x1b[A"); f.terminal.onInput("\r");
+    f.terminal.onInput("custom answer draft");
+    assert.equal(f.app.composer.getValue(), "keep this unsent reply", "Question typing never reaches the hidden composer");
+    f.c.dialog = { kind: "help" }; f.c.changed();
+    assert.equal(f.tui.hasOverlay(), true);
+    f.terminal.onInput("\x1b");
+    assert.equal(f.tui.hasOverlay(), false);
+    assert.match(screen(), /custom answer draft/);
+    f.terminal.onInput("\x1b");
+    assert.equal(f.c.questionForm, undefined);
+    assert.equal(f.app.composer.focused, true);
+    assert.match(screen(), /keep this unsent reply/);
+    assert.equal(session.status, "needs-input");
+    assert.equal(f.engine.calls.length, 0);
+    f.c.showQuestions();
+    assert.equal(f.tui.hasOverlay(), false);
+    assert.match(screen(), /custom answer draft/);
+    f.c.back();
+    assert.doesNotMatch(screen(), /Question 1 of 4/);
+    f.c.open();
+    assert.match(screen(), /custom answer draft/);
+  } finally { await f.cleanup(); }
+});
+
+test("Tab and Shift+Tab still navigate the question wizard after shortcut removal", async () => {
+  const f = setup();
+  const screen = () => { f.tui.renderNow(); return f.tui.getScreenLines().map(stripTerminalSequences).join("\n"); };
+  try {
+    const session = waitingSession(); session.projectId = f.pa.id;
+    session.agent = { model: { provider: "test", modelId: "reasoner" }, thinkingLevel: "high" };
+    f.store.state.sessions.push(session);
+    f.c.select(`session:${session.id}`); f.c.open();
+    const configuration = f.c.configuration;
+    f.terminal.onInput(" "); f.terminal.onInput("\t");
+    assert.match(screen(), /Question 2 of 4/);
+    f.terminal.onInput("\x1b[B"); f.terminal.onInput("\r");
+    assert.match(screen(), /Question 3 of 4/);
+    f.terminal.onInput("\t"); f.terminal.onInput("\t");
+    assert.match(screen(), /Review your answers/);
+    assert.match(screen(), /You have not answered all questions/);
+    f.terminal.onInput("\t");
+    assert.equal(f.engine.calls.length, 0, "Tab on Submit does not send");
+    f.terminal.onInput("\x1b[Z");
+    assert.match(screen(), /Question 4 of 4/);
+    f.terminal.onInput("\x1b[Z");
+    assert.match(screen(), /Question 3 of 4/);
+    f.terminal.onInput("\x1b[Z");
+    assert.match(screen(), /Question 2 of 4/);
+    assert.match(screen(), /Go/);
+    assert.deepEqual(f.c.configuration, configuration, "Shift+Tab must not cycle thinking during questions");
+    assert.equal(f.tui.hasOverlay(), false);
+    assert.equal(f.app.composer.getValue(), "");
+  } finally { await f.cleanup(); }
+});
+
+test("five choices and every description fit together in the composer without paging", async () => {
+  const f = setup();
+  try {
+    f.terminal.columns = 80;
+    for (const type of ["radio", "select", "multiselect"]) {
+      for (const allowOther of [false, true]) {
+        const options = Array.from({ length: allowOther ? 4 : 5 }, (_, i) => ({ value: String(i), label: `Option ${i + 1}`, description: `Description for option ${i + 1}` }));
+        const session = waitingSession(`${type}-${allowOther}`); session.projectId = f.pa.id;
+        session.messages[1]!.tool!.arguments = { question: "Pick features", questions: [{ id: "features", question: "Which features?", type, allowOther, options }] };
+        f.store.state.sessions.push(session);
+        f.c.select(`session:${session.id}`); f.c.open();
+        for (const height of [24, 32]) {
+          f.terminal.rows = height; f.terminal.onResize(); f.tui.renderNow();
+          const lines = f.tui.getScreenLines().map(stripTerminalSequences);
+          const text = lines.join("\n");
+          for (const option of options) assert.match(text, new RegExp(`${option.label}\\s+${option.description}`));
+          if (allowOther) assert.match(text, /5\. (?:\[ \] )?type something/);
+          assert.doesNotMatch(text, /Filter|Search/);
+          assert.ok(f.app.chatScroll.viewportHeight >= 1);
+          assert.match(lines.at(-1)!, /test\/mock/);
+          f.terminal.onInput("\x1b[B");
+        }
+        assert.equal(f.engine.calls.length, 0);
+      }
+    }
+  } finally { await f.cleanup(); }
+});
+
+test("ask_question stays in chat with the normal composer and accepts an ordinary reply", async () => {
+  const f = setup();
+  const screen = () => { f.tui.renderNow(); return f.tui.getScreenLines().map(stripTerminalSequences).join("\n"); };
+  try {
+    const session = waitingSession("direct"); session.projectId = f.pa.id;
+    session.messages[1]!.tool!.name = "ask_question";
+    session.messages[1]!.tool!.arguments = { question: "Which file should I change?" };
+    session.messages[1]!.tool!.output = "Which file should I change?";
+    session.messages.at(-1)!.text = "Which file should I change?";
+    f.store.state.sessions.push(session);
+    f.c.select(`session:${session.id}`); f.c.open();
+    assert.equal(f.c.questionForm, undefined);
+    assert.equal(f.tui.hasOverlay(), false);
+    assert.equal(f.app.composer.focused, true);
+    assert.match(screen(), /Which file should I change/);
+    assert.doesNotMatch(screen(), /Question 1 of|Review your answers|Submit answers/);
+    f.c.back(); f.c.peek();
+    assert.equal(f.c.dialog?.kind, "peek", "Peeking a direct question uses the ordinary reply peek");
+    assert.equal(f.c.questionForm, undefined);
+    f.terminal.onInput("\x1b"); f.c.open();
+    f.app.composer.setValue("src/main.ts");
+    f.c.showQuestions();
+    assert.match(f.c.notice, /No pending question form/);
+    assert.equal(f.app.composer.getValue(), "src/main.ts");
+    f.terminal.onInput("\r"); await tick();
+    assert.equal(f.engine.calls.length, 1);
+    assert.equal(f.engine.calls[0]!.session.id, session.id);
+    assert.equal(f.engine.calls[0]!.prompt, "src/main.ts");
+  } finally { await f.cleanup(); }
+});
+
+test("a direct question removes an obsolete wizard and restores the unsent composer draft", async () => {
+  const f = setup();
+  try {
+    const session = waitingSession("transition"); session.projectId = f.pa.id;
+    session.status = "completed";
+    f.store.state.sessions.push(session);
+    f.c.select(`session:${session.id}`); f.c.open();
+    f.app.composer.setValue("keep my draft");
+    session.status = "needs-input"; f.c.changed();
+    assert.ok(f.c.questionForm);
+    assert.equal(f.app.composer.focused, false);
+    session.messages.push({ role: "tool", text: "", timestamp: 3, tool: {
+      id: "direct", name: "ask_question", arguments: { question: "Continue?" }, output: "Continue?", status: "done",
+    } }, { role: "assistant", text: "Continue?", timestamp: 3 });
+    f.c.changed();
+    assert.equal(f.c.questionForm, undefined);
+    assert.equal(f.app.composer.focused, true);
+    assert.equal(f.app.composer.getValue(), "keep my draft");
+    assert.equal(f.tui.hasOverlay(), false);
+    assert.equal(f.engine.calls.length, 0);
+  } finally { await f.cleanup(); }
+});
+
+test("$ autocomplete uses the engine catalog for the selected project and peek session without sending", async () => {
+  const f = setup();
+  const listed: string[] = [];
+  f.engine.listSkills = async (project) => {
+    listed.push(project.id);
+    return [{ name: project.id === f.pa.id ? "alpha-skill" : "beta-skill", description: "Scoped skill", filePath: "/skills/SKILL.md" }];
+  };
+  try {
+    for (const project of [f.pa, f.pb]) {
+      f.c.select(`project:${project.id}`);
+      f.app.composer.setValue("");
+      f.terminal.onInput("$");
+      for (let i = 0; i < 100 && !f.app.composer.showingSuggestions; i++) await delay(20);
+      assert.equal(f.app.composer.showingSuggestions, true);
+      f.terminal.onInput("\r");
+      assert.equal(f.app.composer.getValue(), project.id === f.pa.id ? "$alpha-skill " : "$beta-skill ");
+      assert.equal(f.store.state.sessions.length, 0);
+      assert.equal(listed.at(-1), project.id);
+    }
+    f.app.composer.setValue("");
+    f.c.send("create peek session"); await tick(); f.c.peek();
+    const peek = f.tui.getFocusedComponent() as unknown as { input: Composer };
+    assert.ok(peek.input instanceof Composer);
+    peek.input.handleInput("$");
+    for (let i = 0; i < 100 && !peek.input.showingSuggestions; i++) await delay(20);
+    assert.equal(peek.input.showingSuggestions, true);
+    peek.input.handleInput("\r");
+    assert.equal(peek.input.getValue(), "$beta-skill ");
+    assert.equal(listed.at(-1), f.pb.id);
+    assert.equal(f.engine.calls.length, 1, "Accepting a skill must not send a reply");
   } finally { await f.cleanup(); }
 });

@@ -43,7 +43,7 @@ test("SYSTEM and APPEND_SYSTEM have independent project-over-user precedence and
     writeFileSync(join(a, ".pi", "SYSTEM.md"), "PROJECT_SYSTEM");
     assert.match(await catalog.preamble(a), /PROJECT_SYSTEM/);
     assert.doesNotMatch(await catalog.preamble(a), /USER_SYSTEM|Inspect before editing/);
-    assert.match(INTERACTION_POLICY, /Use ask_user whenever/);
+    assert.match(INTERACTION_POLICY, /Use ask_question whenever/);
     assert.equal(await catalog.append(a), "USER_APPEND");
     writeFileSync(join(a, ".pi", "APPEND_SYSTEM.md"), "PROJECT_APPEND");
     assert.equal(await catalog.append(a), "PROJECT_APPEND");

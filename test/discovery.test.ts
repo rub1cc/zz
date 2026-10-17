@@ -17,7 +17,7 @@ function provider(cwd: string, session = false, commands = true, selectedSession
 test("slash discovery filters available commands and excludes later draft lines and peek commands", async () => {
   const p = provider(process.cwd());
   const all = await suggestions(p, "/");
-  assert.deepEqual(all?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "login", "logout", "help"]);
+  assert.deepEqual(all?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "projects", "login", "logout", "help"]);
   assert.equal((await suggestions(p, "/th"))?.items[0]?.value, "thinking");
   assert.equal(await suggestions(p, "/copy"), null);
   assert.equal((await suggestions(provider(process.cwd(), true), "/copy"))?.items[0]?.value, "copy");
@@ -26,7 +26,7 @@ test("slash discovery filters available commands and excludes later draft lines 
   assert.equal(await suggestions(p, "draft\n/mo"), null);
   assert.equal(await suggestions(provider(process.cwd(), true, false), "/mo"), null);
   const selected = await suggestions(provider(process.cwd(), false, true, true), "/");
-  assert.deepEqual(selected?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "login", "logout", "copy", "session", "compact", "undo", "stop", "help"]);
+  assert.deepEqual(selected?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "projects", "login", "logout", "answer", "copy", "session", "compact", "undo", "stop", "help"]);
   const open = await suggestions(provider(process.cwd(), true), "/");
   assert.deepEqual(open?.items.map((i) => i.value), [...selected!.items.map((i) => i.value), "bottom", "expand", "collapse"]);
   assert.deepEqual(composerCommands(true).filter((c) => !composerCommands(false, true).some((base) => base.name === c.name)).map((c) => c.name), ["bottom", "expand", "collapse"]);
@@ -83,4 +83,43 @@ process.stdout.write(readFileSync(join(base, 'results.txt'), 'utf8'));
     const abort = new AbortController(); abort.abort();
     assert.equal(await p.getSuggestions(["@needle"], 0, 7, { signal: abort.signal }), null);
   } finally { temp.cleanup(); }
+});
+
+test("$ discovery filters scoped skills, includes manual skills, and preserves draft suffixes", async () => {
+  const calls: string[] = [];
+  const p = new ComposerDiscovery({ cwd: "/project-a", commands: true, session: false }, new Promise(() => {}), {
+    list: async (cwd) => {
+      calls.push(cwd);
+      return [
+        { name: "frontend-design", description: "Build a UI", filePath: "/skills/frontend/SKILL.md" },
+        { name: "nf:draft-pr", description: "Draft a PR", filePath: "/skills/pr/SKILL.md" },
+        { name: "manual-only", description: "Manual\nonly\x1b[31m", filePath: "/skills/manual/SKILL.md" },
+      ];
+    },
+  });
+  assert.ok(p.triggerCharacters.includes("$"));
+  const all = (await suggestions(p, "$"))!;
+  assert.deepEqual(all.items.map((i) => i.value), ["$frontend-design", "$nf:draft-pr", "$manual-only"]);
+  assert.equal(all.items[2]?.description, "Manual only");
+  const filtered = (await suggestions(p, "$frd"))!;
+  assert.equal(filtered.items[0]?.value, "$frontend-design");
+  assert.equal((await suggestions(p, "$nf:d"))?.items[0]?.value, "$nf:draft-pr");
+  assert.deepEqual(calls, ["/project-a"], "Filtering reuses the project catalog");
+  assert.equal(await suggestions(p, "$no-such-skill"), null);
+  for (const text of ["draft $frd", "draft\n$frd", "!echo $frd", "$frontend-design request"]) {
+    assert.equal(await suggestions(p, text), null, text);
+  }
+  assert.deepEqual(p.applyCompletion(["$frdkeep this", "second line"], 0, 4, filtered.items[0]!, filtered.prefix), {
+    lines: ["$frontend-design keep this", "second line"], cursorLine: 0, cursorCol: 17,
+  });
+  assert.equal(p.shouldTriggerFileCompletion(["$frd"], 0, 4), true);
+  await suggestions(p, "$");
+  assert.deepEqual(calls, ["/project-a", "/project-a"], "Reopening $ refreshes discovery");
+
+  const peek = new ComposerDiscovery({ cwd: "/project-b", commands: false, session: true }, Promise.resolve(null), {
+    list: async (cwd) => [{ name: cwd.slice(1), description: "Peek skill", filePath: "/skill/SKILL.md" }],
+  });
+  assert.equal((await suggestions(peek, "$"))?.items[0]?.value, "$project-b");
+  const abort = new AbortController(); abort.abort();
+  assert.equal(await peek.getSuggestions(["$"], 0, 1, { signal: abort.signal }), null);
 });

@@ -41,3 +41,34 @@ test("streaming thinking remains separate from replies and never exposes redacte
   assert.doesNotMatch(JSON.stringify(session.messages), /hidden-encrypted-data|opaque-live-signature|"encrypted"/);
   assert.equal(session.status, "working");
 });
+
+test("question tools restore waiting state from history, but only structured sets request a wizard", async () => {
+  const { pendingQuestion } = await import("../src/questions.js");
+  const direct = { question: "Continue?" };
+  const multiple = { question: "Preferences", questions: [{ id: "name", question: "Name?", type: "input" }] };
+  for (const [name, arguments_, form] of [
+    ["ask_question", direct, false], ["ask_multiple_questions", multiple, true],
+    ["ask_user", direct, false], ["ask_user", multiple, true],
+  ] as const) {
+    const s: Session = { id: name, projectId: "/project", title: "Test", status: "completed", preview: "", createdAt: 1, updatedAt: 1, messages: [] };
+    const entries = [{ id: 1, model: [{ role: "assistant", timestamp: 2, content: [{ type: "toolCall", id: "question", name, arguments: arguments_ }] }] },
+      { id: 2, model: [{ role: "toolResult", toolCallId: "question", toolName: name, content: [{ type: "text", text: "Continue?" }], timestamp: 3 }] }];
+    applyView(s, { entries, docs: {} } as unknown as ConversationView);
+    assert.equal(s.status, "needs-input");
+    assert.equal(s.messages.at(-1)?.text, "Continue?");
+    assert.equal(!!pendingQuestion(s), form);
+    applyView(s, { entries: [...entries, { id: 3, model: [{ role: "user", content: "yes", timestamp: 4 }] }], docs: {} } as unknown as ConversationView);
+    assert.equal(s.status, "completed");
+    assert.equal(pendingQuestion(s), undefined);
+  }
+});
+
+test("failed question tool results do not display an unanswered chat question or request a form", () => {
+  for (const name of ["ask_question", "ask_multiple_questions", "ask_user"]) {
+    const s: Session = { id: name, projectId: "/project", title: "Test", status: "working", preview: "", createdAt: 1, updatedAt: 1, messages: [] };
+    applyView(s, { entries: [{ id: 1, model: [{ role: "toolResult", toolCallId: "bad", toolName: name, content: [{ type: "text", text: "Invalid question" }], isError: true, timestamp: 2 }] }], docs: {} } as unknown as ConversationView);
+    assert.equal(s.status, "completed");
+    assert.equal(s.messages.some((message) => message.role === "assistant"), false);
+    assert.equal(s.messages[0]?.tool?.status, "error");
+  }
+});

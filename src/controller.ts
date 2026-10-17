@@ -6,6 +6,7 @@ import { ShellRun } from "./shell.js";
 import { AuthFlow, type AuthAccess, type AuthAction } from "./auth.js";
 import type { CompactionPolicy } from "@earendil-works/pi-durable";
 import { compactionPolicy, compactionSettingsError } from "./compaction-settings.js";
+import { answerError, answerText, pendingQuestion, type QuestionForm, type QuestionAnswers } from "./questions.js";
 
 export interface Engine {
   run(session: Session, project: Project, prompt: string, changed: () => void, images?: ImageAttachment[]): Promise<void>;
@@ -28,6 +29,7 @@ export type Dialog =
   | { kind: "auth"; flow: AuthFlow }
   | { kind: "peek"; sessionId: string }
   | { kind: "add-project" }
+  | { kind: "rename-session"; sessionId: string }
   | { kind: "settings"; sessionId?: string; selected: SettingsSelection }
   | { kind: "model" | "thinking"; sessionId?: string; choices: ModelOption[]; returnToSettings?: boolean }
   | { kind: "skills"; sessionId?: string; skills: SkillOption[] }
@@ -40,6 +42,7 @@ export class Controller {
   selection?: string;
   openedSessionId?: string;
   dialog?: Dialog;
+  questionForm?: QuestionForm;
   pendingDelete?: string;
   private deleting = false;
   private deletingProjectId?: string;
@@ -54,7 +57,6 @@ export class Controller {
   private compacting = new Set<string>();
   private undoing = new Set<string>();
   private configuring = false;
-  private thinkingQueue = Promise.resolve();
   private clipboardQueue = Promise.resolve();
   private activeShell?: { projectId: string; sessionId: string; run: ShellRun };
   get shellRun(): ShellRun | undefined { return this.activeShell?.run; }
@@ -115,6 +117,27 @@ export class Controller {
     this.changed();
   }
 
+  showQuestions(sessionId?: string): void {
+    const session = sessionId ? this.session(sessionId) : this.mode === "session" ? this.opened : this.selected?.kind === "session" ? this.selected.session : undefined;
+    const request = pendingQuestion(session);
+    if (!session || !request) { this.fail("No pending question form. Reply directly in the composer for a chat question."); return; }
+    this.dialog = undefined;
+    this.mode = "session";
+    this.openedSessionId = session.id;
+    this.selection = `session:${session.id}`;
+    this.questionForm = { sessionId: session.id, request };
+    this.notice = "";
+    this.changed();
+  }
+
+  answerQuestions(sessionId: string, requestId: string, answers: QuestionAnswers): boolean {
+    const request = pendingQuestion(this.session(sessionId));
+    if (!request || request.id !== requestId) { this.fail("This question is no longer waiting for an answer."); return false; }
+    const error = answerError(request, answers);
+    if (error) { this.fail(error); return false; }
+    return this.send(answerText(request, answers), sessionId);
+  }
+
   showUsage(): void {
     const session = this.mode === "session" ? this.opened : this.selected?.kind === "session" ? this.selected.session : undefined;
     if (!session) { this.fail("Open or select a session first to view /session usage."); return; }
@@ -162,7 +185,7 @@ export class Controller {
   runShell(command: string, replyTo?: string): boolean {
     if (this.closing) return false;
     if (!command.trim()) { this.fail("Usage: !command (for example, !pwd)."); return false; }
-    if (this.activeShell) { this.fail("A direct shell command is already running. Open its session and press Escape or /stop, or wait for it to finish."); return false; }
+    if (this.activeShell) { this.fail("A direct shell command is already running. Open its session and use /stop, or wait for it to finish."); return false; }
     let session = replyTo ? this.session(replyTo) : this.mode === "session" ? this.opened : this.selected?.kind === "session" ? this.selected.session : undefined;
     const project = session ? this.store.state.projects.find((project) => project.id === session!.projectId) : !replyTo ? this.project : undefined;
     if (!project) { this.fail("Select a project or open a session before running a shell command."); return false; }
@@ -220,13 +243,6 @@ export class Controller {
     return true;
   }
 
-  stopShell(sessionId?: string): boolean {
-    const active = this.activeShell;
-    if (!active || active.sessionId !== sessionId || !active.run.running) return false;
-    active.run.cancel();
-    return true;
-  }
-
   showSettings(selected: SettingsSelection = "replyBehavior"): void {
     if (this.closing) return;
     this.dialog = { kind: "settings", sessionId: this.mode === "session" ? this.openedSessionId : undefined, selected };
@@ -281,27 +297,6 @@ export class Controller {
     this.dialog = { kind, sessionId, choices, returnToSettings: previousDialog?.kind === "settings" || undefined };
     this.notice = "";
     this.changed();
-  }
-
-  cycleThinking(): Promise<void> {
-    const mode = this.mode;
-    const sessionId = mode === "session" ? this.openedSessionId : undefined;
-    this.thinkingQueue = this.thinkingQueue.then(async () => {
-      if (this.closing || this.mode !== mode || (mode === "session" && this.openedSessionId !== sessionId)) return;
-      const session = sessionId ? this.session(sessionId) : undefined;
-      const choices = await this.engine.listModels();
-      if (this.closing || this.mode !== mode || (mode === "session" && this.openedSessionId !== sessionId)) return;
-      const current = this.engine.configuration(session);
-      const levels = choices.find((model) => model.provider === current.model?.provider && model.modelId === current.model.modelId)?.thinkingLevels;
-      if (!levels?.length) { this.fail("Choose an available model with /model first."); return; }
-      const next = levels[(levels.indexOf(current.thinkingLevel) + 1) % levels.length]!;
-      if (await this.configure({ thinkingLevel: next }, sessionId)) {
-        this.notice = levels.length === 1 ? `This model supports thinking ${next} only.`
-          : `Thinking ${next}${session?.status === "working" ? " / applies to the next model request" : ""}`;
-        this.changed();
-      }
-    }).catch((error: unknown) => this.fail(error));
-    return this.thinkingQueue;
   }
 
   async skills(): Promise<void> {
@@ -368,6 +363,48 @@ export class Controller {
     if (next) this.select(rowId(next));
   }
 
+  reorderSession(delta: -1 | 1): void {
+    const selected = this.selected;
+    if (this.closing || this.mode !== "sessions" || selected?.kind !== "session") return;
+    const sessions = this.currentRows.filter((row): row is Extract<Row, { kind: "session" }> =>
+      row.kind === "session" && row.project.id === selected.project.id);
+    const index = sessions.findIndex((row) => rowId(row) === this.selection);
+    const next = index + delta;
+    if (next < 0 || next >= sessions.length) return;
+    const ids = sessions.map((row) => row.session.id);
+    [ids[index], ids[next]] = [ids[next]!, ids[index]!];
+    const previous = selected.project.sessionOrder;
+    selected.project.sessionOrder = ids;
+    try { this.store.save(); }
+    catch (error) { selected.project.sessionOrder = previous; this.fail(error); return; }
+    this.notice = "";
+    this.changed();
+  }
+
+  showRenameSession(): void {
+    const selected = this.selected;
+    if (this.closing || this.mode !== "sessions" || selected?.kind !== "session" || this.deletingSessions.has(selected.session.id)) return;
+    this.dialog = { kind: "rename-session", sessionId: selected.session.id };
+    this.notice = "";
+    this.changed();
+  }
+
+  renameSession(sessionId: string, title: string): boolean {
+    const session = this.session(sessionId);
+    if (this.closing || !session || this.deletingSessions.has(sessionId)) return false;
+    title = title.replace(/\s+/g, " ").trim();
+    if (!title) { this.fail("Enter a nonempty session name."); return false; }
+    const previous = { title: session.title, titleRenamed: session.titleRenamed };
+    session.title = title;
+    session.titleRenamed = true;
+    try { this.store.save(); }
+    catch (error) { Object.assign(session, previous); this.fail(error); return false; }
+    this.dialog = undefined;
+    this.notice = "";
+    this.changed();
+    return true;
+  }
+
   toggleProjects(): void {
     this.pendingDelete = undefined;
     const project = this.project;
@@ -397,10 +434,7 @@ export class Controller {
   }
 
   escape(): void {
-    if (this.mode === "session") {
-      if (this.stopShell(this.openedSessionId)) return;
-      void this.cancel(this.openedSessionId); return;
-    }
+    if (this.mode === "session") { void this.cancel(); return; }
     this.back();
   }
 
@@ -512,6 +546,7 @@ export class Controller {
   peek(): void {
     const selected = this.selected;
     if (selected?.kind === "session") {
+      if (pendingQuestion(selected.session)) { this.showQuestions(selected.session.id); return; }
       this.dialog = { kind: "peek", sessionId: selected.session.id };
       this.changed();
     }
@@ -592,7 +627,7 @@ export class Controller {
     const project = target
       ? this.store.state.projects.find((p) => p.id === session?.projectId)
       : this.project;
-    if (!project || (target && !session)) { this.fail("Select a project first. Use ctrl+o to add one."); return false; }
+    if (!project || (target && !session)) { this.fail("Select a project first. Use /projects to add one."); return false; }
     if (images.length && this.engine.supportsImages?.(session) === false) {
       this.fail("This model does not accept images. Choose an image-capable model with /model."); return false;
     }

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { type JsonRepresentation } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { Type, type Message as ModelMessage, type ModelThinkingLevel, type Usage } from "@earendil-works/pi-ai";
+import { type Message as ModelMessage, type ModelThinkingLevel, type Usage } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, getSupportedThinkingLevels, type Models } from "@earendil-works/pi-ai/models";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
@@ -22,6 +22,7 @@ import { generateSessionTitle } from "./title.js";
 import { contextEstimate, conversationUsage, sessionStats, sumUsage } from "./usage.js";
 import { settleWithin } from "./shutdown.js";
 import { UndoDoc, UndoHistory } from "./undo.js";
+import { askQuestionParameters, askMultipleQuestionsParameters, isQuestionTool, questionnaire, questionText } from "./questions.js";
 
 const ctx = BACKGROUND_CONTEXT;
 const SessionMeta = defineDoc<{ sessionId: string; priorUsage?: JsonRepresentation<Usage> }>({
@@ -94,7 +95,7 @@ export function applyView(session: Session, view: ConversationView, priorUsage?:
       if (message.role === "assistant") error = message.stopReason === "error"
         ? message.errorMessage || "The model request failed." : undefined;
       const text = textOf(message);
-      if (message.role === "toolResult" && message.toolName === "ask_user" && !message.isError) needsInput = true;
+      if (message.role === "toolResult" && isQuestionTool(message.toolName) && !message.isError) needsInput = true;
       else if (message.role === "assistant" || message.role === "user") needsInput = false;
       if (message.role === "toolResult") {
         let call = calls.get(message.toolCallId);
@@ -114,7 +115,7 @@ export function applyView(session: Session, view: ConversationView, priorUsage?:
         tool.status = message.isError ? interrupted ? "interrupted" : "error" : "done";
         tool.details = message.details !== undefined || Array.isArray(diagnostics) && diagnostics.length
           ? { result: message.details, diagnostics } : undefined;
-        if (message.toolName === "ask_user" && text) messages.push({ role: "assistant", text, timestamp: message.timestamp });
+        if (isQuestionTool(message.toolName) && !message.isError && text) messages.push({ role: "assistant", text, timestamp: message.timestamp });
         continue;
       }
       messages.push(...thinkingMessages(message, String(entry.id)));
@@ -218,9 +219,13 @@ export class DurableEngine implements Engine {
         section("skills", ({ agent }) => agent.cwd ? skills.prompt(agent.cwd) : undefined, { tag: false }),
       ],
       tools: [defineTool({
-        name: "ask_user", description: "Ask the user a question whenever you expect an answer, including conversational or random questions, clarification, decisions, and approval requests. This marks the session as needs-input and pauses work until the user replies. Do not use for rhetorical questions, quoted questions, or examples that do not need an answer.",
-        parameters: Type.Object({ question: Type.String() }),
+        name: "ask_question", description: "Ask a direct question in chat whenever you expect a conversational reply, including conversational or random questions, clarification, decisions, and approval requests. This is the default question tool. The normal composer stays available; no form or wizard opens. Marks the session as needs-input and pauses work until the user replies. Use ask_multiple_questions only when structured choices or related multi-step questions genuinely benefit from controls. Do not use for rhetorical questions, quoted questions, or examples that do not need an answer.",
+        parameters: askQuestionParameters,
         execute: async ({ question }) => ({ output: [{ type: "text", text: question }], control: { terminate: true } }),
+      }), defineTool({
+        name: "ask_multiple_questions", description: "Collect structured choices or related multi-step answers in a form that replaces the composer. Use ask_question for ordinary conversational questions instead. Marks the session as needs-input and pauses work until the user submits or replies. Supply questions with unique ids and types: radio (single choice), select (single choice, same as radio), multiselect (one or more choices), or input (free text). Choice steps allow at most 5 options total, including the custom answer row. Each listed option requires a value, label, and concise description shown underneath. allowOther defaults to true, leaving room for at most 4 listed options. Options are not searchable or filterable and all descriptions remain visible. The last step reviews answers and requires explicit submission.",
+        parameters: askMultipleQuestionsParameters,
+        execute: async (args) => ({ output: [{ type: "text", text: questionText(questionnaire(args)) }], control: { terminate: true } }),
       })],
     }));
     const harness = await Harness.open(await openNodeSqliteStorage(join(store.root, "sessions.sqlite")), {
@@ -391,7 +396,7 @@ export class DurableEngine implements Engine {
   }
 
   private startTitle(session: Session, prompt: string, changed: () => void): void {
-    if (this.closing || this.stopping.has(session.id)) return;
+    if (this.closing || this.stopping.has(session.id) || session.titleRenamed) return;
     const ref = this.configuration(session).model;
     const model = ref && this.models.getModel(ref.provider, ref.modelId);
     if (!model) return;
@@ -403,7 +408,7 @@ export class DurableEngine implements Engine {
       this.store.save();
       changed();
     }).then((title) => {
-      if (!title || abort.signal.aborted || this.closing || this.stopping.has(session.id) || session.title !== original) return;
+      if (!title || abort.signal.aborted || this.closing || this.stopping.has(session.id) || session.titleRenamed || session.title !== original) return;
       session.title = title;
       this.store.save();
       changed();

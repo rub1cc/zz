@@ -34,7 +34,7 @@ export class SkillCatalog {
   }
 
   async prepare(cwd: string, prompt: string): Promise<PreparedInput> {
-    const match = /^\/skill:([^\s]+)(?:\s+([\s\S]*))?$/.exec(prompt.trim());
+    const match = /^(?:\$|\/skill:)([^\s]+)(?:\s+([\s\S]*))?$/.exec(prompt.trim());
     if (!match) return { content: prompt };
     const name = match[1]!;
     const skill = (await this.get(cwd)).skills.find((s) => s.name === name);

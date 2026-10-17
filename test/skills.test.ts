@@ -49,6 +49,13 @@ test("discovers scoped Pi/Agent skills and installed package skills without runn
     assert.match(explicit.content, /User request:\ncheck the files/);
     assert.match(explicit.content, /Resolve relative references against/);
     assert.equal(explicit.skill?.name, "manual-only");
+    assert.deepEqual(await catalog.prepare(a, "$manual-only check the files"), explicit);
+    assert.deepEqual(await catalog.prepare(a, "  $manual-only\ncheck the files  "), explicit);
+    assert.match((await catalog.prepare(a, "$manual-only")).content, /User request:\nFollow this skill\./);
+    for (const text of ["$", "use $manual-only here", "!echo $manual-only", "draft\n$manual-only"]) {
+      assert.deepEqual(await catalog.prepare(a, text), { content: text });
+    }
+    await assert.rejects(catalog.prepare(a, "$missing task"), /Unknown skill missing/);
     assert.deepEqual(await catalog.prepare(a, "ordinary task"), { content: "ordinary task" });
     await assert.rejects(catalog.prepare(a, "/skill:missing task"), /Unknown skill missing/);
     addSkill(join(a, ".pi", "skills", "new"), "new-skill");

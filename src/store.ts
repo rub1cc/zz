@@ -27,7 +27,9 @@ function isState(value: unknown): value is State {
     && (state.settings === undefined || !!state.settings && isReplyBehavior(state.settings.replyBehavior)
       && (state.settings.showThinking === undefined || typeof state.settings.showThinking === "boolean")
       && (state.settings.compaction === undefined || compactionSettingsError(state.settings.compaction) === undefined))
-    && state.projects.every((p) => typeof p.id === "string" && typeof p.path === "string")
+    && state.projects.every((p) => typeof p.id === "string" && typeof p.path === "string"
+      && (p.sessionOrder === undefined || Array.isArray(p.sessionOrder)
+        && p.sessionOrder.every((id) => typeof id === "string") && new Set(p.sessionOrder).size === p.sessionOrder.length))
     && state.sessions.every((s) => typeof s.id === "string" && typeof s.projectId === "string"
       && (s.conversationId === undefined || Number.isSafeInteger(s.conversationId) && s.conversationId >= 0)
       && (s.shellResponses === undefined || Array.isArray(s.shellResponses) && s.shellResponses.every(isShellResponse)
@@ -39,6 +41,7 @@ function isState(value: unknown): value is State {
         && (input.mode === undefined || isReplyBehavior(input.mode))
         && (input.imageCount === undefined || Number.isSafeInteger(input.imageCount) && input.imageCount >= 0)))
       && typeof s.title === "string" && typeof s.preview === "string"
+      && (s.titleRenamed === undefined || typeof s.titleRenamed === "boolean")
       && (s.stopped === undefined || typeof s.stopped === "boolean")
       && (s.agent === undefined || isAgentSettings(s.agent))
       && (s.compactions === undefined || Array.isArray(s.compactions) && s.compactions.every(isCompaction))
