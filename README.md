@@ -904,17 +904,23 @@ Node.js 22.19 and 24. Only after all checks pass does it create a GitHub release
 with `zz.tgz`, `zz.tgz.sha256`, and `install.sh`. No npm registry publish or npm
 publish token is needed; the workflow uses the repository's `GITHUB_TOKEN`.
 
-For the first release, commit the release setup and push it along with the tag:
+To release, first commit your changes on `main` so the working tree is clean, then:
 
 ```sh
-git tag v0.0.1
-git push origin main
-git push origin v0.0.1
+npm run check
+npm test
+npm version patch
+git push --atomic origin main --follow-tags
 ```
 
-For subsequent releases, run `npm version patch --no-git-tag-version` (or choose
-`minor`/`major`), commit both package files, then tag that commit with the matching
-`vX.Y.Z`. Packaging rejects mismatches between the tag, package.json, and lockfile.
+Use `minor` or `major` instead of `patch` when appropriate. `npm version` updates
+`package.json` and `package-lock.json`, commits both, and creates the matching
+annotated `vX.Y.Z` tag. Do not bump the version or create the tag separately.
+Packaging still rejects mismatches between the tag, package.json, and lockfile.
+
+The atomic push sends the commit and tag together. Only a pushed version tag
+triggers a release; ordinary pushes to `main` do not. `npm version` alone stays
+local until you push.
 
 To inspect a release package locally:
 
