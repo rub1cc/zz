@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -8,7 +9,8 @@ import { stripTerminalSequences, TuiAltScreen, visibleWidth } from "@earendil-wo
 import { Controller } from "../src/controller.js";
 import { Composer } from "../src/composer.js";
 import { rows, rowId, type CompactResult } from "../src/model.js";
-import { Store } from "../src/store.js";
+import { displayPath, Store } from "../src/store.js";
+import { version } from "../src/version.js";
 import { Dashboard, scrollToEndIndicator } from "../src/ui.js";
 import { UndoDialog } from "../src/undo-dialog.js";
 import { QuestionComposer } from "../src/question-composer.js";
@@ -67,7 +69,7 @@ test("dashboard uses terminal edges for headers, composer and footer in every vi
           const lines = f.tui.getScreenLines().map(stripTerminalSequences);
           assert.equal(lines.length, height);
           assert.ok(lines.every((line) => visibleWidth(line) <= width));
-          const heading = mode === "projects" ? "Projects" : mode === "session" ? session.title : "0 awaiting";
+          const heading = mode === "projects" ? "Projects" : mode === "session" ? session.title : `ZZ v${version}`;
           assert.ok(lines[0]!.startsWith(heading.slice(0, 8)), `${mode} ${width}x${height}: ${JSON.stringify(lines[0])}`);
           assert.ok(lines.at(-1)!.startsWith(mode === "projects" ? "r twice" : "test/mock"), `${mode} ${width}x${height}: ${JSON.stringify(lines.at(-1))}`);
           const border = mode === "projects" ? "-".repeat(width)
@@ -77,6 +79,66 @@ test("dashboard uses terminal edges for headers, composer and footer in every vi
         }
       }
     }
+  } finally { await f.cleanup(); }
+});
+
+test("dashboard header shows the running version, new-session defaults, selected path and agent counts", async () => {
+  const f = setup();
+  try {
+    const screen = () => { f.tui.renderNow(); return f.tui.getScreenLines().map(stripTerminalSequences); };
+    f.c.select(`project:${f.pa.id}`);
+    const initial = screen();
+    assert.equal(initial[0]!.trimEnd(), `ZZ v${version}`);
+    assert.equal(initial[1]!.trimEnd(), `New sessions: test/mock · thinking off · ${displayPath(f.pa.path)}`);
+    assert.equal(initial[2]!.trimEnd(), "0 awaiting input · 0 working · 0 completed");
+    f.c.select(`project:${f.pb.id}`);
+    await f.engine.configure({ model: { provider: "test", modelId: "reasoner" }, thinkingLevel: "high" });
+    f.c.changed();
+    assert.equal(screen()[1]!.trimEnd(), `New sessions: test/reasoner · high effort · ${displayPath(f.pb.path)}`);
+    for (const status of ["working", "needs-input", "completed", "paused", "failed"] as const) {
+      f.c.select(`project:${f.pb.id}`);
+      f.c.send(status); await tick();
+      const session = f.store.state.sessions.at(-1)!;
+      session.status = status;
+      session.agent = { model: { provider: "other", modelId: "session-only" }, thinkingLevel: "low" };
+    }
+    f.c.changed();
+    assert.match(screen()[1]!, /New sessions: test\/reasoner · high effort/);
+    assert.equal(screen()[2]!.trimEnd(), "1 awaiting input · 1 working · 1 completed · 2 interrupted or failed");
+    f.engine.defaults = { thinkingLevel: "off" };
+    f.store.state.projects = [];
+    f.c.changed();
+    assert.equal(screen()[1]!.trimEnd(), "New sessions: no model configured · thinking off");
+    assert.equal(screen()[2]!.trimEnd(), "0 awaiting input · 0 working · 0 completed");
+  } finally { await f.cleanup(); }
+});
+
+test("dashboard project headings show Git branches without changing session headers", async () => {
+  const f = setup();
+  try {
+    // Leave the dashboard while initializing so its first query reads the new repository.
+    f.c.mode = "session"; f.c.changed();
+    execFileSync("git", ["-C", f.pa.path, "init", "--initial-branch=fix/login"], { stdio: "pipe" });
+    f.c.mode = "sessions"; f.c.changed();
+    let heading = "";
+    for (let attempt = 0; attempt < 100; attempt++) {
+      heading = stripTerminalSequences(f.app.body.render(240)[0]!);
+      if (heading.includes("[fix/login]")) break;
+      await delay(10);
+    }
+    assert.match(heading, /\[fix\/login\]  0 sessions/);
+    for (const width of [40, 80, 240]) {
+      const line = f.app.body.render(width)[0]!;
+      assert.ok(visibleWidth(line) <= width);
+      assert.match(stripTerminalSequences(line), /\[fix\/login\]  0 sessions/);
+    }
+    f.c.select(`project:${f.pa.id}`);
+    f.c.send("Fix login"); await tick();
+    f.c.select(`session:${f.store.state.sessions[0]!.id}`); f.c.open();
+    f.tui.renderNow();
+    const lines = f.tui.getScreenLines().map(stripTerminalSequences);
+    assert.equal(lines[0]!.trimEnd(), "Fix login");
+    assert.equal(lines[1]!.trimEnd(), `${displayPath(f.pa.path)}  completed`);
   } finally { await f.cleanup(); }
 });
 
@@ -1101,7 +1163,7 @@ test("composer status always shows below the editor with no shortcut toggle or h
   try {
     const idle = "test/mock · off · ?/100k · ◉ ? · cost ?";
     assert.deepEqual(belowComposer(), [idle]);
-    assert.equal(render().filter((line) => line.includes("test/mock")).length, 1, "Model appears only below the composer");
+    assert.equal(render().filter((line) => line.includes("test/mock")).length, 2, "Dashboard defaults and composer status both show the model");
     assert.doesNotMatch(render().join("\n"), /shortcuts|ctrl\+l model|shift\+tab cycle|ctrl\+j newline|New task in /);
     f.terminal.onInput("?");
     assert.equal(Boolean(f.c.dialog), false);

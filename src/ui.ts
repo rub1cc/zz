@@ -21,6 +21,8 @@ import { DirectoryInput } from "./directory-input.js";
 import { composerCommands } from "./discovery.js";
 import { composerStatus, usageDetails } from "./usage.js";
 import { TaskDisplay, taskDetails, taskProgress, taskVisibleLimit, type TaskDisplayClock } from "./task-display.js";
+import { GitBranches } from "./git-branches.js";
+import { version } from "./version.js";
 
 export const scrollToEndIndicator = () => accent("[ Scroll to bottom (/bottom) ]");
 
@@ -48,7 +50,7 @@ class SessionList extends Dynamic {
   private hits = new Map<number, Row>();
   readonly transcript: Transcript;
 
-  constructor(readonly controller: Controller) {
+  constructor(readonly controller: Controller, private readonly branches: GitBranches) {
     super((width) => this.drawList(width));
     this.transcript = new Transcript(controller, () => controller.changed());
   }
@@ -81,8 +83,12 @@ class SessionList extends Dynamic {
       let rowLines: string[];
       if (row.kind === "project") {
         const count = c.store.state.sessions.filter((s) => s.projectId === row.project.id).length;
-        const heading = `${selected ? ">" : " "} ${bold(oneLine(displayPath(row.project.path)))}`;
-        rowLines = [`${heading}${dim(`  ${count} session${count === 1 ? "" : "s"}`)}`];
+        const branch = this.branches.value(row.project.path);
+        const collapsed = c.mode === "sessions" && c.collapsedProjects.has(row.project.id);
+        const metadata = `${branch ? `  [${oneLine(branch)}]` : ""}  ${count} session${count === 1 ? "" : "s"}${collapsed ? " (collapsed)" : ""}`;
+        const pathWidth = Math.max(8, width - visibleWidth(metadata) - 2);
+        const heading = `${selected ? ">" : " "} ${bold(fit(oneLine(displayPath(row.project.path)), pathWidth))}`;
+        rowLines = [`${heading}${dim(metadata)}`];
         if (c.pendingProjectRemoval === row.project.id) {
           rowLines.push(...wrapTextWithAnsi(red("r again to remove from list (files and sessions kept); any other key cancels"), Math.max(1, width)));
         }
@@ -183,6 +189,7 @@ export class Dashboard extends VStack implements Focusable {
   private readonly bodyHost = new VStack();
   private readonly wheelScroll = new AdaptiveWheelScroll();
   private readonly taskDisplay: TaskDisplay;
+  private readonly branches: GitBranches;
   get scroll(): ScrollView { return this.controller.mode === "session" ? this.chatScroll : this.listScroll; }
   private overlay?: OverlayHandle;
   private activeDialog?: Controller["dialog"];
@@ -209,11 +216,12 @@ export class Dashboard extends VStack implements Focusable {
   constructor(readonly controller: Controller, readonly tui: TuiAltScreen, readonly quit: () => void, taskClock?: TaskDisplayClock) {
     super();
     this.taskDisplay = new TaskDisplay(() => tui.requestRender(), taskClock);
+    this.branches = new GitBranches(() => tui.requestRender());
     // The viewport handles this binding before dashboard input; use /bottom instead.
     const keybindings = getKeybindings();
     keybindings.setUserBindings({ ...keybindings.getUserBindings(), "tui.altScreen.bottom": [] });
     this.composer = new Composer(tui, "describe a task for a new session", (error) => controller.fail(error));
-    this.body = new SessionList(controller);
+    this.body = new SessionList(controller, this.branches);
     this.listScroll = new SessionListScroll(this.body);
     this.chatScroll = new ScrollView(this.body, { primary: true, follow: "end", scrollbar: "auto" });
     this.bodyHost.addChild(this.listScroll, { basis: 0, grow: 1, minSize: 1 });
@@ -300,7 +308,15 @@ export class Dashboard extends VStack implements Focusable {
     const visible = c.store.state.sessions.filter((s) => c.store.state.projects.some((p) => p.id === s.projectId));
     const count = (status: string) => visible.filter((s) => displayStatus(s) === status).length;
     const extra = count("failed") + count("paused");
-    return [dim(`${count("needs-input")} awaiting input / ${count("working")} working / ${count("completed")} completed${extra ? ` / ${extra} interrupted or failed` : ""}`), ""];
+    const settings = c.engine.configuration();
+    const model = settings.model ? `${settings.model.provider}/${settings.model.modelId}` : "no model configured";
+    const thinking = settings.thinkingLevel === "off" ? "thinking off" : `${settings.thinkingLevel} effort`;
+    const path = c.project ? ` · ${displayPath(c.project.path)}` : "";
+    return [
+      `${bold("ZZ")} ${dim(`v${version}`)}`,
+      dim(oneLine(`New sessions: ${model} · ${thinking}${path}`)),
+      dim(`${count("needs-input")} awaiting input · ${count("working")} working · ${count("completed")} completed${extra ? ` · ${extra} interrupted or failed` : ""}`), "",
+    ];
   }
 
   private footer(width: number): string[] {
@@ -319,10 +335,11 @@ export class Dashboard extends VStack implements Focusable {
         c.auth?.codexQuota?.value(c.configuration.model?.provider))];
   }
 
-  dispose(): void { this.taskDisplay.close(); this.controller.auth?.codexQuota?.close(); }
+  dispose(): void { this.branches.close(); this.taskDisplay.close(); this.controller.auth?.codexQuota?.close(); }
 
   sync(): void {
     const c = this.controller;
+    this.branches.sync(c.mode === "session" ? [] : c.store.state.projects.map((project) => project.path));
     const quotaSettings = c.dialog?.kind === "peek" ? c.engine.configuration(c.session(c.dialog.sessionId)) : c.configuration;
     c.auth?.codexQuota?.select(c.mode === "projects" ? undefined : quotaSettings.model?.provider);
     this.taskDisplay.sync(c.store.state.sessions);
@@ -501,7 +518,11 @@ export class Dashboard extends VStack implements Focusable {
       }
       if (!this.composer.hasContent) {
         if (matchesKey(data, "space")) { c.peek(); return; }
-        if (matchesKey(data, "enter")) { c.open(); return; }
+        if (matchesKey(data, "enter")) {
+          if (c.selected?.kind === "project") c.toggleProject();
+          else c.open();
+          this.revealSelection(); return;
+        }
       }
     }
     this.composer.handleInput(data);
@@ -591,6 +612,7 @@ class DialogView implements Component, Focusable {
       "up / ctrl+p     select previous project or session",
       "down / ctrl+n   select next project or session",
       "enter           new task when composer has text", "enter           open session when composer is empty",
+      "enter           collapse or expand selected project (empty composer)",
       "enter           queue a busy-session reply (/settings chooses follow-up or steer)",
       "↑ / ↓           recall sent prompts in session / peek (empty draft or start of first line)",
       "↓               after newest recalled prompt, restore your unsent draft",

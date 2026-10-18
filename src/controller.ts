@@ -40,6 +40,7 @@ export type Dialog =
 export class Controller {
   mode: Mode = "sessions";
   selection?: string;
+  readonly collapsedProjects = new Set<string>();
   openedSessionId?: string;
   dialog?: Dialog;
   questionForm?: QuestionForm;
@@ -82,7 +83,10 @@ export class Controller {
     store.save();
   }
 
-  get currentRows(): Row[] { return rows(this.store.state, this.mode === "projects"); }
+  get currentRows(): Row[] {
+    return rows(this.store.state, this.mode === "projects")
+      .filter((row) => this.mode !== "sessions" || row.kind === "project" || !this.collapsedProjects.has(row.project.id));
+  }
   get selected(): Row | undefined { return this.currentRows.find((row) => rowId(row) === this.selection); }
   get project(): Project | undefined {
     if (this.mode === "session") return this.store.state.projects.find((p) => p.id === this.opened?.projectId);
@@ -426,6 +430,15 @@ export class Controller {
     this.changed();
   }
 
+  toggleProject(): void {
+    const selected = this.selected;
+    if (this.closing || this.mode !== "sessions" || selected?.kind !== "project") return;
+    const id = selected.project.id;
+    if (!this.collapsedProjects.delete(id)) this.collapsedProjects.add(id);
+    this.notice = "";
+    this.changed();
+  }
+
   open(): void {
     const selected = this.selected;
     if (selected?.kind !== "session") return;
@@ -441,6 +454,7 @@ export class Controller {
     this.pendingProjectRemoval = undefined;
     this.dialog = undefined;
     if (this.mode === "session") {
+      if (this.opened) this.collapsedProjects.delete(this.opened.projectId);
       this.selection = this.openedSessionId ? `session:${this.openedSessionId}` : this.selection;
       this.mode = "sessions";
     } else if (this.mode === "projects") this.mode = "sessions";
@@ -707,6 +721,7 @@ export class Controller {
         this.store.state.sessions = this.store.state.sessions.filter((s) => s !== session);
         this.fail(error); return false;
       }
+      this.collapsedProjects.delete(project.id);
       this.selection = `session:${session.id}`;
     }
     if (!busy) {

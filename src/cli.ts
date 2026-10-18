@@ -16,10 +16,11 @@ import { statusRefreshInterval } from "./format.js";
 import { createShutdown } from "./shutdown.js";
 import { setDiffBackground } from "./diff-background.js";
 import { upgrade } from "./upgrade.js";
+import { version } from "./version.js";
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
-  options: { help: { type: "boolean", short: "h" }, model: { type: "string" }, thinking: { type: "string" }, "data-dir": { type: "string" } },
+  options: { help: { type: "boolean", short: "h" }, version: { type: "boolean", short: "v" }, model: { type: "string" }, thinking: { type: "string" }, "data-dir": { type: "string" } },
 });
 
 if (values.help) {
@@ -27,8 +28,10 @@ if (values.help) {
 
 Usage: zz [project-directory] [--model provider/model-id] [--thinking level] [--data-dir path]
        zz upgrade
+       zz --version
 
-zz upgrade installs the latest release. Use zz ./upgrade to open a directory named upgrade.
+zz upgrade checks for updates and installs only a newer release.
+Use zz ./upgrade to open a directory named upgrade.
 
 New tasks run in the selected project. Up/down or ctrl+p/ctrl+n navigates the list.
 With an empty composer: enter opens a session; space peeks and lets you reply.
@@ -60,6 +63,8 @@ Backspace with empty draft text removes the last staged image.
 /settings controls reasoning visibility. Project instruction Markdown loads automatically.
 Data: --data-dir, ZZ_DATA_DIR, or ~/.zz (default).
 Agents can edit files and run commands. Project directories are not sandboxes.`);
+} else if (values.version) {
+  console.log(version);
 } else {
   void main().catch((error: unknown) => {
     console.error(`zz: ${error instanceof Error ? error.message : String(error)}`);
@@ -72,7 +77,7 @@ async function main(): Promise<void> {
     if (positionals.length !== 1 || values.model !== undefined || values.thinking !== undefined || values["data-dir"] !== undefined) {
       throw new Error("Usage: zz upgrade");
     }
-    upgrade();
+    await upgrade();
     return;
   }
   if (positionals.length > 1) throw new Error("Pass at most one project directory.");

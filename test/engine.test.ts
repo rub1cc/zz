@@ -2274,3 +2274,18 @@ test("compaction preserves the completion deadline and cleanup does not touch ot
     assert.deepEqual(f.errors, []);
   } finally { await f.engine.close(); f.cleanup(); }
 });
+
+test("engine tool rounds wait for shell mutations before admitting following file reads", async () => {
+  const f = await undoFixture();
+  try {
+    writeFileSync(join(f.project.path, "ordered.txt"), "before");
+    await f.engine.run(f.s, f.project, toolPrompt(
+      taskCall("bash", { command: "sleep 0.05; printf after > ordered.txt" }, "mutate"),
+      taskCall("read", { path: "ordered.txt" }, "observe"),
+    ), () => {});
+    const read = f.s.messages.find((message) => message.tool?.name === "read")!.tool!;
+    assert.equal(read.status, "done");
+    assert.equal(read.output, "after");
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});

@@ -25,6 +25,7 @@ import { UndoDoc, UndoHistory } from "./undo.js";
 import { askQuestionParameters, askMultipleQuestionsParameters, isQuestionTool, questionnaire, questionText } from "./questions.js";
 import { createLegacyTaskExtension, createTaskExtension, TasksDoc, updateTaskCompletion, type TaskState } from "./tasks.js";
 import { TaskCleanup, taskCleanupClock, type TaskCleanupClock } from "./task-cleanup.js";
+import { createToolSchedulingExtension } from "./tool-scheduling.js";
 
 const ctx = BACKGROUND_CONTEXT;
 const SessionMeta = defineDoc<{ sessionId: string; priorUsage?: JsonRepresentation<Usage> }>({
@@ -239,6 +240,7 @@ export class DurableEngine implements Engine {
         execute: async (args) => ({ output: [{ type: "text", text: questionText(questionnaire(args)) }], control: { terminate: true } }),
       })],
     }));
+    registry.install(createToolSchedulingExtension(registry, () => harness));
     const harness = await Harness.open(await openNodeSqliteStorage(join(store.root, "sessions.sqlite")), {
       models, registry, settings: { get compaction() { return store.compaction; } }, env: ({ cwd }) => {
         if (!cwd) throw new Error("Session has no project directory.");

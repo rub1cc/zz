@@ -34,6 +34,79 @@ function setup() {
     async cleanup() { await controller.close(); tui.stop(); temp.cleanup(); } };
 }
 
+test("Enter toggles only the selected project's dashboard sessions and navigation skips hidden rows", async () => {
+  const f = setup();
+  try {
+    const first = f.add("alpha first");
+    f.add("alpha second");
+    const other = f.add("beta session", f.beta.id);
+    f.controller.select(`project:${f.alpha.id}`);
+    const original = f.ids();
+    f.terminal.onInput("\r");
+    assert.equal(f.controller.mode, "sessions");
+    assert.equal(f.controller.selection, `project:${f.alpha.id}`);
+    assert.deepEqual(f.ids(), []);
+    const screen = f.app.body.render(120).map(stripTerminalSequences).join("\n");
+    assert.match(screen, /2 sessions \(collapsed\)/);
+    assert.doesNotMatch(screen, /alpha first|alpha second/);
+    assert.match(screen, /beta session/);
+    f.terminal.onInput("\x1b[B");
+    assert.equal(f.controller.selection, `project:${f.beta.id}`);
+    f.terminal.onInput("\x1b[B");
+    assert.equal(f.controller.selection, `session:${other.id}`);
+    f.controller.select(`project:${f.alpha.id}`);
+    f.terminal.onInput("\r");
+    assert.deepEqual(f.ids(), original);
+    assert.doesNotMatch(f.app.body.render(120).map(stripTerminalSequences).join("\n"), /collapsed/);
+    assert.equal(f.engine.calls.length, 0);
+    f.controller.select(`session:${first.id}`);
+    f.terminal.onInput("\r");
+    assert.equal(f.controller.mode, "session");
+    assert.equal(f.controller.openedSessionId, first.id);
+  } finally { await f.cleanup(); }
+});
+
+test("collapsed projects retain sessions, allow new tasks and reveal the opened session on return", async () => {
+  const f = setup();
+  try {
+    const existing = f.add("existing session");
+    f.controller.select(`project:${f.alpha.id}`);
+    f.terminal.onInput("\r");
+    f.controller.changed();
+    assert.deepEqual(f.ids(), [], "Background updates must not expand the project");
+    f.command("/projects");
+    f.terminal.onInput("\r");
+    assert.deepEqual(f.ids(), [], "Selecting a project in management must not toggle collapse");
+    f.app.composer.setValue("new task in collapsed project");
+    f.terminal.onInput("\r");
+    assert.equal(f.engine.calls.length, 1);
+    assert.equal(f.engine.calls[0]?.project.id, f.alpha.id);
+    assert.equal(f.controller.mode, "sessions");
+    assert.ok(f.controller.selected?.kind === "session", "New tasks must select a visible row");
+    assert.equal(f.ids().length, 2);
+    f.terminal.onInput("\r");
+    assert.equal(f.controller.mode, "session");
+    assert.ok(f.store.state.sessions.includes(existing));
+    f.terminal.onInput("\x1b[D");
+    assert.equal(f.controller.mode, "sessions");
+    assert.ok(f.controller.selected?.kind === "session");
+    assert.equal(f.ids().length, 2);
+  } finally { await f.cleanup(); }
+});
+
+test("Enter safely toggles an empty dashboard project", async () => {
+  const f = setup();
+  try {
+    f.controller.select(`project:${f.alpha.id}`);
+    f.terminal.onInput("\r");
+    assert.match(f.app.body.render(120).map(stripTerminalSequences).join("\n"), /0 sessions \(collapsed\)/);
+    f.terminal.onInput("\r");
+    assert.doesNotMatch(f.app.body.render(120).map(stripTerminalSequences).join("\n"), /collapsed/);
+    assert.equal(f.controller.selection, `project:${f.alpha.id}`);
+    assert.equal(f.engine.calls.length, 0);
+  } finally { await f.cleanup(); }
+});
+
 test("/projects replaces Ctrl+O from dashboard and open session, without creating agent work", async () => {
   const f = setup();
   try {

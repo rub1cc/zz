@@ -5,8 +5,20 @@ import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirS
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
+import { version } from "../src/version.js";
 
 const installer = readFileSync(resolve("install.sh"), "utf8");
+const releasePreload = `
+  import { appendFileSync } from "node:fs";
+  import { join } from "node:path";
+  globalThis.fetch = async (url) => {
+    appendFileSync(join(process.env.TEST_INSTALL_ROOT, "calls"), JSON.stringify({ command: "release-check", args: [String(url)] }) + "\\n");
+    if (String(url) !== "https://api.github.com/repos/rub1cc/zz/releases/latest") throw new Error("Unexpected URL");
+    if (process.env.TEST_CHECK_FAIL) throw new Error("Update check unavailable");
+    return new Response(process.env.TEST_RELEASE_RESPONSE ?? JSON.stringify({ tag_name: process.env.TEST_RELEASE_TAG ?? "v999.0.0" }),
+      { status: Number(process.env.TEST_CHECK_STATUS ?? "200") });
+  };
+`;
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "zz-installer-"));
@@ -40,7 +52,8 @@ if (command === "curl") {
     root, bin,
     run(extra: Record<string, string> = {}, upgrade = false) {
       // Exercise the actual installer in both the piped and CLI upgrade flows.
-      return spawnSync(upgrade ? process.execPath : "bash", upgrade ? ["--import", "tsx", "src/cli.ts", "upgrade"] : [], {
+      return spawnSync(upgrade ? process.execPath : "bash", upgrade ? ["--import", "tsx", "--import",
+        `data:text/javascript,${encodeURIComponent(releasePreload)}`, "src/cli.ts", "upgrade"] : [], {
         input: upgrade ? undefined : installer, encoding: "utf8", timeout: 20000, env: {
           ...process.env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: temp, TSX_DISABLE_CACHE: "1",
           ZZ_VERSION: "", ZZ_INSTALL_PREFIX: join(root, "prefix with spaces"),
@@ -188,15 +201,49 @@ test("zz upgrade installs latest without a TTY, ignores version pins, and respec
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Installed zz/);
     const calls = f.calls();
-    assert.equal(calls.length, 3);
-    assert.ok(calls[0]!.args.includes("https://github.com/rub1cc/zz/releases/latest/download/zz.tgz"));
-    assert.ok(calls[1]!.args.includes("https://github.com/rub1cc/zz/releases/latest/download/zz.tgz.sha256"));
-    assert.deepEqual(calls[2]!.args.slice(0, -1), ["install", "--global", "--prefix", join(f.root, "prefix with spaces"),
+    assert.match(result.stdout, /Upgrading zz .* to v999\.0\.0/);
+    assert.equal(calls.length, 4);
+    assert.deepEqual(calls[0], { command: "release-check", args: ["https://api.github.com/repos/rub1cc/zz/releases/latest"] });
+    assert.ok(calls[1]!.args.includes("https://github.com/rub1cc/zz/releases/download/v999.0.0/zz.tgz"));
+    assert.ok(calls[2]!.args.includes("https://github.com/rub1cc/zz/releases/download/v999.0.0/zz.tgz.sha256"));
+    assert.deepEqual(calls[3]!.args.slice(0, -1), ["install", "--global", "--prefix", join(f.root, "prefix with spaces"),
       "--ignore-scripts", "--omit=dev", "--no-audit", "--no-fund"]);
     assert.equal(readdirSync(f.root).includes("unused-data"), false);
     f.assertClean();
   } finally { f.cleanup(); }
 });
+
+for (const tag of [`v${version}`, "v0.0.1"]) {
+  test(`zz upgrade skips downloads and installation when latest is ${tag}`, () => {
+    const f = fixture();
+    try {
+      const result = f.run({ TEST_RELEASE_TAG: tag }, true);
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout, /is up to date/);
+      assert.doesNotMatch(result.stdout, /Downloading zz|Upgrading zz|Installed zz/);
+      assert.deepEqual(f.calls().map(call => call.command), ["release-check"]);
+      f.assertClean();
+    } finally { f.cleanup(); }
+  });
+}
+
+const failedChecks: Record<string, string>[] = [
+  { TEST_CHECK_FAIL: "1" }, { TEST_CHECK_STATUS: "403" }, { TEST_CHECK_STATUS: "404" },
+  { TEST_RELEASE_RESPONSE: "not json" }, { TEST_RELEASE_TAG: "v999.0.0-beta.1" }, { TEST_RELEASE_TAG: "../../bad" },
+];
+for (const env of failedChecks) {
+  test(`zz upgrade stops before downloading when update check fails: ${JSON.stringify(env)}`, () => {
+    const f = fixture();
+    try {
+      const result = f.run(env, true);
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, /Could not check for updates/);
+      assert.doesNotMatch(result.stdout, /Downloading zz|Upgrading zz|Installed zz|is up to date/);
+      assert.deepEqual(f.calls().map(call => call.command), ["release-check"]);
+      f.assertClean();
+    } finally { f.cleanup(); }
+  });
+}
 
 for (const failure of ["checksum", "download", "npm", "prefix"] as const) {
   test(`zz upgrade reports ${failure} failure without claiming success`, () => {

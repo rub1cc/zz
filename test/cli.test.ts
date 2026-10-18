@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { test } from "node:test";
@@ -39,9 +40,26 @@ test("CLI help documents upgrade without running the installer", () => {
     encoding: "utf8", timeout: 20000,
   });
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /zz upgrade installs the latest release/);
+  assert.match(result.stdout, /zz upgrade checks for updates and installs only a newer release/);
+  assert.match(result.stdout, /zz --version/);
   assert.doesNotMatch(result.stdout, /Downloading zz/);
 });
+
+for (const flag of ["--version", "-v"]) {
+  test(`CLI ${flag} prints the package version without a TTY or data directory`, () => {
+    const temp = temporary();
+    try {
+      const result = spawnSync(process.execPath, ["--import", "tsx", "src/cli.ts", flag], {
+        encoding: "utf8", timeout: 20000,
+        env: { ...process.env, ZZ_DATA_DIR: join(temp.root, "unused-data") },
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout.trim(), JSON.parse(readFileSync("package.json", "utf8")).version);
+      assert.equal(result.stderr, "");
+      assert.equal(existsSync(join(temp.root, "unused-data")), false);
+    } finally { temp.cleanup(); }
+  });
+}
 
 for (const args of [["extra"], ["--model", "provider/model"], ["--thinking", "high"], ["--data-dir", "/tmp/zz"]]) {
   test(`CLI rejects unsupported upgrade arguments: ${args.join(" ")}`, () => {

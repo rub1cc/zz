@@ -16,17 +16,22 @@ The installer downloads the latest GitHub release, verifies its SHA-256 checksum
 and uses npm to install the prebuilt command and locked production dependencies.
 It does not install Node.js, run dependency install scripts, or require sudo.
 The default prefix is `~/.local`; if needed, add `~/.local/bin` to your `PATH`
-(the installer prints the command). Run `zz upgrade` to install the latest release:
+(the installer prints the command). Check your version and upgrade with:
 
 ```sh
+zz --version
 zz upgrade
 ```
+
+`zz upgrade` checks GitHub's latest stable release first. It downloads and installs
+only when that version is newer; otherwise it reports that zz is up to date.
+If the update check fails, nothing is downloaded or installed.
 
 Upgrades use the same checksum-verified installer, keep the current global npm
 install prefix, and leave sessions and Pi credentials untouched. `ZZ_INSTALL_PREFIX`
 overrides the destination; source checkouts default to `~/.local`. `ZZ_VERSION` is
-ignored by `zz upgrade` so it always installs the latest release. Use `zz ./upgrade`
-to open a project directory named `upgrade`.
+ignored by `zz upgrade`; the installer uses the exact release found by the update
+check. Use `zz ./upgrade` to open a project directory named `upgrade`.
 A published GitHub release is required; the first release is **v0.0.1**.
 
 To pin a version or choose a different install prefix:
