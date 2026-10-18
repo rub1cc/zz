@@ -98,6 +98,38 @@ test("/projects works with no configured projects and offers adding a directory"
   } finally { await f.cleanup(); }
 });
 
+test("Add project completes folders with Tab, adds only on Enter and dismisses suggestions before canceling", async () => {
+  const f = setup();
+  try {
+    const a = join(f.root, "new-alpha"); const b = join(f.root, "new-beta space");
+    mkdirSync(a); mkdirSync(b); writeFileSync(join(f.root, "new-file"), "");
+    f.command("/projects"); f.terminal.onInput("a");
+    f.terminal.onInput(`${f.root}/new-`);
+    const screen = () => {
+      f.tui.renderNow();
+      return f.tui.getScreenLines().map(stripTerminalSequences).join("\n");
+    };
+    for (let i = 0; i < 100 && !screen().includes("new-beta space/"); i++) await delay(10);
+    assert.match(screen(), /new-alpha\//);
+    assert.match(screen(), /new-beta space\//);
+    assert.doesNotMatch(screen(), /new-file/);
+    f.terminal.onInput("\x1b[B"); f.terminal.onInput("\t");
+    assert.equal(f.store.state.projects.length, 2, "Tab does not add the project");
+    f.terminal.onInput("\r");
+    assert.equal(f.controller.dialog, undefined);
+    assert.equal(f.controller.project?.path, b);
+    assert.equal(f.store.state.projects.length, 3);
+    f.terminal.onInput("a"); f.terminal.onInput(`${f.root}/new-`);
+    for (let i = 0; i < 100 && !screen().includes("new-beta space/"); i++) await delay(10);
+    f.terminal.onInput("\x1b");
+    assert.equal((f.controller as Controller).dialog?.kind, "add-project");
+    assert.doesNotMatch(screen(), /new-beta space\//);
+    f.terminal.onInput("\x1b");
+    assert.equal(f.controller.dialog, undefined);
+    assert.equal(f.engine.calls.length, 0);
+  } finally { await f.cleanup(); }
+});
+
 test("r twice removes a project from the list, preserving files, sessions and active work across re-add", async () => {
   const f = setup();
   try {

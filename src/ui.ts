@@ -17,6 +17,7 @@ import { UndoDialog } from "./undo-dialog.js";
 import { QuestionComposer } from "./question-composer.js";
 import { pendingQuestion } from "./questions.js";
 import { Composer } from "./composer.js";
+import { DirectoryInput } from "./directory-input.js";
 import { composerCommands } from "./discovery.js";
 import { composerStatus, usageDetails } from "./usage.js";
 import { TaskDisplay, taskDetails, taskProgress, taskVisibleLimit, type TaskDisplayClock } from "./task-display.js";
@@ -519,7 +520,9 @@ class DialogView implements Component, Focusable {
   constructor(readonly controller: Controller, readonly tui: TuiAltScreen, private readonly taskDisplay: TaskDisplay) {
     this.input = controller.dialog?.kind === "peek"
       ? new Composer(tui, "reply to this session", (error) => controller.fail(error))
-      : new Input({ placeholder: "/path/to/project", placeholderStyle: dim });
+      : controller.dialog?.kind === "add-project"
+        ? new DirectoryInput(() => tui.requestRender())
+        : new Input();
     const dialog = controller.dialog;
     if (this.input instanceof Composer && dialog?.kind === "peek") {
       this.input.setHistory(promptHistory(controller.session(dialog.sessionId)));
@@ -543,6 +546,7 @@ class DialogView implements Component, Focusable {
     const c = this.controller;
     const dialog = c.dialog;
     if (this.input instanceof Composer && this.input.handleDiscoveryInput(data)) { this.tui.requestRender(); return; }
+    if (this.input instanceof DirectoryInput && this.input.dismissSuggestions(data)) { this.tui.requestRender(); return; }
     if (matchesKey(data, "escape")) {
       c.dialog = undefined; c.notice = ""; c.changed(); return;
     }
@@ -620,8 +624,8 @@ class DialogView implements Component, Focusable {
       return frame([bold("zz shortcuts"), "", ...help.slice(this.offset, this.offset + height), "", dim("pgup pgdn scroll / any other key closes")]);
     }
     if (dialog.kind === "add-project") return frame([
-      bold("Add project"), dim("Enter an existing directory. ~ is supported."), "",
-      ...this.input.render(inner), "", c.notice ? warning(oneLine(c.notice)) : dim("enter add / esc cancel"),
+      bold("Add project"), dim("Enter an existing directory. ~ is supported; spaces need no quotes."), "",
+      ...this.input.render(inner), "", c.notice ? warning(oneLine(c.notice)) : dim("up/down select / tab complete / enter add / esc dismiss or cancel"),
     ]);
     if (dialog.kind !== "peek") return [];
     const session = c.session(dialog.sessionId);

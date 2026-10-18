@@ -9,6 +9,7 @@
   },
   "files": [
     "dist",
+    "install.sh",
     "README.md",
     "npm-shrinkwrap.json"
   ],

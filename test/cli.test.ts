@@ -33,3 +33,32 @@ for (const mode of ["default", "xdg", "env", "flag"] as const) {
     } finally { temp.cleanup(); }
   });
 }
+
+test("CLI help documents upgrade without running the installer", () => {
+  const result = spawnSync(process.execPath, ["--import", "tsx", "src/cli.ts", "upgrade", "--help"], {
+    encoding: "utf8", timeout: 20000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /zz upgrade installs the latest release/);
+  assert.doesNotMatch(result.stdout, /Downloading zz/);
+});
+
+for (const args of [["extra"], ["--model", "provider/model"], ["--thinking", "high"], ["--data-dir", "/tmp/zz"]]) {
+  test(`CLI rejects unsupported upgrade arguments: ${args.join(" ")}`, () => {
+    const result = spawnSync(process.execPath, ["--import", "tsx", "src/cli.ts", "upgrade", ...args], {
+      encoding: "utf8", timeout: 20000,
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /Usage: zz upgrade/);
+    assert.doesNotMatch(result.stdout, /Downloading zz/);
+  });
+}
+
+test("a project named upgrade remains accessible via an explicit path", () => {
+  const result = spawnSync(process.execPath, ["--import", "tsx", "src/cli.ts", "./upgrade"], {
+    encoding: "utf8", timeout: 20000,
+  });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /An interactive terminal is required/);
+  assert.doesNotMatch(result.stdout, /Downloading zz/);
+});

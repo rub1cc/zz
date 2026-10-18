@@ -38,13 +38,15 @@ if (command === "curl") {
   }
   return {
     root, bin,
-    run(extra: Record<string, string> = {}) {
-      // Feed the script on stdin just like curl | bash; no interactive input.
-      return spawnSync("bash", [], { input: installer, encoding: "utf8", env: {
-        ...process.env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: temp,
-        ZZ_VERSION: "", ZZ_INSTALL_PREFIX: join(root, "prefix with spaces"),
-        TEST_INSTALL_ROOT: root, ...extra,
-      } });
+    run(extra: Record<string, string> = {}, upgrade = false) {
+      // Exercise the actual installer in both the piped and CLI upgrade flows.
+      return spawnSync(upgrade ? process.execPath : "bash", upgrade ? ["--import", "tsx", "src/cli.ts", "upgrade"] : [], {
+        input: upgrade ? undefined : installer, encoding: "utf8", timeout: 20000, env: {
+          ...process.env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: temp, TSX_DISABLE_CACHE: "1",
+          ZZ_VERSION: "", ZZ_INSTALL_PREFIX: join(root, "prefix with spaces"),
+          TEST_INSTALL_ROOT: root, ...extra,
+        },
+      });
     },
     calls(): { command: string; args: string[] }[] {
       try { return readFileSync(join(root, "calls"), "utf8").trim().split("\n").map(line => JSON.parse(line)); }
@@ -156,6 +158,10 @@ test("release package includes built CLI and shrinkwrap, excludes source, and ha
     const contents = spawnSync("tar", ["-tzf", archive], { encoding: "utf8" });
     assert.equal(contents.status, 0, contents.stderr);
     assert.match(contents.stdout, /package\/dist\/cli\.js/);
+    assert.match(contents.stdout, /package\/install\.sh/);
+    const bundledInstaller = spawnSync("tar", ["-xOzf", archive, "package/install.sh"], { encoding: "utf8" });
+    assert.equal(bundledInstaller.status, 0, bundledInstaller.stderr);
+    assert.equal(bundledInstaller.stdout, installer);
     assert.match(contents.stdout, /package\/npm-shrinkwrap\.json/);
     assert.doesNotMatch(contents.stdout, /secret\.ts/);
     const lock = spawnSync("tar", ["-xOzf", archive, "package/npm-shrinkwrap.json"], { encoding: "utf8" });
@@ -174,3 +180,40 @@ test("release packaging rejects a tag that does not match the package version", 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /does not match package.json/);
 });
+
+test("zz upgrade installs latest without a TTY, ignores version pins, and respects the prefix", () => {
+  const f = fixture();
+  try {
+    const result = f.run({ ZZ_VERSION: "v0.0.1", ZZ_DATA_DIR: join(f.root, "unused-data") }, true);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Installed zz/);
+    const calls = f.calls();
+    assert.equal(calls.length, 3);
+    assert.ok(calls[0]!.args.includes("https://github.com/rub1cc/zz/releases/latest/download/zz.tgz"));
+    assert.ok(calls[1]!.args.includes("https://github.com/rub1cc/zz/releases/latest/download/zz.tgz.sha256"));
+    assert.deepEqual(calls[2]!.args.slice(0, -1), ["install", "--global", "--prefix", join(f.root, "prefix with spaces"),
+      "--ignore-scripts", "--omit=dev", "--no-audit", "--no-fund"]);
+    assert.equal(readdirSync(f.root).includes("unused-data"), false);
+    f.assertClean();
+  } finally { f.cleanup(); }
+});
+
+for (const failure of ["checksum", "download", "npm", "prefix"] as const) {
+  test(`zz upgrade reports ${failure} failure without claiming success`, () => {
+    const f = fixture();
+    try {
+      const env: Record<string, string> = {};
+      if (failure === "checksum") writeFileSync(join(f.root, "zz.tgz.sha256"), "bad checksum\n");
+      if (failure === "download") env.TEST_DOWNLOAD_FAIL = "1";
+      if (failure === "npm") env.TEST_NPM_FAIL = "1";
+      if (failure === "prefix") env.ZZ_INSTALL_PREFIX = "relative/path";
+      const result = f.run(env, true);
+      assert.equal(result.status, failure === "download" ? 22 : 1, result.stderr);
+      assert.doesNotMatch(result.stdout, /Installed zz/);
+      if (failure !== "npm") assert.equal(f.calls().some(call => call.command === "npm"), false);
+      if (failure === "checksum") assert.match(result.stderr, /checksum verification failed/);
+      if (failure === "prefix") assert.match(result.stderr, /must be an absolute path/);
+      f.assertClean();
+    } finally { f.cleanup(); }
+  });
+}

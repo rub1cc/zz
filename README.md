@@ -16,7 +16,17 @@ The installer downloads the latest GitHub release, verifies its SHA-256 checksum
 and uses npm to install the prebuilt command and locked production dependencies.
 It does not install Node.js, run dependency install scripts, or require sudo.
 The default prefix is `~/.local`; if needed, add `~/.local/bin` to your `PATH`
-(the installer prints the command). Re-run the same command to upgrade.
+(the installer prints the command). Run `zz upgrade` to install the latest release:
+
+```sh
+zz upgrade
+```
+
+Upgrades use the same checksum-verified installer, keep the current global npm
+install prefix, and leave sessions and Pi credentials untouched. `ZZ_INSTALL_PREFIX`
+overrides the destination; source checkouts default to `~/.local`. `ZZ_VERSION` is
+ignored by `zz upgrade` so it always installs the latest release. Use `zz ./upgrade`
+to open a project directory named `upgrade`.
 A published GitHub release is required; the first release is **v0.0.1**.
 
 To pin a version or choose a different install prefix:
@@ -745,7 +755,10 @@ and session lists never follow chat output.
   Editor failures leave the original draft intact; temporary draft files are removed.
 - `/projects` opens project management. `a` adds an existing directory;
   Enter selects a project and returns to sessions; Escape returns without changing
-  the project. `~` paths are supported.
+  the project. The Add project dialog suggests directories as you type (including
+  `~/` and relative paths). Up/Down or Ctrl+P/N selects a suggestion; Tab fills it
+  and browses its subdirectories; Enter adds the typed directory. Spaces need no
+  quotes. Escape dismisses suggestions first, then cancels the dialog.
 - In `/projects`, press `r` twice to remove the selected project from the list.
   Any other key cancels confirmation. Files and sessions stay intact, and running
   work continues. Re-add the same directory to bring its sessions back, even after

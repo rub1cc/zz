@@ -22,6 +22,7 @@ try {
   mkdirSync(output, { recursive: true });
   cpSync(join(root, "dist"), join(staging, "dist"), { recursive: true });
   cpSync(join(root, "README.md"), join(staging, "README.md"));
+  cpSync(join(root, "install.sh"), join(staging, "install.sh"));
   cpSync(join(root, "package.json"), join(staging, "package.json"));
   // npm includes shrinkwrap files in packages and uses them for global installs.
   // A package-lock alone would be excluded from the tarball by npm pack.
@@ -29,7 +30,7 @@ try {
   const packed = JSON.parse(execFileSync("npm", ["pack", "--ignore-scripts", "--json"], {
     cwd: staging, encoding: "utf8",
   }));
-  for (const required of ["dist/cli.js", "npm-shrinkwrap.json"]) {
+  for (const required of ["dist/cli.js", "install.sh", "npm-shrinkwrap.json"]) {
     if (!packed[0].files.some(file => file.path === required)) {
       throw new Error(`Release archive is missing ${required}`);
     }
