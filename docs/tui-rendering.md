@@ -11,8 +11,8 @@ agent loop, or additional filesystem operations are introduced. Presentation is:
 
 - A prompt marker for sent user text and the editable composer; user text stays literal.
 - Sent user text has a full-width light-grey background and dark text, including wrapped and blank lines.
-- A filled bullet for assistant Markdown and tool headings.
-- An indented result branch for concise tool summaries; shell commands/stdout require expansion.
+- A filled bullet for assistant Markdown and tool headings; only tool names are bold, not commands, paths or other heading details.
+- An indented result branch for concise tool summaries and successful standalone shell output previews; expansion reveals full commands/output.
 - A muted thinking heading/body, with the existing visibility and expansion controls.
 - Complete SDK edit diffs and numbered written content stay visible in both compact and expanded cards.
 - Green additions and red removals retain line numbers and colors across wrapped rows.
@@ -50,11 +50,11 @@ navigation, follow-end scrolling, and explicit scroll-to-bottom remain intact.
 | Write pending/error/interrupted | Lifecycle status, no successful-write preview | Proposed arguments remain inspectable |
 | Edit success with SDK diff | Actual added/removed counts and every colored diff hunk | Code remains visible; expansion adds raw metadata |
 | Edit without diff metadata | All retained applied replacement fragments, explicitly without line numbers; unavailable notice if no fragments remain | Never invents file context, diffstats or line numbers |
-| Bash / PowerShell, standalone | Tool name plus lifecycle summary; no command text or stdout | Full command/arguments, retained stdout/stderr and diagnostics |
+| Bash / PowerShell, standalone | First command line and SDK duration in a one-row heading; successful output previews up to three wrapped rows; non-success lifecycle status stays explicit | Full command/arguments, retained stdout/stderr and diagnostics |
 | Adjacent routine reads/shell calls | One line such as Read 1 file, ran 1 shell command | All member calls expand together |
 | Running / pending group members | Reading/running/queued counts, not past-tense success | Stable group anchor while calls settle or more calls arrive |
 | Generic tool text | Literal six-row output preview, one-row heading | Full retained output and metadata |
-| Empty successful shell output | Ran-shell-command summary; no fabricated output | Explicit no-text-output placeholder in expansion |
+| Empty successful shell output | Heading only, with duration when supplied; no result row or fabricated output | Explicit no-text-output placeholder in expansion |
 | Empty successful generic output | Explicit no-text-output result | Does not manufacture results or an exit code |
 | Nonzero exit, timeout, truncation, spill path | Error/status plus short diagnostic lines, outside any group | Full raw retained output/details available |
 | Direct chat question | Question tool summary and projected question text | Normal composer remains available |
@@ -73,11 +73,19 @@ Pending, failed and interrupted mutations do not claim their proposed code was
 applied. Generic output previews remain limited by rendered rows, with an expand
 hint when content is omitted. All content is still bounded by what the SDK
 retained; a spill-path diagnostic does not load the spill file automatically.
-Durations are displayed only when the SDK supplies them. A successful write can
+Durations are displayed only when the SDK supplies them; standalone shell timings
+sit beside the heading, with space reserved when truncating long commands. A successful write can
 create or overwrite a file; the UI does not claim it necessarily created one.
 
-Every tool heading is limited to one terminal row. Bash/PowerShell headings never
-include raw commands (including huge heredocs and inline scripts). Compact shell
+Every tool heading is limited to one terminal row. Standalone Bash/PowerShell
+headings include only the first command line, sanitized and truncated to fit;
+missing or blank first lines leave the tool name alone. Full script arguments
+remain expansion-only. Successful standalone shell output shows at most three
+rendered rows plus a more/expand hint if truncated. Normal shell summaries and
+output (including expanded output) are dim; errors and warning diagnostics retain
+their highlighting. Empty or whitespace-only output
+has no result row. Pending/running/interrupted output stays expansion-only, and
+grouped headings still show counts, not commands. Compact shell
 errors without structured diagnostics may show one bounded first output line.
 Structured diagnostics prioritize errors/warnings and show at most two one-row
 messages, with an expansion notice if more exist. Expanded diagnostics retain
@@ -98,7 +106,7 @@ are not grouped or hidden.
 
 | State | Presentation |
 | --- | --- |
-| Waiting for model / working | Existing animated work indicator; thinking when reported by the projection |
+| Waiting for model / working | Animated work indicator plus compact elapsed time; thinking when reported by the projection |
 | Model retry | Retry message from the session's projected preview |
 | Explicit cancellation in progress | Stopping indicator |
 | Stopped / paused | Reply-to-continue notice; no false done label |
@@ -125,7 +133,14 @@ are not grouped or hidden.
 | No open session | No transcript rows |
 | Session switch/reopen | Clears presentation selection/expansion; renders persisted content |
 | Resize, narrow widths, Unicode | Wraps response bodies, truncates tool/group headings to one row, drops indentation when space is scarce |
-| Reduced motion | Existing ZZ_REDUCED_MOTION / NO_COLOR behavior retained |
+| Reduced motion | ZZ_REDUCED_MOTION / NO_COLOR disable shimmer and icon animation; working elapsed time still refreshes once per second |
+
+The work indicator appends compact elapsed time, e.g. `(12s)`, `(1m2s)`,
+`(2h3m4s)` or `(1d20m15s)`, to working, thinking, retry and stopping states.
+Zero-valued units are omitted, with `0s` for a just-started run. It does not
+display token counts. Missing start times
+show `?s`. Queued replies share the work period; an idle reply resets it.
+Completed-work labels and underlying usage accounting are unchanged.
 
 Apart from checklist counts and the new task details dialog, the dashboard,
 authentication/settings dialogs, usage footer, undo picker, and peek's
@@ -260,12 +275,13 @@ zz adopts an explicit inline policy rather than claiming exact Claude parity:
 all retained successful write content and SDK edit diffs remain visible even
 when raw tool details are collapsed. There is no new `/diff` panel or filesystem
 snapshotting here. Arbitrary shell mutations do not supply structured file diffs
-through Pi's Bash result, so zz does not invent them from command text; shell
-commands/output retain their existing expansion controls.
+through Pi's Bash result, so zz does not invent them from command text. Full shell
+commands and output remain available through expansion.
 
 The screenshot's failure came from flattening the entire `arguments.command`
-into a heading and wrapping that heading without a row bound. zz now never
-renders that argument in a collapsed shell heading. Native Claude Code can
+into a heading and wrapping that heading without a row bound. zz now shows only
+the first command line in standalone shell headings and truncates it to one row;
+script bodies stay hidden until expansion. Native Claude Code can
 classify shell reads/listings and has additional transcript/focus behaviors;
 zz deliberately uses conservative adjacent-call groups and preserves its own
 keyboard bindings (use `/projects` for project management; click or `/expand`
@@ -276,7 +292,8 @@ for tool details).
 - `test/tool-groups.test.ts`: exact mixed-group output, lifecycle counts,
   boundaries, error breakout, merging/appending, click/keyboard controls, restart,
   saved-history preservation, and bounded headings/diagnostics.
-- `test/tool-response.test.ts`: huge heredoc and hidden-stdout regressions;
+- `test/tool-response.test.ts`: huge heredoc, lifecycle-aware shell previews,
+  empty results, wrapped preview bounds, heading durations and full-expansion regressions;
   real SDK read/write/edit executions against
   temporary files; lifecycle matrix, complete multi-hunk diffs and writes in both
   expansion states, wrapped diff colors, legacy replacement fragments, diagnostics, unknown tools,
@@ -285,6 +302,9 @@ for tool details).
   streaming projection/card replacement, Markdown variants, images, thinking,
   waiting/retry/stop/queue states, preview clicks, collapse/group/session-switch
   code visibility, and full TUI resize/cursor tests.
+- `test/work.test.ts` and `test/usage.test.ts`: elapsed seconds, reduced-motion
+  refresh cadence, per-work token baselines, partial-to-final handoff, retries,
+  replay, persistence, unknown legacy measurements and idle-reply resets.
 - Existing dashboard, question/answer, shell, image, work-timer, and engine suites
   cover the remaining form, persistence, compaction, shell, and recovery behavior.
 

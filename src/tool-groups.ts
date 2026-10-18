@@ -51,5 +51,6 @@ export function renderToolGroup(tools: ToolActivity[], width: number, expanded: 
   const color = tools.some((tool) => tool.status !== "done") ? accent : green;
   const prefix = width > 2 ? `${selected ? accent(">") : color("\u25cf")} ` : "";
   const hint = expanded ? " (collapse)" : " (/expand)";
-  return [prefix + fit(bold(toolGroupLabel(tools)) + dim(hint), Math.max(1, width - (width > 2 ? 2 : 0)))];
+  const label = toolGroupLabel(tools).replace(/^Read(?= )/, bold);
+  return [prefix + fit(label + dim(hint), Math.max(1, width - (width > 2 ? 2 : 0)))];
 }

@@ -156,7 +156,12 @@ export interface Session {
   createdAt: number;
   updatedAt: number;
   messages: Message[];
-  work?: { startedAt: number; finishedAt?: number };
+  work?: { startedAt: number; finishedAt?: number; outputTokensStart?: number; outputTokens?: number };
+}
+
+export function startWork(session: Session, now = Date.now()): void {
+  const outputTokensStart = session.usage?.output ?? (session.conversationId === undefined ? 0 : undefined);
+  session.work = { startedAt: now, ...(outputTokensStart === undefined ? {} : { outputTokensStart, outputTokens: 0 }) };
 }
 
 export function finishWork(session: Session, now = Date.now()): void {

@@ -507,7 +507,8 @@ independent proof of test success, and may contain sensitive project information
 ## Compact Activity
 
 The conversation uses `❯` for user prompts, `●` for assistant replies and tool
-headings, and `⎿` for results. Sent user prompts use literal text on a full-width
+headings, and `⎿` for results. Only tool names are bold; commands, file paths and
+other heading details use normal weight. Sent user prompts use literal text on a full-width
 light-grey background with dark text, including wrapped and blank lines. Assistant
 replies keep the terminal background and Markdown formatting, including code
 fences, lists and tables. Tool calls
@@ -536,8 +537,8 @@ and results stay paired in one compact block, updating in place while running.
       2   expect(greet("")).toBe("World");
       3 });
 
-● Bash
-  ⎿ Ran 1 shell command (/expand)
+● Bash(npm test -- --run)
+  ⎿ 1 test passed
 
 ● Fixed empty names and added a regression test. Tests: 1 passed.
 ```
@@ -547,8 +548,16 @@ removals red, including wrapped continuation rows. Successful writes show all
 numbered content; every edit diff hunk stays visible without expansion. Collapsing
 a tool hides only its extra details, never its code changes. Older edits without
 SDK diff metadata show their applied replacement fragments when retained, with
-no invented file context or line numbers. Agent Bash/PowerShell commands and stdout stay hidden
-until expansion, including while running; a long heredoc never becomes a heading.
+no invented file context or line numbers. Standalone Bash/PowerShell headings show
+the command in parentheses, truncated to one terminal row. Multiline commands show
+only their first line, with the SDK-supplied duration beside the heading when
+available. Successful standalone calls show up to three wrapped rows of actual
+stdout/stderr in dim text, matching normal status summaries, with a `/expand` hint
+when more remains. Expanded non-error shell output is dim too; errors and warnings
+keep their highlighting. Empty successful results
+have no result row. Running calls keep their explicit status and hide streaming
+output until expansion; errors and diagnostics remain visible. Expansion reveals
+the full command and retained output. Grouped calls keep their count-only heading.
 Errors, interruptions, pending/running states, truncation and continuation
 messages remain explicit. Failed/interrupted mutations never get a success preview.
 `read` calls for `SKILL.md` are labeled `Skill <directory name>`; that reports a
@@ -585,12 +594,16 @@ Inside a session:
 
 Activity is presentation only: compact previews do not change retained output or model context.
 
-The transcript ends with a shimmering working/thinking, retry, or stopping indicator while a task runs. On completion,
-it shows e.g. `✻ Worked for 3s · done 3:22 PM`, using your local time. Timing is
-saved per session and resets with each idle-session reply; queued follow-ups keep
-the current work timer running until the queue finishes. Failures and input requests are
-labelled accordingly. Set `ZZ_REDUCED_MOTION=1` to disable shimmer animation
-(`NO_COLOR` also disables it).
+The transcript ends with a shimmering working/thinking, retry, or stopping indicator,
+e.g. `✻ Working (12s)`. The suffix shows elapsed time, not token counts, using
+compact days/hours/minutes/seconds such as `1m2s`, `2h3m4s`, or `1d20m15s`.
+Zero-valued units are omitted; a just-started run shows `0s`.
+Timing persists across restarts and resets with each idle-session reply; queued
+follow-ups share the current work period.
+On completion, it shows e.g. `✻ Worked for 3s · done 3:22 PM`, using your local time.
+Failures and input requests are labelled accordingly. Set `ZZ_REDUCED_MOTION=1`
+to disable shimmer animation (`NO_COLOR` also disables it); elapsed seconds still
+refresh once per second while working.
 
 ## Composer Discovery
 

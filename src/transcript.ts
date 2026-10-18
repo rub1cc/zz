@@ -3,7 +3,7 @@ import { Markdown, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouse
 import { renderShellResponse } from "./shell-response.js";
 import { ImageDisplay } from "./image-display.js";
 import type { Controller } from "./controller.js";
-import { accent, dim, fit, markdownTheme, oneLine, pad, plain, shimmer, warning, workingIcon } from "./format.js";
+import { accent, dim, fit, formatElapsed, markdownTheme, oneLine, pad, plain, shimmer, warning, workingIcon } from "./format.js";
 import { transcriptMessages, lastReplyMessage, compactionLabel, type Message, type Session, type TranscriptMessage } from "./model.js";
 import { answeredQuestions, formQuestion, isQuestionTool, type AnsweredQuestion, type Questionnaire } from "./questions.js";
 import { indentLines, renderToolResponse } from "./tool-response.js";
@@ -14,7 +14,9 @@ export function workLabel(session: Session): string | undefined {
   if (session.status === "working") {
     const state = session.stopped ? "Stopping..." : session.preview.startsWith("Retrying:") ? oneLine(session.preview)
       : session.preview === "Thinking..." || session.messages.at(-1)?.role === "thinking" ? "Thinking..." : "Working";
-    return shimmer(`${workingIcon()} ${state}`);
+    const now = Date.now();
+    const elapsed = session.work ? formatElapsed((now - session.work.startedAt) / 1000) : "?s";
+    return `${shimmer(`${workingIcon(now)} ${state}`, now)}${dim(` (${elapsed})`)}`;
   }
   const work = session.work;
   if (!work || work.finishedAt === undefined || session.status === "paused") return;

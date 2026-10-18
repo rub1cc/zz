@@ -5,6 +5,7 @@ import type { ToolActivity } from "./model.js";
 const bullet = "\u25cf";
 const branch = "  \u23bf ";
 const previewLimit = 6;
+const shellPreviewLimit = 3;
 
 type RecordValue = Record<string, unknown>;
 const record = (value: unknown): RecordValue | undefined => value !== null && typeof value === "object" && !Array.isArray(value)
@@ -24,17 +25,19 @@ function diagnostics(tool: ToolActivity): { severity?: unknown; message: string 
   }) : [];
 }
 
-export function activityLabel(tool: ToolActivity): string {
-  if (tool.name === "compact") return `Context compacted (${oneLine(String(tool.arguments.reason ?? "manual"))})`;
-  if (tool.name === "load_skill" && typeof tool.arguments.name === "string") return `Skill ${oneLine(tool.arguments.name)}`;
+export function activityLabel(tool: ToolActivity, nameStyle = (name: string) => name): string {
+  if (tool.name === "compact") return `${nameStyle("Context compacted")} (${oneLine(String(tool.arguments.reason ?? "manual"))})`;
+  if (tool.name === "load_skill" && typeof tool.arguments.name === "string") return `${nameStyle("Skill")} ${oneLine(tool.arguments.name)}`;
   const path = typeof tool.arguments.path === "string" ? tool.arguments.path.replaceAll("\\", "/") : "";
-  if (tool.name === "read" && /(^|\/)SKILL\.md$/i.test(path)) return `Skill ${oneLine(path.split("/").at(-2) || "instructions")}`;
+  if (tool.name === "read" && /(^|\/)SKILL\.md$/i.test(path)) return `${nameStyle("Skill")} ${oneLine(path.split("/").at(-2) || "instructions")}`;
   const names: Record<string, string> = { read: "Read", write: "Write", edit: "Update", bash: "Bash", powershell: "PowerShell",
     ask_user: "Ask user", ask_question: "Ask question", ask_multiple_questions: "Ask questions",
     task_create: "Create task", task_update: "Update tasks", task_list: "List tasks", task_get: "Get task" };
   const name = Object.hasOwn(names, tool.name) ? names[tool.name]! : tool.name;
-  const target = isShellTool(tool) ? "" : path;
-  return `${oneLine(name)}${target ? `(${oneLine(target)})` : ""}`;
+  const target = isShellTool(tool)
+    ? typeof tool.arguments.command === "string" ? oneLine(tool.arguments.command.split(/\r\n?|\n|\u2028|\u2029/, 1)[0] ?? "").trim() : ""
+    : path;
+  return `${nameStyle(oneLine(name))}${target ? `(${oneLine(target)})` : ""}`;
 }
 
 function isTaskTool(tool: ToolActivity): boolean {
@@ -156,7 +159,7 @@ function summary(tool: ToolActivity, output: string): string {
     }
     return appliedEdits(tool).length ? "Updated file (line numbers unavailable)" : "Updated file (diff unavailable)";
   }
-  if (isShellTool(tool)) return "Ran 1 shell command (/expand)";
+  if (isShellTool(tool)) return "";
   if (["ask_user", "ask_question", "ask_multiple_questions"].includes(tool.name)) return "Question sent";
   return output ? "" : tool.images?.length ? `Returned ${tool.images.length} image${tool.images.length === 1 ? "" : "s"}` : "Done (no text output).";
 }
@@ -167,18 +170,24 @@ export function renderToolResponse(tool: ToolActivity, width: number, expanded: 
   const color = failed ? warning : tool.status === "done" ? green : accent;
   const marker = selected ? accent(">") : color(bullet);
   const output = outputText(tool);
+  const shell = isShellTool(tool);
   const label = summary(tool, output);
   const duration = tool.durationMs === undefined ? "" : tool.durationMs < 1000 ? ` (${Math.round(tool.durationMs)}ms)` : ` (${(tool.durationMs / 1000).toFixed(1)}s)`;
-  const title = bold(activityLabel(tool)) + (!label ? dim(duration) : "");
-  const lines = indentLines([fit(title, Math.max(1, width - (width > 2 ? 2 : 0)))], width, `${marker} `);
-  if (label) lines.push(...literal(`${label}${duration}`, width, branch, Infinity, failed ? warning : dim));
+  const headingWidth = Math.max(1, width - (width > 2 ? 2 : 0));
+  const title = shell
+    ? fit(activityLabel(tool, bold), Math.max(1, headingWidth - visibleWidth(duration))) + dim(duration)
+    : activityLabel(tool, bold) + (!label ? dim(duration) : "");
+  const lines = indentLines([fit(title, headingWidth)], width, `${marker} `);
+  if (label) lines.push(...literal(`${label}${shell ? "" : duration}`, width, branch, Infinity, failed ? warning : dim));
   const previewPrefix = label ? "    " : branch;
   const skill = tool.name === "load_skill" || activityLabel(tool).startsWith("Skill ");
   const question = ["ask_user", "ask_question", "ask_multiple_questions"].includes(tool.name);
   for (const line of renderCodeChanges(tool, width)) lines.push(line);
   if (!expanded) {
-    if (isShellTool(tool)) {
-      if (tool.status === "error" && !diagnostics(tool).length && output) {
+    if (shell) {
+      if (tool.status === "done" && plain(output).trim()) {
+        lines.push(...literal(output, width, branch, shellPreviewLimit, dim));
+      } else if (tool.status === "error" && !diagnostics(tool).length && output) {
         lines.push(...indentLines([warning(fit(oneLine(textLines(output)[0] ?? ""), Math.max(1, width - (width > 4 ? 4 : 0))))], width, "    "));
       }
     } else if ((failed || !["read", "write", "edit", "compact"].includes(tool.name) && !skill && !question && !isTaskTool(tool)) && output) {
@@ -186,7 +195,8 @@ export function renderToolResponse(tool: ToolActivity, width: number, expanded: 
     }
   } else {
     const section = (title: string, text: string) => {
-      lines.push(...literal(title, width, "    ", Infinity, dim), ...literal(text, width, "    "));
+      lines.push(...literal(title, width, "    ", Infinity, dim),
+        ...literal(text, width, "    ", Infinity, shell && title === "Output" && !failed ? dim : (s) => s));
     };
     if (Object.keys(tool.arguments).length) section("Arguments", JSON.stringify(tool.arguments, null, 2));
     section("Output", output || (tool.status === "pending" || tool.status === "running" ? "Waiting for output..." : "No text output."));

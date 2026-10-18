@@ -12,7 +12,7 @@ import { Dashboard, scrollToEndIndicator } from "./ui.js";
 import { displayStatus } from "./model.js";
 import { loadPi } from "./pi.js";
 import { cancelExternalEditor, isExternalEditorOpen } from "./external-editor.js";
-import { motionEnabled } from "./format.js";
+import { statusRefreshInterval } from "./format.js";
 import { createShutdown } from "./shutdown.js";
 
 const { values, positionals } = parseArgs({
@@ -132,10 +132,10 @@ async function main(): Promise<void> {
     let lastRefresh = Date.now();
     timer = setInterval(() => {
       const now = Date.now();
-      const animating = motionEnabled() && (controller?.mode === "session"
+      const working = controller?.mode === "session"
         ? !!controller.opened && displayStatus(controller.opened) === "working"
-        : controller?.currentRows.some((row) => row.kind === "session" && displayStatus(row.session) === "working"));
-      if (animating || now - lastRefresh >= 30_000) {
+        : controller?.currentRows.some((row) => row.kind === "session" && displayStatus(row.session) === "working");
+      if (now - lastRefresh >= statusRefreshInterval(!!working)) {
         tui?.requestRender();
         lastRefresh = now;
       }

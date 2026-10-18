@@ -606,12 +606,12 @@ test("tool previews are compact, keyboard and mouse expandable, and stable acros
       id: "read-skill", name: "read", arguments: { path: "/skills/frontend-design/SKILL.md" },
       output: "skill instructions that should stay hidden", status: "running",
     } }, { role: "tool", text: "", timestamp: Date.now(), tool: {
-      id: "run-tests", name: "bash", arguments: { command: "npm test" }, output: "Tests passed\n14 tests", status: "done", durationMs: 1100,
+      id: "run-tests", name: "bash", arguments: { command: "npm test" }, output: "Tests passed\n14 tests\n0 failed\nFULL_OUTPUT_TAIL", status: "done", durationMs: 1100,
     } });
     const render = () => f.app.body.render(f.terminal.columns).map(stripTerminalSequences).join("\n");
     assert.match(render(), /● Skill frontend-design/);
-    assert.match(render(), /Ran 1 shell command/);
-    assert.doesNotMatch(render(), /skill instructions|Arguments|Tests passed|npm test/);
+    assert.match(render(), /Bash\(npm test\) \(1\.1s\)\n  ⎿ Tests passed\n    14 tests\n    0 failed/);
+    assert.doesNotMatch(render(), /skill instructions|Arguments|FULL_OUTPUT_TAIL|Ran 1 shell command/);
     f.terminal.onInput("\t"); f.terminal.onInput(" ");
     assert.match(render(), /skill instructions that should stay hidden/);
     // Durable replaces projected message objects on each update; the call ID owns expansion.
@@ -619,14 +619,14 @@ test("tool previews are compact, keyboard and mouse expandable, and stable acros
     session.messages.at(-2)!.tool!.status = "done";
     assert.match(render(), /skill instructions that should stay hidden/);
     const transcript = f.app.body.transcript;
-    const y = transcript.positions.get("run-tests")!;
+    const y = transcript.positions.get("run-tests")! + 2;
     transcript.handleMouse({ type: "click", button: "left", x: 5, y, screenX: 5, screenY: y, width: 120, height: 32, shift: false, ctrl: false, alt: false });
-    assert.match(render(), /Tests passed/);
+    assert.match(render(), /Arguments[^]*FULL_OUTPUT_TAIL/);
     f.terminal.onInput("/collapse"); f.terminal.onInput("\r");
-    assert.doesNotMatch(render(), /skill instructions|Arguments|Tests passed|npm test/);
-    assert.match(render(), /Ran 1 shell command/);
+    assert.match(render(), /Bash\(npm test\) \(1\.1s\)[^]*Tests passed/);
+    assert.doesNotMatch(render(), /skill instructions|Arguments|FULL_OUTPUT_TAIL|Ran 1 shell command/);
     f.terminal.onInput("/expand"); f.terminal.onInput("\r");
-    assert.match(render(), /Tests passed/);
+    assert.match(render(), /FULL_OUTPUT_TAIL/);
     for (const width of [10, 24, 50, 120]) assert.ok(f.app.body.render(width).every((line) => visibleWidth(line) <= width));
     assert.equal(session.messages.filter((m) => m.role === "user").length, 1);
   } finally { await f.cleanup(); }

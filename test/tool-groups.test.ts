@@ -46,6 +46,13 @@ test("adjacent routine reads and commands become one line without commands, path
   } finally { await f.close(); }
 });
 
+test("group counts and hints are normal weight, with only the Read name bold", () => {
+  const mixed = renderToolGroup([read(), bash()], 120, false, false)[0]!;
+  assert.ok(mixed.includes("\x1b[1mRead\x1b[22m 1 file, ran 1 shell command"));
+  assert.equal(mixed.match(/\x1b\[1m/g)?.length, 1);
+  assert.doesNotMatch(renderToolGroup([bash(), bash("second")], 120, false, false)[0]!, /\x1b\[1m/);
+});
+
 test("groups distinguish completed, running and pending work without claiming uncompleted work ran", () => {
   assert.equal(toolGroupLabel([read(), bash("run", "running")]), "Read 1 file, running 1 shell command");
   assert.equal(toolGroupLabel([read("a", "running"), bash("run", "pending")]), "Reading 1 file, queued 1 shell command");

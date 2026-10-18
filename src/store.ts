@@ -59,6 +59,8 @@ function isState(value: unknown): value is State {
       && ["working", "needs-input", "completed", "failed", "paused"].includes(s.status)
       && Number.isFinite(s.createdAt) && Number.isFinite(s.updatedAt)
       && (s.work === undefined || !!s.work && Number.isFinite(s.work.startedAt)
+        && (s.work.outputTokensStart === undefined || nonnegative(s.work.outputTokensStart))
+        && (s.work.outputTokens === undefined || nonnegative(s.work.outputTokens))
         && (s.work.finishedAt === undefined || Number.isFinite(s.work.finishedAt) && s.work.finishedAt >= s.work.startedAt))
       && Array.isArray(s.messages) && s.messages.every((m) => typeof m.text === "string"
         && ["user", "assistant", "tool", "error", "thinking"].includes(m.role) && Number.isFinite(m.timestamp)

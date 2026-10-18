@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { copyToClipboard } from "@earendil-works/pi-coding-agent";
-import { finishWork, isReplyBehavior, markStopped, rowId, rows, transcriptMessages, type ShellResponse, type ImageAttachment, type ReplyBehavior, type SettingsSelection, type AgentSettings, type CompactResult, type ModelOption, type Project, type Row, type Session, type SessionStats, type SkillOption, type UndoResult, type UndoCheckpoint } from "./model.js";
+import { startWork, finishWork, isReplyBehavior, markStopped, rowId, rows, transcriptMessages, type ShellResponse, type ImageAttachment, type ReplyBehavior, type SettingsSelection, type AgentSettings, type CompactResult, type ModelOption, type Project, type Row, type Session, type SessionStats, type SkillOption, type UndoResult, type UndoCheckpoint } from "./model.js";
 import { directory, isImages, Store } from "./store.js";
 import { ShellRun } from "./shell.js";
 import { AuthFlow, type AuthAccess, type AuthAction } from "./auth.js";
@@ -668,7 +668,7 @@ export class Controller {
       session.status = "working";
       session.preview = "Starting...";
       session.updatedAt = Date.now();
-      session.work = { startedAt: session.updatedAt };
+      startWork(session, session.updatedAt);
     }
     this.notice = "";
     this.dialog = undefined;

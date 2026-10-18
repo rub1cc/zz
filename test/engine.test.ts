@@ -179,6 +179,8 @@ test("durable conversations execute tools concurrently in their own cwd and reta
     for (const s of sessions) {
       assert.ok(s.work);
       assert.ok(s.work.finishedAt! >= s.work.startedAt);
+      assert.equal(s.work.outputTokensStart, 0);
+      assert.equal(s.work.outputTokens, s.usage?.output);
     }
     const firstTiming = { ...sessions[0]!.work! };
     await engine.close();
@@ -189,6 +191,8 @@ test("durable conversations execute tools concurrently in their own cwd and reta
     assert.deepEqual(first.work, firstTiming);
     await engine.run(first, projects[0]!, "reply", () => {});
     assert.ok(first.work!.startedAt >= firstTiming.finishedAt!);
+    assert.equal(first.work!.outputTokensStart, firstTiming.outputTokens);
+    assert.equal(first.work!.outputTokens, first.usage!.output - firstTiming.outputTokens!);
     assert.equal(first.messages.filter((m) => m.role === "user").length, 2);
     assert.equal(first.status, "completed");
     assert.equal(errors.length, 0);

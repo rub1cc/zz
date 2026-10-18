@@ -13,7 +13,19 @@ export const oneLine = (s: string) => plain(s).replace(/\s+/g, " ");
 export const fit = (s: string, width: number) => truncateToWidth(s, Math.max(0, width));
 export const pad = (s: string, width: number) => s + " ".repeat(Math.max(0, width - visibleWidth(s)));
 
+export function formatElapsed(seconds: number): string {
+  let remaining = Math.max(0, Math.floor(seconds));
+  const parts: string[] = [];
+  for (const [unit, size] of [["d", 86400], ["h", 3600], ["m", 60], ["s", 1]] as const) {
+    const value = Math.floor(remaining / size);
+    if (value) parts.push(`${value}${unit}`);
+    remaining %= size;
+  }
+  return parts.join("") || "0s";
+}
+
 export const motionEnabled = () => process.env.ZZ_REDUCED_MOTION !== "1" && process.env.NO_COLOR === undefined;
+export const statusRefreshInterval = (working: boolean) => working ? motionEnabled() ? 80 : 1000 : 30_000;
 
 const workingFrames = ["✽", "✻", "✢", "∙", "✢", "✻", "✽"] as const;
 export function workingIcon(now = Date.now()): string {

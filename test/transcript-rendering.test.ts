@@ -49,7 +49,7 @@ test("the complete sample conversation renders as prompt, thinking, tools, edits
       "    -2   return name;", '    +2   return name || "World";', "     3 }", "",
       "\u25cf Write(src/greet.test.ts)", "  \u23bf Wrote 3 lines", '      1 test("empty name", () => {',
       '      2   expect(greet("")).toBe("World");', "      3 });", "",
-      "\u25cf Bash", "  \u23bf Ran 1 shell command (/expand)", "",
+      "\u25cf Bash(npm test -- --run)", "  \u23bf 1 test passed", "",
       '\u25cf Updated greet() to fall back to "World".', "", "  Tests: 1 passed.", "",
     ].join("\n"));
     assert.deepEqual(f.session.messages, before, "Rendering is presentation only");
@@ -109,7 +109,7 @@ test("streaming projection updates one tool card and preserves expansion across 
   const project = (entries: unknown[], live: unknown) => applyView(f.session, { entries, docs: { "pi.live": live } } as unknown as ConversationView);
   try {
     project([call], { run: { taskId: 1 } });
-    assert.match(f.render(), /Bash[^]*Pending/);
+    assert.match(f.render(), /Bash\(npm test\)[^]*Pending/);
     f.transcript.move(1); f.transcript.toggle();
     project([call], { run: { taskId: 1 }, tools: [{ callId: "run", name: "bash", status: "running", output: "PASS first" }] });
     assert.match(f.render(), /Running[^]*Arguments[^]*PASS first/);
@@ -118,6 +118,27 @@ test("streaming projection updates one tool card and preserves expansion across 
     assert.match(f.render(), /Arguments[^]*PASS second/);
     project([call], {});
     assert.match(f.render(), /Interrupted; completion not confirmed/);
+  } finally { await f.close(); }
+});
+
+test("collapsed shell cards replace running status with successful output previews as calls settle", async () => {
+  const f = setup();
+  try {
+    const tool: ToolActivity = { id: "run", name: "bash", arguments: { command: "npm test" },
+      status: "running", output: "FIRST_RESULT\nsecond\nthird\nFULL_TAIL" };
+    f.session.messages = [toolMessage(tool)];
+    assert.match(f.render(), /Running/);
+    assert.doesNotMatch(f.render(), /FIRST_RESULT|FULL_TAIL/);
+    tool.status = "done"; tool.durationMs = 6900;
+    assert.match(f.render(), /Bash\(npm test\) \(6\.9s\)[^]*FIRST_RESULT[^]*third[^]*more \(\/expand\)/);
+    assert.doesNotMatch(f.render(), /Running|Ran 1 shell command|FULL_TAIL/);
+    f.transcript.toggleAll(true);
+    assert.match(f.render(), /Arguments[^]*FULL_TAIL/);
+    f.transcript.toggleAll(false);
+    assert.doesNotMatch(f.render(), /FULL_TAIL/);
+    tool.status = "interrupted";
+    assert.match(f.render(), /Interrupted; completion not confirmed/);
+    assert.doesNotMatch(f.render(), /FIRST_RESULT|FULL_TAIL/);
   } finally { await f.close(); }
 });
 
@@ -282,12 +303,19 @@ test("cached history does not freeze work animation, queues or session status", 
     t.mock.method(Date, "now", () => now);
     f.session.messages = [{ role: "assistant", text: "Existing reply", timestamp: 1 }];
     f.session.status = "working";
+    f.session.work = { startedAt: 0, outputTokensStart: 0, outputTokens: 0 };
     const initial = f.transcript.render(100);
+    assert.match(initial.map(stripTerminalSequences).join("\n"), /Working \(0s\)/);
     const clear = t.mock.method(f.transcript.positions, "clear");
-    now = 320;
+    now = 2320;
+    f.session.work.outputTokens = 1234;
     const next = f.transcript.render(100);
+    assert.match(next.map(stripTerminalSequences).join("\n"), /Working \(2s\)/);
+    assert.doesNotMatch(next.map(stripTerminalSequences).join("\n"), /tokens|1,234/);
     assert.deepEqual(next.slice(0, 2), initial.slice(0, 2));
     assert.ok(next.includes(workLabel(f.session)!));
+    now = 87615000;
+    assert.match(f.render(), /Working \(1d20m15s\)/);
     f.session.preview = "Retrying: rate limit";
     assert.match(f.render(), /Retrying: rate limit/);
     f.session.queuedInputs = [{ id: 1, text: "Next task", mode: "steer" }];

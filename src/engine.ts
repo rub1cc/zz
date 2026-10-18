@@ -13,7 +13,7 @@ import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { createCodingTools } from "@earendil-works/pi-durable/tools";
 import type { Engine } from "./controller.js";
-import { compactionLabel, finishWork, isThinkingLevel, lastReply, markStopped, type ImageAttachment, type AgentSettings, type CompactResult, type Message, type ModelOption, type PendingInput, type PreparedInput, type Project, type Session, type SessionStats, type SkillOption, type UndoResult, type UndoCheckpoint } from "./model.js";
+import { compactionLabel, startWork, finishWork, isThinkingLevel, lastReply, markStopped, type ImageAttachment, type AgentSettings, type CompactResult, type Message, type ModelOption, type PendingInput, type PreparedInput, type Project, type Session, type SessionStats, type SkillOption, type UndoResult, type UndoCheckpoint } from "./model.js";
 import { directory, isImages, Store } from "./store.js";
 import { InstructionCatalog, INTERACTION_POLICY } from "./instructions.js";
 import { getImageProcessor, prepareImageFile, referencedImages, MAX_ATTACHMENTS } from "./attachments.js";
@@ -73,6 +73,11 @@ export function applyView(session: Session, view: ConversationView, priorUsage?:
   });
   session.queuedInputs = queued.length ? queued : undefined;
   const live = view.docs["pi.live"] as LiveState | undefined;
+  if (session.work?.finishedAt === undefined && session.work?.outputTokensStart !== undefined) {
+    // Completed attempts move into the ledger atomically as their live partial disappears.
+    session.work.outputTokens = Math.max(0, session.usage.output - session.work.outputTokensStart)
+      + (live?.generation?.message?.usage?.output ?? 0);
+  }
   session.compactions = live?.compactions?.length ? structuredClone(live.compactions) : undefined;
   session.compactionFailure = live?.compactionFailure && structuredClone(live.compactionFailure);
   const agent = view.docs["pi.agent"] as AgentState | undefined;
@@ -444,7 +449,7 @@ export class DurableEngine implements Engine {
     if (this.stopping.has(session.id)) throw new Error("This session is still stopping. Try again when it is idle.");
     delete session.stopped;
     if (!session.pendingInput && session.work?.finishedAt !== undefined) session.work = undefined;
-    session.work ??= { startedAt: Date.now() };
+    if (!session.work) startWork(session);
     if (!isImages(images)) throw new Error("Invalid image attachments; paste an image or use an @image path.");
     const input: PendingInput = { requestId: randomUUID(), prompt, ...(images.length ? { images: structuredClone(images) } : {}), whenBusy: this.store.settings.replyBehavior };
     if (!session.pendingInput) session.pendingInput = input;

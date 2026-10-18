@@ -19,6 +19,30 @@ function render(value: ToolActivity, expanded = false, width = 100): string {
   return renderToolResponse(value, width, expanded, false).map(stripTerminalSequences).join("\n");
 }
 
+test("only tool names are bold, never commands, paths, skill names or compaction reasons", () => {
+  const cases: [Partial<ToolActivity>, string, string][] = [
+    [{ name: "bash", arguments: { command: "npm test" } }, "Bash", "(npm test)"],
+    [{ name: "powershell", arguments: { command: "Get-ChildItem" } }, "PowerShell", "(Get-ChildItem)"],
+    ...[["read", "Read"], ["edit", "Update"], ["write", "Write"], ["custom", "custom"]].map(([name, label]) =>
+      [{ name, arguments: { path: "src/file.ts" } }, label!, "(src/file.ts)"] as [Partial<ToolActivity>, string, string]),
+    [{ name: "read", arguments: { path: "/skills/testing/SKILL.md" } }, "Skill", " testing"],
+    [{ name: "load_skill", arguments: { name: "testing" } }, "Skill", " testing"],
+    [{ name: "compact", arguments: { reason: "manual" } }, "Context compacted", " (manual)"],
+    [{ name: "ask_question", arguments: {} }, "Ask question", ""],
+    [{ name: "task_update", arguments: {} }, "Update tasks", ""],
+  ];
+  for (const [change, label, suffix] of cases) {
+    for (const expanded of [false, true]) {
+      for (const selected of [false, true]) {
+        const heading = renderToolResponse(tool(change), 100, expanded, selected)[0]!;
+        assert.ok(heading.includes(`\x1b[1m${label}\x1b[22m${suffix}`), heading);
+        assert.deepEqual([...heading.matchAll(/\x1b\[1m([^\x1b]*)\x1b\[22m/g)].map((match) => match[1]), [label]);
+        assert.equal(activityLabel(tool(change)), label + suffix, "plain labels remain unstyled");
+      }
+    }
+  }
+});
+
 test("read, write and update use actual SDK results and display truthful line counts and diffs", async () => {
   const temp = temporary();
   try {
@@ -61,24 +85,138 @@ test("each tool lifecycle state is explicit and failed mutations never get a suc
   }
 });
 
-test("bash and PowerShell hide commands and output until explicitly expanded", () => {
+test("shell script bodies stay hidden, with output previewed only after success", () => {
   const script = "cat > docs/inventory.md <<'EOF'\n" + "SCRIPT_BODY_MUST_STAY_HIDDEN ".repeat(2000) + "\nEOF";
   for (const name of ["bash", "powershell"]) {
-    const value = tool({ name, arguments: { command: script }, output: "STDOUT_MUST_STAY_HIDDEN\nmore output" });
+    const value = tool({ name, arguments: { command: script }, output: "RESULT_READY\nmore output" });
     for (const status of ["pending", "running", "done"] as const) {
       value.status = status;
       for (const width of [24, 100, 300]) {
         const lines = renderToolResponse(value, width, false, false);
         assert.ok(lines.length <= 3, "A huge script must not grow the compact card");
-        assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /SCRIPT_BODY|STDOUT|cat >|inventory\.md/);
+        assert.ok(lines.every((line) => visibleWidth(line) <= width));
+        const text = lines.map(stripTerminalSequences).join("\n");
+        assert.match(text, /(?:Bash|PowerShell)\(cat >/);
+        assert.doesNotMatch(text, /SCRIPT_BODY|EOF\)/);
+        assert.equal(text.includes("RESULT_READY"), status === "done");
       }
-      assert.match(render(value, true), /Arguments[^]*SCRIPT_BODY_MUST_STAY_HIDDEN[^]*Output[^]*STDOUT_MUST_STAY_HIDDEN/);
+      assert.match(render(value, true), /Arguments[^]*SCRIPT_BODY_MUST_STAY_HIDDEN[^]*Output[^]*RESULT_READY/);
     }
     value.durationMs = 1200;
-    assert.match(render(value), /Ran 1 shell command \(\/expand\) \(1\.2s\)/);
+    assert.match(render(value).split("\n")[0]!, /\(1\.2s\)$/);
+    assert.doesNotMatch(render(value), /Ran 1 shell command/);
     value.output = "";
-    assert.match(render(value), /Ran 1 shell command/);
+    assert.equal(renderToolResponse(value, 100, false, false).length, 1);
     assert.match(render(value, true), /No text output/);
+  }
+});
+
+test("successful shell cards show three literal output rows and expand to the full script and output", () => {
+  for (const [name, label] of [["bash", "Bash"], ["powershell", "PowerShell"]]) {
+    const value = tool({ name, arguments: { command: "run-script\nHIDDEN_SCRIPT_BODY" },
+      output: "one\ntwo\nthree\nfour\nfive", durationMs: 6900 });
+    assert.equal(render(value), [
+      `\u25cf ${label}(run-script) (6.9s)`, "  \u23bf one", "    two", "    three", "  \u23bf ... more (/expand)",
+    ].join("\n"));
+    const expanded = render(value, true);
+    assert.match(expanded, /Arguments[^]*HIDDEN_SCRIPT_BODY[^]*Output[^]*one[^]*five/);
+    assert.equal(expanded.match(/\(6\.9s\)/g)?.length, 1);
+    assert.doesNotMatch(expanded, /more \(\/expand\)|Ran 1 shell command/);
+    value.output = "one\ntwo\nthree\n";
+    assert.equal(renderToolResponse(value, 100, false, false).length, 4);
+    assert.doesNotMatch(render(value), /more \(\/expand\)/);
+    value.output = "BEGIN " + "word ".repeat(200) + "END";
+    for (const width of [1, 2, 4, 12, 24, 80]) {
+      const lines = renderToolResponse(value, width, false, false);
+      assert.ok(lines.length <= 5, "Preview limits apply to wrapped terminal rows");
+      assert.ok(lines.every((line) => visibleWidth(line) <= width));
+    }
+    assert.match(render(value, false, 24), /more \(\/expand\)/);
+    assert.doesNotMatch(render(value, false, 24), /END/);
+    assert.match(render(value, true, 24), /END/);
+    for (const output of ["", "\n", " \t\r\n", "\x1b[32m\x1b[0m"]) {
+      value.output = output;
+      assert.equal(renderToolResponse(value, 100, false, false).length, 1, "Empty results need no result row");
+    }
+  }
+});
+
+test("normal shell output and summaries are dim while warnings and errors remain highlighted", () => {
+  for (const name of ["bash", "powershell"]) {
+    const value = tool({ name, output: "NORMAL_OUTPUT\nsecond line", details: { diagnostics: [
+      { severity: "warn", message: "IMPORTANT_WARNING" },
+    ] } });
+    for (const expanded of [false, true]) {
+      const lines = renderToolResponse(value, 100, expanded, false);
+      assert.ok(lines.some((line) => line.includes("\x1b[2mNORMAL_OUTPUT\x1b[22m")));
+      assert.ok(lines.some((line) => line.includes("\x1b[2msecond line\x1b[22m")));
+      assert.ok(lines.some((line) => line.includes("\x1b[33mIMPORTANT_WARNING\x1b[39m")));
+      assert.ok(lines[0]!.includes(`\x1b[1m${name === "bash" ? "Bash" : "PowerShell"}\x1b[22m`));
+    }
+    for (const status of ["pending", "running"] as const) {
+      const lines = renderToolResponse({ ...value, status }, 100, false, false);
+      assert.ok(lines.some((line) => line.includes(`\x1b[2m${status === "pending" ? "Pending" : "Running"}... (/expand)\x1b[22m`)));
+    }
+    const failed = renderToolResponse({ ...value, status: "error", output: "ERROR_OUTPUT", details: undefined }, 100, false, false);
+    assert.ok(failed.some((line) => line.includes("\x1b[33mERROR_OUTPUT\x1b[39m")));
+    assert.ok(failed.some((line) => line.includes("\x1b[33mError (/expand)\x1b[39m")));
+  }
+});
+
+test("successful shell previews keep harness diagnostics visible outside their output limit", () => {
+  const value = tool({ output: "one\ntwo\nthree\nfour\n<harness>\n[warn] Output truncated\n</harness>",
+    details: { diagnostics: [{ severity: "warn", message: "Output truncated" }, { severity: "info", message: "Full output: /tmp/log.txt" }] } });
+  const text = render(value);
+  assert.match(text, /one[^]*two[^]*three[^]*more \(\/expand\)[^]*Output truncated[^]*Full output: \/tmp\/log\.txt/);
+  assert.doesNotMatch(text, /four|<harness>|Ran 1 shell command/);
+  assert.equal(text.match(/Output truncated/g)?.length, 1);
+  assert.match(render(value, true), /four/);
+});
+
+test("shell durations remain in the bounded heading across lifecycle, selection and expansion states", () => {
+  for (const name of ["bash", "powershell"]) {
+    for (const status of ["pending", "running", "done", "error", "interrupted"] as const) {
+      for (const [durationMs, duration] of [[25, "25ms"], [6900, "6.9s"]] as const) {
+        const value = tool({ name, status, durationMs, arguments: { command: "LONG_COMMAND ".repeat(1000) } });
+        for (const selected of [false, true]) {
+          for (const expanded of [false, true]) {
+            const lines = renderToolResponse(value, 40, expanded, selected);
+            const heading = stripTerminalSequences(lines[0]!);
+            assert.ok(heading.endsWith(` (${duration})`), heading);
+            assert.equal(visibleWidth(heading), 40);
+            assert.doesNotMatch(lines.slice(1).map(stripTerminalSequences).join("\n"), /\(25ms\)|\(6\.9s\)/);
+          }
+        }
+      }
+    }
+  }
+});
+
+test("shell command headings stay bounded, literal and sanitized across lifecycle and selection states", () => {
+  for (const [name, label] of [["bash", "Bash"], ["powershell", "PowerShell"]]) {
+    assert.equal(activityLabel(tool({ name })), `${label}(npm test)`);
+    for (const command of [undefined, null, 42, "", " \t", "\nHIDDEN_BODY"]) {
+      assert.equal(activityLabel(tool({ name, arguments: { command, path: "NOT_A_SHELL_TARGET" } })), label);
+    }
+    for (const separator of ["\n", "\r\n", "\r", "\u2028", "\u2029"]) {
+      assert.equal(activityLabel(tool({ name, arguments: { command: `  npm\ttest ${separator}HIDDEN_BODY` } })), `${label}(npm test)`);
+    }
+    const command = '\x1b[2J\x1b]0;injected\x07\u009b2Jecho "**literal** \u754c\u9762 \ud83d\ude00" ' + "long argument ".repeat(2000);
+    const value = tool({ name, arguments: { command }, output: "STDOUT_MUST_STAY_HIDDEN" });
+    assert.ok(activityLabel(value).includes('echo "**literal** \u754c\u9762 \ud83d\ude00"'));
+    for (const status of ["pending", "running", "done", "error", "interrupted"] as const) {
+      value.status = status;
+      for (const selected of [false, true]) {
+        for (const width of [1, 2, 3, 4, 8, 12, 24, 80]) {
+          const lines = renderToolResponse(value, width, false, selected);
+          assert.ok(lines.every((line) => visibleWidth(line) <= width));
+          assert.equal(lines.length, renderToolResponse({ ...value, arguments: {} }, width, false, selected).length,
+            "A long single-line command must not wrap the heading");
+          assert.ok(lines.every((line) => !line.includes("\x1b[2J") && !line.includes("\x1b]0;") && !line.includes("\u009b")));
+          assert.doesNotMatch(stripTerminalSequences(lines[0]!), /STDOUT_MUST_STAY_HIDDEN/);
+        }
+      }
+    }
   }
 });
 

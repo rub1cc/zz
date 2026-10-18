@@ -6,7 +6,7 @@ import { estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import type { CompactionStatus, ContextView, ConversationView } from "@earendil-works/pi-durable";
 import { stripTerminalSequences } from "@earendil-works/pi-tui";
 import { applyView } from "../src/engine.js";
-import type { Session } from "../src/model.js";
+import { startWork, type Session } from "../src/model.js";
 import { Store } from "../src/store.js";
 import { composerStatus, contextEstimate, emptyUsage, formatCost, formatTokens, sessionStats, usageDetails } from "../src/usage.js";
 import { temporary } from "./helpers.js";
@@ -57,6 +57,44 @@ test("projection uses ledger totals without double counting visible messages, to
   assert.deepEqual(sessionStats(s, 1000), stats, "replayed snapshots must not accumulate usage");
 });
 
+test("work tokens combine the run's recorded output and current partial without double counting", () => {
+  const s = session();
+  s.usage = structuredClone(usage);
+  s.titleUsage = { ...emptyUsage(), output: 9999 };
+  startWork(s, 1000);
+  const view = (output: number, partial?: number) => ({ entries: [], docs: {
+    "pi.usage": { models: { "test/mock": { ...usage, output } }, tools: {} },
+    "pi.live": { run: { taskId: 1 }, generation: partial === undefined ? undefined : {
+      message: { ...assistant, usage: { ...usage, output: partial } },
+    } },
+  } }) as unknown as ConversationView;
+  applyView(s, view(50, 12));
+  assert.equal(s.work?.outputTokens, 12);
+  applyView(s, view(50, 12));
+  assert.equal(s.work?.outputTokens, 12, "repeated snapshots do not accumulate");
+  applyView(s, view(62));
+  assert.equal(s.work?.outputTokens, 12, "final usage replaces the live partial atomically");
+  applyView(s, view(62, 5));
+  assert.equal(s.work?.outputTokens, 17, "tool rounds and retries retain earlier output");
+  applyView(s, view(67));
+  assert.equal(s.work?.outputTokens, 17);
+  const restored = structuredClone(s);
+  applyView(restored, view(67, 3));
+  assert.equal(restored.work?.outputTokens, 20, "restored work retains its original baseline");
+  startWork(s, 2000);
+  applyView(s, view(67, 3));
+  assert.equal(s.work?.outputTokens, 3, "new work excludes earlier turns and title overhead");
+  s.work!.finishedAt = 3000;
+  applyView(s, view(100));
+  assert.equal(s.work?.outputTokens, 3, "later background work does not rewrite finished statistics");
+  const legacy = session(); legacy.work = { startedAt: 1000 };
+  applyView(legacy, view(100));
+  assert.equal(legacy.work.outputTokens, undefined, "legacy work without a baseline stays unknown");
+  const forked = session(); forked.usage = { ...usage, output: 150 }; startWork(forked);
+  applyView(forked, view(50, 4), { ...usage, output: 100 });
+  assert.equal(forked.work?.outputTokens, 4, "undo's prior usage remains outside the new run");
+});
+
 test("footer distinguishes pending, unavailable, zero-cost and high context; details explain estimates", () => {
   const settings = { model: { provider: "test", modelId: "mock" }, thinkingLevel: "high" as const };
   assert.equal(stripTerminalSequences(composerStatus(settings, {})), "test/mock · high · ?/? · ◉ ? · cost ?");
@@ -93,12 +131,16 @@ test("cached usage is backwards compatible, validated and persists without chang
     const store = new Store(temp.root); const s = session(); store.state.sessions.push(s); store.save();
     assert.equal(new Store(temp.root).state.sessions[0]?.usage, undefined);
     s.usage = structuredClone(usage); s.titleUsage = emptyUsage(); s.context = { tokens: 500, cacheHitRate: 50 };
+    startWork(s, 1000); s.work!.outputTokens = 12;
     store.save();
     assert.deepEqual(new Store(temp.root).state.sessions[0], s);
     for (const change of [
       (value: Session) => { value.usage!.input = -1; },
       (value: Session) => { value.titleUsage!.cost.total = NaN; },
       (value: Session) => { value.context!.cacheHitRate = 101; },
+      (value: Session) => { value.work!.outputTokensStart = -1; },
+      (value: Session) => { value.work!.outputTokens = -1; },
+      (value: Session) => { value.work!.outputTokens = "12" as never; },
     ]) {
       const state = structuredClone(store.state); change(state.sessions[0]!);
       const json = JSON.stringify(state); writeFileSync(store.file, json);
