@@ -1,11 +1,14 @@
+import { initTheme, renderDiff } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { accent, bold, dim, fit, green, oneLine, plain, red, warning } from "./format.js";
 import type { ToolActivity } from "./model.js";
+import { shadeDiffRow } from "./diff-background.js";
 
 const bullet = "\u25cf";
 const branch = "  \u23bf ";
 const previewLimit = 6;
 const shellPreviewLimit = 3;
+let diffThemeInitialized = false;
 
 type RecordValue = Record<string, unknown>;
 const record = (value: unknown): RecordValue | undefined => value !== null && typeof value === "object" && !Array.isArray(value)
@@ -119,9 +122,21 @@ function renderCodeChanges(tool: ToolActivity, width: number): string[] {
   if (tool.name !== "edit") return [];
   const diff = diffText(tool);
   if (diff !== undefined) {
-    // Color before wrapping so long additions/removals keep their color on every row.
-    return textLines(diff).flatMap((source) => literal(source || "\n", width, "    ", Infinity,
-      /^\+\s*\d+ /.test(source) ? green : /^-\s*\d+ /.test(source) ? red : dim));
+    const sources = textLines(diff);
+    if (!sources.length) return [];
+    if (!diffThemeInitialized) { initTheme(); diffThemeInitialized = true; }
+    // Sanitize source before Pi renders it, then retain its generated ANSI through wrapping.
+    const rendered = renderDiff(sources.join("\n"), { filePath: typeof tool.arguments.path === "string" ? tool.arguments.path : undefined });
+    const indent = width > 4 ? "    " : "";
+    return rendered.split("\n").flatMap((line, index) => {
+      // Pi's word matcher can normalize whitespace; never change the SDK's displayed source.
+      const source = sources[index]!;
+      const styled = plain(line) === source ? line : renderDiff(source);
+      const change = /^\+\s*\d+ /.test(source) ? "added" : /^-\s*\d+ /.test(source) ? "removed" : undefined;
+      const contentWidth = Math.max(1, width - indent.length);
+      return wrapTextWithAnsi(styled, contentWidth)
+        .map((row) => `${indent}${shadeDiffRow(row, contentWidth, change)}`);
+    });
   }
   // Older histories may lack SDK diff metadata. Show confirmed replacement fragments,
   // not invented file context, line numbers, or diffstats.

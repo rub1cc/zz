@@ -44,6 +44,7 @@ export class Controller {
   dialog?: Dialog;
   questionForm?: QuestionForm;
   pendingDelete?: string;
+  pendingProjectRemoval?: string;
   private deleting = false;
   private deletingProjectId?: string;
   notice = "";
@@ -358,6 +359,7 @@ export class Controller {
 
   select(id: string): void {
     this.pendingDelete = undefined;
+    this.pendingProjectRemoval = undefined;
     this.selection = id;
     const row = this.selected;
     if (row) this.store.state.selectedProjectId = row.project.id;
@@ -416,6 +418,7 @@ export class Controller {
 
   toggleProjects(): void {
     this.pendingDelete = undefined;
+    this.pendingProjectRemoval = undefined;
     const project = this.project;
     this.dialog = undefined;
     this.mode = this.mode === "projects" ? "sessions" : "projects";
@@ -427,6 +430,7 @@ export class Controller {
     const selected = this.selected;
     if (selected?.kind !== "session") return;
     this.pendingDelete = undefined;
+    this.pendingProjectRemoval = undefined;
     this.openedSessionId = selected.session.id;
     this.mode = "session";
     this.changed();
@@ -434,6 +438,7 @@ export class Controller {
 
   back(): void {
     this.pendingDelete = undefined;
+    this.pendingProjectRemoval = undefined;
     this.dialog = undefined;
     if (this.mode === "session") {
       this.selection = this.openedSessionId ? `session:${this.openedSessionId}` : this.selection;
@@ -561,8 +566,50 @@ export class Controller {
     }
   }
 
+  requestProjectRemoval(): void {
+    const selected = this.selected;
+    if (this.closing || this.deleting || this.mode !== "projects" || selected?.kind !== "project") return;
+    this.pendingDelete = undefined;
+    this.pendingProjectRemoval = selected.project.id;
+    this.notice = "";
+    this.changed();
+  }
+
+  cancelProjectRemoval(): void {
+    if (!this.pendingProjectRemoval) return;
+    this.pendingProjectRemoval = undefined;
+    this.changed();
+  }
+
+  confirmProjectRemoval(): void {
+    const target = this.pendingProjectRemoval;
+    const selected = this.selected;
+    this.cancelProjectRemoval();
+    if (this.closing || this.deleting || this.mode !== "projects" || selected?.kind !== "project"
+      || selected.project.id !== target) return;
+    const previous = { projects: this.store.state.projects, selection: this.selection,
+      selectedProjectId: this.store.state.selectedProjectId };
+    const index = previous.projects.findIndex((project) => project.id === target);
+    this.store.state.projects = previous.projects.filter((project) => project.id !== target);
+    const remaining = this.currentRows;
+    const next = remaining[Math.min(index, remaining.length - 1)];
+    this.selection = next && rowId(next);
+    this.store.state.selectedProjectId = next?.project.id;
+    try { this.store.save(); }
+    catch (error) {
+      this.store.state.projects = previous.projects;
+      this.store.state.selectedProjectId = previous.selectedProjectId;
+      this.selection = previous.selection;
+      this.fail(error);
+      return;
+    }
+    this.notice = "Project removed from list. Files and sessions are kept; re-add the directory to restore sessions. Running work continues.";
+    this.changed();
+  }
+
   requestDelete(): void {
     if (this.mode === "session" || this.deleting) return;
+    this.pendingProjectRemoval = undefined;
     const selected = this.selected;
     if (selected && (selected.kind === "session" || this.store.state.sessions.some((s) => s.projectId === selected.project.id))) {
       this.pendingDelete = rowId(selected);

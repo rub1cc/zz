@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import lockfile from "proper-lockfile";
-import { matchesKey, ProcessTerminal, TuiAltScreen } from "@earendil-works/pi-tui";
+import { matchesKey, ProcessTerminal, TuiAltScreen, type TerminalColors } from "@earendil-works/pi-tui";
 import { Controller } from "./controller.js";
 import { DurableEngine } from "./engine.js";
 import { Store } from "./store.js";
@@ -14,6 +14,7 @@ import { loadPi } from "./pi.js";
 import { cancelExternalEditor, isExternalEditorOpen } from "./external-editor.js";
 import { statusRefreshInterval } from "./format.js";
 import { createShutdown } from "./shutdown.js";
+import { setDiffBackground } from "./diff-background.js";
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
@@ -127,6 +128,12 @@ async function main(): Promise<void> {
     await engine.restore(() => controller?.changed(true));
     if (shutdown.isClosing) return;
     tui.start();
+    const updateDiffBackground = (colors: TerminalColors) => {
+      if (shutdown.isClosing || !setDiffBackground(colors.background)) return;
+      app?.body.transcript.invalidate();
+      tui?.requestRender();
+    };
+    void tui.queryTerminalColors({ timeoutMs: 200, onLateReply: updateDiffBackground }).then(updateDiffBackground, () => {});
     app.sync();
     for (const error of reports) controller.fail(error);
     let lastRefresh = Date.now();

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -6,6 +7,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createEditTool, createReadTool, createWriteTool } from "@earendil-works/pi-durable/tools";
 import type { ToolExecutionApi } from "@earendil-works/pi-durable";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
+import { renderDiff as renderPiDiff } from "@earendil-works/pi-coding-agent";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import type { ToolActivity } from "../src/model.js";
 import { activityLabel, renderToolResponse } from "../src/tool-response.js";
@@ -56,8 +58,8 @@ test("read, write and update use actual SDK results and display truthful line co
       '    -2   return "Hello";', '    +2   return "Hello, World!";', "     3 }",
     ].join("\n"));
     const colored = renderToolResponse(value, 100, false, false).join("\n");
-    assert.match(colored, /\x1b\[32m[^]*\+2/);
-    assert.match(colored, /\x1b\[31m[^]*-2/);
+    assert.ok(colored.includes(renderPiDiff("+2 code").split("+2 code")[0]! + "+2"));
+    assert.ok(colored.includes(renderPiDiff("-2 code").split("-2 code")[0]! + "-2"));
     assert.match(readFileSync(join(temp.root, args.path), "utf8"), /Hello, World!/);
     for (const details of [result.details, { details: result.details }, { result: result.details }]) {
       assert.match(render({ ...value, details }), /Added 1 line, removed 1 line/);
@@ -220,6 +222,66 @@ test("shell command headings stay bounded, literal and sanitized across lifecycl
   }
 });
 
+test("Pi diff rendering preserves exact SDK rows even when word matching normalizes whitespace", () => {
+  for (const diff of [
+    '-2   return name;\n+2   return name || "World";',
+    '-1 const value="old";\n+1 const value = "new";',
+    ' 1 before\n-2 old first\n-3 old last\n+2 new first\n+3 new last\n...\n-99 final old\n+99 final new',
+    '-1 \n+1 now filled\n 2 after',
+  ]) {
+    for (const expanded of [false, true]) {
+      const value = tool({ name: "edit", arguments: { path: "file.ts" }, details: { result: { diff } } });
+      const lines = renderToolResponse(value, 200, expanded, false);
+      assert.deepEqual(lines.slice(2, 2 + diff.split("\n").length).map((line) => stripTerminalSequences(line).slice(4)), diff.split("\n"));
+    }
+  }
+  assert.equal(render(tool({ name: "edit", arguments: {}, details: { result: { diff: "" } } })),
+    "\u25cf Update\n  \u23bf Updated file");
+});
+
+test("Pi word highlights survive narrow wrapping without leaking styles, with a no-color fallback", () => {
+  const script = `
+    import assert from "node:assert/strict";
+    import { renderToolResponse } from ${JSON.stringify(new URL("../src/tool-response.ts", import.meta.url).href)};
+    import { setDiffBackground } from ${JSON.stringify(new URL("../src/diff-background.ts", import.meta.url).href)};
+    import { renderDiff } from "@earendil-works/pi-coding-agent";
+    import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+    const diff = '-7 const value = "' + 'OLD'.repeat(50) + '";\\n+7 const value = "' + 'NEW'.repeat(50) + '";';
+    const value = { id: "pi-diff", name: "edit", status: "done", output: "", arguments: { path: "file.ts" }, details: { result: { diff } } };
+    for (const expanded of [false, true]) {
+      const wide = renderToolResponse(value, 1000, expanded, false);
+      assert.deepEqual(wide.slice(2, 4).map(line => stripTerminalSequences(line).slice(4)), diff.split("\\n"));
+      setDiffBackground({ r: 255, g: 255, b: 255 });
+      const lines = renderToolResponse(value, 24, expanded, false);
+      const start = lines.findIndex(line => stripTerminalSequences(line).includes("-7 const"));
+      const end = expanded ? lines.findIndex(line => stripTerminalSequences(line).trim() === "Arguments") : lines.length;
+      const code = lines.slice(start, end);
+      assert.ok(start >= 0 && code.length > 10);
+      assert.ok(code.every(line => line.endsWith("\\x1b[0m")));
+      assert.ok(lines.every(line => visibleWidth(line) <= 24));
+      if (process.env.FORCE_COLOR === "3") {
+        assert.ok(code.filter(line => /\\x1b\\[(?:\\d+;)*7(?:;\\d+)*m/.test(line)).length > 4, "Changed tokens must remain inverse on wrapped rows");
+        assert.ok(code.every(line => visibleWidth(line) === 24 && line.includes("\\x1b[48;")));
+        assert.ok(code.every(line => /\\x1b\\[27m\\x1b\\[48;/.test(line)), "Trailing fill must not inherit inverse");
+      } else {
+        assert.ok(code.every(line => !/\\x1b\\[(?:\\d+;)*7(?:;\\d+)*m/.test(line)));
+        assert.ok(code.every(line => !line.includes("\\x1b[48;")));
+      }
+      assert.ok(stripTerminalSequences(lines.join("\\n")).includes("NEWNEW"));
+      setDiffBackground(undefined);
+    }
+    const multi = '-1 old one\\n-2 old two\\n+1 new one\\n+2 new two';
+    assert.ok(!renderDiff(multi).includes("\\x1b[7m"), "Use Pi's native multi-line block behavior");
+  `;
+  for (const color of [true, false]) {
+    const env = { ...process.env };
+    delete env.FORCE_COLOR; delete env.NO_COLOR;
+    if (color) env.FORCE_COLOR = "3"; else env.NO_COLOR = "1";
+    const result = spawnSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], { env, encoding: "utf8", timeout: 20000 });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  }
+});
+
 test("complete writes and every diff hunk stay visible regardless of expansion", () => {
   const content = Array.from({ length: 30 }, (_, i) => `const line${i + 1} = ${i + 1};`).join("\n");
   const diff = [
@@ -253,8 +315,11 @@ test("long code lines wrap in full and diff continuation rows retain addition/re
         const removal = lines.findIndex((line) => stripTerminalSequences(line).includes("-1 BEGIN"));
         const addition = lines.findIndex((line) => stripTerminalSequences(line).includes("+1 BEGIN"));
         assert.ok(removal >= 0 && addition > removal + 6);
-        assert.ok(lines.slice(removal, addition).every((line) => line.includes("\x1b[31m")));
-        assert.ok(lines.slice(addition, addition + 10).every((line) => line.includes("\x1b[32m")));
+        const removedColor = renderPiDiff("-1 code").split("-1 code")[0]!;
+        const addedColor = renderPiDiff("+1 code").split("+1 code")[0]!;
+        assert.ok(lines.slice(removal, addition).every((line) => line.includes(removedColor)));
+        assert.ok(lines.slice(addition, addition + 10).every((line) => line.includes(addedColor)));
+        assert.ok(lines.slice(removal, addition + 10).every((line) => line.endsWith("\x1b[0m")));
       }
     }
   }

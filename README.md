@@ -151,10 +151,13 @@ files. Coding-agent extensions and MCP remain disabled.
   fallback. Expanded `read` tool results also display returned images, and the
   agent's `read` tool now uses the image processor for resizing/conversion.
   Text-only models report an error instead of silently discarding attachments.
-- Provider thinking appears in separate **Thinking** blocks, including during
-  streaming. Click or select a block to collapse/expand it; `/expand` and
-  `/collapse` also apply. **Show reasoning** in `/settings` shows/hides all
-  thinking blocks and saves that global display preference. It does **not** change
+- Provider thinking appears in **Thinking** blocks, including during streaming;
+  empty non-redacted blocks are omitted. Thinking between grouped routine tool
+  calls stays inside the group and appears in its original position on expansion.
+  Standalone blocks still support click/keyboard expansion; grouped reasoning uses
+  the group's controls. `/expand` and `/collapse` also apply. **Show reasoning** in
+  `/settings` shows/hides all thinking blocks without affecting tool grouping and
+  saves that global display preference. It does **not** change
   the model's thinking level; `/thinking` opens the level picker.
   Redacted thinking gets a placeholder; opaque signatures are never displayed or
   copied into the presentation cache. Providers that return no thinking have
@@ -517,8 +520,6 @@ and results stay paired in one compact block, updating in place while running.
 ```text
 ❯ Fix greet() for empty names and add a test.
 
-✻ Thinking...
-
 ● I'll check the function and add a test.
 
 ● Read(src/greet.ts)
@@ -543,9 +544,19 @@ and results stay paired in one compact block, updating in place while running.
 ● Fixed empty names and added a regression test. Tests: 1 passed.
 ```
 
-Edit diffs come from the SDK result, not guessed changes; additions are green and
-removals red, including wrapped continuation rows. Successful writes show all
-numbered content; every edit diff hunk stays visible without expansion. Collapsing
+Edit diffs come from the SDK result, not guessed changes, and use Pi's public
+`renderDiff()` with its default system theme: green additions, red removals, and
+inverse highlighting of changed words in single-line replacement pairs when color
+is enabled. Colors and word highlights survive wrapped continuation rows. If Pi's
+word matcher changes whitespace, that row falls back to Pi's line-only rendering
+to preserve the exact SDK text. Changed diff rows get a faint green/red background,
+blended into the terminal's background and extended through wrapped rows and
+trailing space. Context rows and the transcript indent stay unpainted. The terminal
+background is queried at startup; unsupported terminals and `NO_COLOR` keep the
+existing unfilled rendering. Dark 256-color terminals use a quiet neutral fill
+instead of a stronger saturated tint. This does not add syntax coloring.
+Successful writes show all numbered content; every edit diff hunk stays visible
+without expansion. Collapsing
 a tool hides only its extra details, never its code changes. Older edits without
 SDK diff metadata show their applied replacement fragments when retained, with
 no invented file context or line numbers. Standalone Bash/PowerShell headings show
@@ -565,14 +576,18 @@ skill-file read, not a guarantee that every instruction was followed.
 The [response inventory](docs/tui-rendering.md) documents every currently supported
 message, tool, question, shell and session-state scenario and its test coverage.
 
-Adjacent routine reads and shell calls fold into one expandable line:
+Routine reads and shell calls fold into one expandable line, including calls
+separated only by provider thinking:
 
 ```text
 ● Read 1 file, ran 1 shell command (/expand)
 ● Read 2 files, running 1 shell command (/expand)
 ```
 
-Groups do not cross assistant/user/thinking messages, edits, writes, skills,
+Intervening thinking stays hidden inside compact groups. Expanding a group shows
+its tools and non-empty reasoning in their original order, honoring **Show reasoning**.
+A group remains one keyboard/mouse target. Reasoning before or after its tool span
+stays standalone. Groups do not cross assistant/user messages, edits, writes, skills,
 questions, compaction, images, warnings, errors or interruptions. File counts
 use distinct path strings; shell counts are tool invocations, not the individual
 commands inside a script. Grouping is not a read-only/safety classification.
@@ -589,7 +604,8 @@ Inside a session:
   composer returns to the dashboard without cancelling work. Text in the composer still
   behaves as ordinary text and Enter sends it.
 - `/expand` and `/collapse` show/hide all tool details. Page Up/Down scrolls long
-  output. Expanding a group reveals all its member calls. Expansion survives
+  output. Expanding a group reveals all its member calls and intervening reasoning
+  when enabled. Expansion survives
   streaming updates and resets when switching sessions.
 
 Activity is presentation only: compact previews do not change retained output or model context.
@@ -730,6 +746,10 @@ and session lists never follow chat output.
 - `/projects` opens project management. `a` adds an existing directory;
   Enter selects a project and returns to sessions; Escape returns without changing
   the project. `~` paths are supported.
+- In `/projects`, press `r` twice to remove the selected project from the list.
+  Any other key cancels confirmation. Files and sessions stay intact, and running
+  work continues. Re-add the same directory to bring its sessions back, even after
+  restarting zz. Ctrl+X remains a separate action that deletes sessions instead.
 - Shift+Up/Down moves the selected dashboard session within its project. The first
   move saves that project's visible session order, which remains stable as session
   statuses change and survives restart. New sessions appear above the saved order.

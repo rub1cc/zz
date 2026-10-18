@@ -69,7 +69,7 @@ test("dashboard uses terminal edges for headers, composer and footer in every vi
           assert.ok(lines.every((line) => visibleWidth(line) <= width));
           const heading = mode === "projects" ? "Projects" : mode === "session" ? session.title : "0 awaiting";
           assert.ok(lines[0]!.startsWith(heading.slice(0, 8)), `${mode} ${width}x${height}: ${JSON.stringify(lines[0])}`);
-          assert.ok(lines.at(-1)!.startsWith(mode === "projects" ? "Ctrl+x" : "test/mock"), `${mode} ${width}x${height}: ${JSON.stringify(lines.at(-1))}`);
+          assert.ok(lines.at(-1)!.startsWith(mode === "projects" ? "r twice" : "test/mock"), `${mode} ${width}x${height}: ${JSON.stringify(lines.at(-1))}`);
           const border = mode === "projects" ? "-".repeat(width)
             : stripTerminalSequences(f.app.composer.render(width)[0]!);
           assert.equal(visibleWidth(border), width);

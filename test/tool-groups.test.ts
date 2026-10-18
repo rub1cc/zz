@@ -15,6 +15,7 @@ import { FakeEngine, FakeTerminal, temporary } from "./helpers.js";
 const read = (id = "read", status: ToolActivity["status"] = "done"): ToolActivity => ({ id, name: "read", status, arguments: { path: `${id}.ts` }, output: "FILE_CONTENT" });
 const bash = (id = "bash", status: ToolActivity["status"] = "done"): ToolActivity => ({ id, name: "bash", status, arguments: { command: "cat > file <<'EOF'\nSCRIPT_BODY\nEOF" }, output: "COMMAND_OUTPUT" });
 const message = (tool: ToolActivity): Message => ({ role: "tool", tool, text: "", timestamp: 1 });
+const thinking = (text = "Provider thinking", id = "one"): Message => ({ role: "thinking", text, timestamp: 2, thinking: { id: `thinking:${id}` } });
 const clean = (lines: string[]) => lines.map(stripTerminalSequences).map((line) => line.trimEnd()).join("\n");
 
 function setup(messages: Message[] = [message(read()), message(bash())]) {
@@ -46,6 +47,47 @@ test("adjacent routine reads and commands become one line without commands, path
   } finally { await f.close(); }
 });
 
+test("routine calls group across thinking, with reasoning revealed in its original order", async () => {
+  const messages = [message(read()), thinking("REASON_ONE"), thinking(" \t\n", "empty"),
+    { ...thinking("NEVER_DISPLAY", "redacted"), thinking: { id: "thinking:redacted", redacted: true } },
+    thinking("REASON_TWO", "two"), message(bash())];
+  const f = setup(messages);
+  try {
+    const original = structuredClone(messages);
+    assert.equal(f.render(), "\u25cf Read 1 file, ran 1 shell command (/expand)\n");
+    assert.equal(f.transcript.positions.get("thinking:one"), f.transcript.positions.get("read"));
+    assert.equal(f.transcript.positions.has("thinking:empty"), false);
+    f.transcript.move(1); f.transcript.toggle();
+    const expanded = f.render();
+    assert.match(expanded, /Read\(read.ts\)[^]*FILE_CONTENT[^]*REASON_ONE[^]*Thinking \(redacted\)[^]*REASON_TWO[^]*Bash[^]*COMMAND_OUTPUT/);
+    assert.equal(expanded.match(/^\s*✻ Thinking/gm)?.length, 3, "Empty thinking is not a card");
+    assert.doesNotMatch(expanded, /NEVER_DISPLAY/);
+    assert.match(expanded, /\n  ● Read\(read.ts\)/);
+    assert.match(expanded, /\n  ✻ Thinking/);
+    assert.match(expanded, /\n  ● Bash/);
+    f.transcript.toggle();
+    assert.doesNotMatch(f.render(), /Thinking|REASON|FILE_CONTENT|COMMAND_OUTPUT/);
+    f.store.state.settings = { replyBehavior: "followUp", showThinking: false };
+    assert.match(f.render(), /Read 1 file, ran 1 shell command/);
+    f.transcript.toggleAll(true);
+    assert.match(f.render(), /FILE_CONTENT[^]*COMMAND_OUTPUT/);
+    assert.doesNotMatch(f.render(), /Thinking|REASON|NEVER_DISPLAY/);
+    f.store.state.settings.showThinking = true;
+    assert.match(f.render(), /REASON_ONE[^]*REASON_TWO/);
+    assert.deepEqual(f.session.messages, original, "Grouping never rewrites retained reasoning");
+  } finally { await f.close(); }
+});
+
+test("only intervening thinking is grouped and exceptional results still break the span", () => {
+  const messages = [thinking("before"), message(read()), thinking("between"), message(bash()), thinking("after", "last")];
+  const groups = toolGroups(messages);
+  assert.deepEqual([...groups.keys()], [1]);
+  assert.equal(groups.get(1)!.end, 3);
+  assert.equal(groups.get(1)!.tools.length, 2);
+  assert.equal(toolGroups([message(read()), thinking(), message(bash("failed", "error"))]).size, 0);
+  assert.equal(toolGroups([thinking(), message(read()), thinking()]).size, 0);
+});
+
 test("group counts and hints are normal weight, with only the Read name bold", () => {
   const mixed = renderToolGroup([read(), bash()], 120, false, false)[0]!;
   assert.ok(mixed.includes("\x1b[1mRead\x1b[22m 1 file, ran 1 shell command"));
@@ -66,7 +108,7 @@ test("narrative, mutations, skills, questions, warnings, images and failures are
   const barriers: TranscriptMessage[] = [
     { role: "user", text: "Next task", timestamp: 2 },
     { role: "assistant", text: "Here is an explanation", timestamp: 2 },
-    { role: "thinking", text: "Provider thinking", timestamp: 2 },
+    { ...thinking(), images: [image] },
     { role: "error", text: "Model failed", timestamp: 2 },
     { role: "tool", text: "Legacy output", timestamp: 2 },
     { role: "shell", text: "local", timestamp: 2, shell: { id: "local", command: "pwd", cwd: "/project", text: "local", status: "done", timestamp: 2, updatedAt: 2, droppedBytes: 0, droppedLines: 0 } },
@@ -81,8 +123,40 @@ test("narrative, mutations, skills, questions, warnings, images and failures are
   ];
   for (const barrier of barriers) {
     assert.equal(toolGroups([message(read()), barrier, message(bash())]).size, 0, JSON.stringify(barrier));
+    assert.equal(toolGroups([message(read()), thinking(), barrier, thinking("later", "later"), message(bash())]).size, 0, JSON.stringify(barrier));
   }
   for (const tool of [{ ...read(), arguments: {} }, { ...bash(), arguments: { command: "" } }]) assert.equal(canGroupTool(tool), false);
+});
+
+test("a selected standalone thinking block follows its anchor when the next call creates a group", async () => {
+  const f = setup([message(read()), thinking("LIVE_REASONING")]);
+  try {
+    assert.match(f.render(), /LIVE_REASONING/);
+    f.transcript.move(-1);
+    assert.equal(f.transcript.selected, "thinking:one");
+    f.session.messages[1]!.text += " updated";
+    assert.match(f.render(), /LIVE_REASONING updated/);
+    f.session.messages.push(message(bash("second", "running")));
+    f.session.messages = structuredClone(f.session.messages);
+    assert.match(f.render(), /Read 1 file, running 1 shell command/);
+    assert.doesNotMatch(f.render(), /Thinking|LIVE_REASONING/);
+    assert.equal(f.transcript.selected, "read");
+    f.transcript.toggleAll(true);
+    assert.match(f.render(), /FILE_CONTENT[^]*LIVE_REASONING updated[^]*Running/);
+    f.session.messages[2]!.tool!.status = "done";
+    f.session.messages[1]!.text += " final";
+    assert.match(f.render(), /LIVE_REASONING updated final/);
+    f.transcript.toggleAll(false);
+    assert.doesNotMatch(f.render(), /LIVE_REASONING/);
+    f.session.messages.push(thinking(" ", "empty"));
+    assert.doesNotMatch(f.render(), /Thinking/);
+    for (const width of [1, 2, 4, 8, 24, 80]) {
+      for (const expanded of [true, false]) {
+        f.transcript.toggleAll(expanded);
+        assert.ok(f.transcript.render(width).every((line) => visibleWidth(line) <= width));
+      }
+    }
+  } finally { await f.close(); }
 });
 
 test("group selection and expansion survive appending calls, projection replacements, and group merging", async () => {
@@ -124,21 +198,23 @@ test("an error breaks out of its group and stays visible instead of being summar
 });
 
 test("group clicks, keyboard navigation and /expand /collapse work in the real TUI", async () => {
-  const f = setup(); const terminal = new FakeTerminal(); const tui = new TuiAltScreen(terminal);
+  const f = setup([message(read()), thinking("GROUP_REASONING"), message(bash())]);
+  const terminal = new FakeTerminal(); const tui = new TuiAltScreen(terminal);
   try {
     const app = new Dashboard(f.controller, tui, () => {});
     tui.setLayoutRoot(app); tui.setFocus(app); tui.start(); app.sync();
     const render = () => clean(app.body.transcript.render(120));
     assert.match(render(), /Read 1 file, ran 1 shell command/);
     terminal.onInput("\t"); terminal.onInput(" ");
-    assert.match(render(), /SCRIPT_BODY[^]*COMMAND_OUTPUT/);
+    assert.match(render(), /FILE_CONTENT[^]*GROUP_REASONING[^]*SCRIPT_BODY[^]*COMMAND_OUTPUT/);
     app.composer.setValue("/collapse"); terminal.onInput("\r");
-    assert.doesNotMatch(render(), /SCRIPT_BODY|COMMAND_OUTPUT/);
+    assert.doesNotMatch(render(), /GROUP_REASONING|SCRIPT_BODY|COMMAND_OUTPUT/);
     app.composer.setValue("/expand"); terminal.onInput("\r");
     assert.match(render(), /SCRIPT_BODY[^]*COMMAND_OUTPUT/);
-    const y = app.body.transcript.positions.get("read")!;
+    const y = app.body.transcript.render(120).findIndex((line) => stripTerminalSequences(line).includes("GROUP_REASONING"));
+    assert.ok(y >= 0);
     app.body.transcript.handleMouse({ type: "click", button: "left", x: 2, y, screenX: 2, screenY: y, width: 120, height: 32, shift: false, ctrl: false, alt: false });
-    assert.doesNotMatch(render(), /SCRIPT_BODY|COMMAND_OUTPUT/);
+    assert.doesNotMatch(render(), /GROUP_REASONING|SCRIPT_BODY|COMMAND_OUTPUT/);
     f.session.messages.push(message({ ...read("edit"), name: "edit" }));
     render(); app.body.transcript.move(1);
     assert.equal(app.body.transcript.selected, "edit", "A group is one navigation target");
@@ -147,11 +223,12 @@ test("group clicks, keyboard navigation and /expand /collapse work in the real T
 });
 
 test("restoring and switching sessions rebuilds collapsed groups without altering saved messages", async () => {
-  const f = setup(); let restoredController: Controller | undefined;
+  const f = setup([message(read()), thinking("SAVED_REASONING"), message(bash())]);
+  let restoredController: Controller | undefined;
   try {
     const expected = f.render();
     f.store.save();
-    f.transcript.toggleAll(true); assert.match(f.render(), /SCRIPT_BODY/);
+    f.transcript.toggleAll(true); assert.match(f.render(), /SAVED_REASONING[^]*SCRIPT_BODY/);
     const restored = new Store(f.store.root);
     restoredController = new Controller(restored, new FakeEngine());
     restoredController.mode = "session"; restoredController.openedSessionId = f.session.id;

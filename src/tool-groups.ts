@@ -7,20 +7,23 @@ export interface ToolGroup {
   tools: ToolActivity[];
 }
 
-/** Never fold across a narrative message, mutation, question, skill, or exceptional tool result. */
+/** Thinking may sit between routine calls; narrative, mutations and exceptional results stay boundaries. */
 export function toolGroups(messages: TranscriptMessage[]): Map<number, ToolGroup> {
   const groups = new Map<number, ToolGroup>();
   let start = 0;
   while (start < messages.length) {
     let end = start;
     const tools: ToolActivity[] = [];
+    let lastTool = start;
     while (end < messages.length) {
       const message = messages[end]!;
+      if (message.role === "thinking" && !message.images?.length && tools.length) { end++; continue; }
       if (message.role !== "tool" || !message.tool || !canGroupTool(message.tool)) break;
       tools.push(message.tool);
-      end++;
+      lastTool = end++;
     }
-    if (tools.length > 1) groups.set(start, { end: end - 1, tools });
+    // Only intervening thinking belongs to the group, never reasoning before/after its tools.
+    if (tools.length > 1) groups.set(start, { end: lastTool, tools });
     start = Math.max(start + 1, end);
   }
   return groups;

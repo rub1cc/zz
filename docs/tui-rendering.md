@@ -15,13 +15,15 @@ agent loop, or additional filesystem operations are introduced. Presentation is:
 - An indented result branch for concise tool summaries and successful standalone shell output previews; expansion reveals full commands/output.
 - A muted thinking heading/body, with the existing visibility and expansion controls.
 - Complete SDK edit diffs and numbered written content stay visible in both compact and expanded cards.
-- Green additions and red removals retain line numbers and colors across wrapped rows.
-- Assistant/tool rows keep the terminal's background; full-width composer borders and wrapped continuation lines remain.
+- Pi's public `renderDiff()` colors additions/removals and inverses changed words in single-line replacement pairs; numbering, colors and highlights survive wrapping.
+- Assistant/tool chrome and diff context keep the terminal's background; changed diff content rows receive subtle fills. Full-width composer borders and wrapped continuation lines remain.
 
 See the rendered example in the README's Compact Activity section. Expansion is
 per call ID, not per projected object. A group uses its first member's call ID;
-expanding it reveals every member's full arguments, output and details. A group is
-one keyboard target; clicking its heading or expanded content toggles the group.
+expanding it reveals every member's full arguments, output and details, with
+intervening non-empty thinking in its original position when reasoning is enabled.
+A group is one keyboard target; clicking its heading or expanded tool/reasoning
+content toggles the group.
 Standalone tools keep their existing per-call controls.
 The selected tool/thinking heading uses a selection arrow. Existing keyboard
 navigation, follow-end scrolling, and explicit scroll-to-bottom remain intact.
@@ -35,7 +37,8 @@ navigation, follow-end scrolling, and explicit scroll-to-bottom remain intact.
 | Headings, lists, quotes, links | Existing Pi Markdown formatting | Wraps within the response indent |
 | Code fences and tables | Existing Pi Markdown code/table renderer | No synthetic tool operation for code in prose |
 | Empty assistant text | No phantom text bubble | Images still render if present |
-| Provider thinking | Muted thinking heading and body | Click, keyboard, expand/collapse; Show reasoning setting retained |
+| Provider thinking | Muted standalone blocks; intervening thinking is tucked inside routine tool groups | Group expansion preserves original order; standalone controls and Show reasoning are retained |
+| Empty non-redacted thinking | No heading, blank row or navigation target | Retained transcript and model context remain unchanged |
 | Provider-redacted thinking | Redacted placeholder only | Never shows the redacted payload or opaque signatures |
 | Tool pending | Tool name/target and Pending | Arguments/output/details available |
 | Tool running | Bounded heading and Running; routine calls may be grouped | Shell output stays hidden until expansion, even while streaming |
@@ -48,10 +51,10 @@ navigation, follow-end scrolling, and explicit scroll-to-bottom remain intact.
 | Read SKILL.md / explicit skill load | Skill name, compact status | Instruction text hidden until expansion |
 | Write/create/overwrite success | Written content's line count and complete numbered content | Code remains visible; expansion adds raw arguments/output/details |
 | Write pending/error/interrupted | Lifecycle status, no successful-write preview | Proposed arguments remain inspectable |
-| Edit success with SDK diff | Actual added/removed counts and every colored diff hunk | Code remains visible; expansion adds raw metadata |
+| Edit success with SDK diff | Actual added/removed counts and every Pi-rendered diff hunk; inverse changed-word highlights for single-line pairs when color is enabled | Code remains visible; expansion adds raw metadata |
 | Edit without diff metadata | All retained applied replacement fragments, explicitly without line numbers; unavailable notice if no fragments remain | Never invents file context, diffstats or line numbers |
 | Bash / PowerShell, standalone | First command line and SDK duration in a one-row heading; successful output previews up to three wrapped rows; non-success lifecycle status stays explicit | Full command/arguments, retained stdout/stderr and diagnostics |
-| Adjacent routine reads/shell calls | One line such as Read 1 file, ran 1 shell command | All member calls expand together |
+| Routine reads/shell calls, optionally separated by thinking | One line such as Read 1 file, ran 1 shell command | Calls and enabled reasoning expand together in original order |
 | Running / pending group members | Reading/running/queued counts, not past-tense success | Stable group anchor while calls settle or more calls arrive |
 | Generic tool text | Literal six-row output preview, one-row heading | Full retained output and metadata |
 | Empty successful shell output | Heading only, with duration when supplied; no result row or fabricated output | Explicit no-text-output placeholder in expansion |
@@ -65,6 +68,29 @@ navigation, follow-end scrolling, and explicit scroll-to-bottom remain intact.
 | Unknown tool name / legacy tool-only message | Generic heading/output fallback | All available arguments/output/details inspectable |
 | Image-only user/assistant message | Native image or textual fallback | Existing image caching/conversion unchanged |
 | Tool images | Count and expand hint | Native images/fallback when expanded |
+
+SDK edit diffs are sanitized before calling the public Pi coding-agent
+`renderDiff()` helper. Its default system theme initializes once for diffs; zz
+retains the generated ANSI through Pi TUI's width-aware wrapping, resetting each
+row so inverse highlights cannot spill into padding or later UI. The current Pi
+helper only word-highlights exactly one removed line followed by one added line;
+multi-line replacement blocks retain line coloring. If word matching normalizes
+whitespace, the affected row is rendered separately by Pi to preserve the exact
+SDK text. No file reads, invented line numbers or language syntax highlighting
+are added. Legacy fragments without SDK diff metadata retain their existing
+explicit, unnumbered red/green rendering without row fills.
+
+Numbered added/removed rows receive a faint green/red background, mixed at 12% into
+the terminal's reported default background. Fills cover the diff content width,
+including the line number, wrapped continuations and trailing space, not the
+transcript indent. Pi's inverse word spans remain inside the code; inverse is
+closed before padding and each row ends with a style reset. Context rows, tool
+headings, summaries and expanded raw sections stay unfilled. The CLI queries
+terminal colors at startup without blocking input and invalidates the transcript
+when an initial or late background report arrives. Unknown backgrounds and
+`NO_COLOR` retain existing unfilled rendering. Colors use Pi TUI's truecolor/256-color
+encoding; dark neutral 256-color terminals use a quiet gray approximation rather
+than the much stronger dark red/green blocks available in that palette.
 
 Successful write content and edit diffs are never capped to a preview or hidden
 by collapse. They wrap to the terminal width and scroll with the transcript;
@@ -92,9 +118,15 @@ messages, with an expansion notice if more exist. Expanded diagnostics retain
 their original order. Hiding content is a display preference, not secret
 redaction: commands and output remain in durable history and model context.
 
-Only adjacent native read/bash/powershell calls without images, diagnostics,
-truncation, errors or interruptions are groupable. Groups do not cross any other
-message, including thinking, or mutation/question/skill/compaction cards. A group
+Native read/bash/powershell calls without images, diagnostics, truncation, errors
+or interruptions are groupable across intervening provider thinking without image
+payloads. Compact groups hide that thinking; expansion shows tools and reasoning
+in original order with one navigation/click target. Show reasoning affects only
+visibility, never grouping. Empty non-redacted thinking has no heading or target,
+but redacted blocks retain their placeholder when shown. Reasoning before the
+first grouped tool or after its last tool stays standalone. All other messages,
+including assistant/user prose and mutation/question/skill/compaction cards, remain
+grouping boundaries. A group
 counts distinct normalized path strings for file reads and tool invocations for
 shell calls. Path aliases are not resolved; shell scripts are not parsed to
 infer reads, directories, side effects, or safety. Repeated reads of the same
@@ -283,20 +315,25 @@ into a heading and wrapping that heading without a row bound. zz now shows only
 the first command line in standalone shell headings and truncates it to one row;
 script bodies stay hidden until expansion. Native Claude Code can
 classify shell reads/listings and has additional transcript/focus behaviors;
-zz deliberately uses conservative adjacent-call groups and preserves its own
+zz deliberately uses conservative routine-call groups (bridging only thinking) and preserves its own
 keyboard bindings (use `/projects` for project management; click or `/expand`
 for tool details).
 
 ## Verification
 
+- `test/diff-background.test.ts`: light/dark tint values, 256-color fallback,
+  unknown backgrounds, no-color behavior, full-width wrapped fills, inverse padding
+  boundaries, and unchanged context/chrome/raw sections.
 - `test/tool-groups.test.ts`: exact mixed-group output, lifecycle counts,
   boundaries, error breakout, merging/appending, click/keyboard controls, restart,
-  saved-history preservation, and bounded headings/diagnostics.
+  saved-history preservation, thinking-aware ordering/visibility/redaction, empty
+  thinking suppression, streaming selection anchors and bounded headings/diagnostics.
 - `test/tool-response.test.ts`: huge heredoc, lifecycle-aware shell previews,
   empty results, wrapped preview bounds, heading durations and full-expansion regressions;
   real SDK read/write/edit executions against
   temporary files; lifecycle matrix, complete multi-hunk diffs and writes in both
-  expansion states, wrapped diff colors, legacy replacement fragments, diagnostics, unknown tools,
+  expansion states, native Pi word highlights and wrapped ANSI resets, exact SDK text
+  when Pi normalizes whitespace, no-color fallback, legacy replacement fragments, diagnostics, unknown tools,
   images, sanitization, tiny widths, and expansion.
 - `test/transcript-rendering.test.ts`: exact full-conversation output, durable
   streaming projection/card replacement, Markdown variants, images, thinking,

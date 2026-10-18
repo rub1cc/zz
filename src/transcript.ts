@@ -38,6 +38,26 @@ export function renderAnsweredQuestions(answers: AnsweredQuestion[], width: numb
   return lines;
 }
 
+function thinkingId(message: Message, index: number): string {
+  return message.thinking?.id ?? `thinking:${index}:${message.timestamp}`;
+}
+
+function hasThinkingContent(message: Message): boolean {
+  return !!message.thinking?.redacted || !!plain(message.text).trim();
+}
+
+function thinkingLines(message: Message, width: number, open: boolean, selected: boolean): string[] {
+  const heading = `${message.thinking?.redacted ? "Thinking (redacted)" : "Thinking"}${open ? "" : " (/expand)"}`;
+  const lines = indentLines(wrapTextWithAnsi(dim(heading), Math.max(1, width - (width > 2 ? 2 : 0))), width,
+    `${selected ? accent(">") : dim("✻")} `);
+  if (open) {
+    const text = message.thinking?.redacted ? "Thinking was redacted by the provider." : message.text;
+    for (const source of plain(text).split("\n")) lines.push(...wrapTextWithAnsi(source.replaceAll("\t", "  "), Math.max(1, width - (width > 4 ? 4 : 0)))
+      .map((line) => `${width > 4 ? "    " : ""}${dim(line)}`));
+  }
+  return [...lines, ""];
+}
+
 interface HistoryCheckpoint {
   index: number;
   line: number;
@@ -97,6 +117,7 @@ export class Transcript implements Component {
 
   toggleAll(expand: boolean): void {
     this.historyCache = undefined;
+    if (expand) this.collapsedThinking.clear();
     for (const id of this.ids) {
       if (id.startsWith("thinking:")) { if (expand) this.collapsedThinking.delete(id); else this.collapsedThinking.add(id); }
       else for (const member of this.groupMembers.get(id) ?? [id]) {
@@ -133,11 +154,15 @@ export class Transcript implements Component {
     const groups = toolGroups(messages);
     this.groupMembers.clear();
     // The first call anchors a growing group; expansion remains attached to its member calls.
-    for (const group of groups.values()) {
+    for (const [start, group] of groups) {
       const id = group.tools[0]!.id;
       const members = group.tools.map((tool) => tool.id);
       this.groupMembers.set(id, members);
       if (this.selected && members.includes(this.selected)) this.selected = id;
+      for (let index = start; index <= group.end; index++) {
+        const message = messages[index]!;
+        if (message.role === "thinking" && this.selected === thinkingId(message, index)) this.selected = id;
+      }
     }
     this.cache.length = messages.length;
     // Appending a routine tool can extend a group that starts before the changed message.
@@ -168,7 +193,17 @@ export class Transcript implements Component {
         this.ids.push(id);
         for (const tool of group.tools) this.positions.set(tool.id, start);
         lines.push(...renderToolGroup(group.tools, width, open, this.selected === id));
-        if (open) for (const tool of group.tools) lines.push(...renderToolResponse(tool, width, true, false), "");
+        const indent = width > 4 ? "  " : "";
+        const memberWidth = Math.max(1, width - indent.length);
+        for (let memberIndex = index; memberIndex <= group.end; memberIndex++) {
+          const member = messages[memberIndex]!;
+          if (member.role === "thinking" && hasThinkingContent(member) && this.controller.store.settings.showThinking !== false) {
+            this.positions.set(thinkingId(member, memberIndex), start);
+            if (open) lines.push(...thinkingLines(member, memberWidth, true, false).map((line) => indent + line));
+          } else if (member.role === "tool" && member.tool && open) {
+            lines.push(...renderToolResponse(member.tool, memberWidth, true, false).map((line) => indent + line), "");
+          }
+        }
         for (let y = start; y < lines.length; y++) this.hits.set(y, id);
         lines.push("");
         groupedThrough = group.end;
@@ -179,18 +214,11 @@ export class Transcript implements Component {
         continue;
       }
       if (message.role === "thinking") {
-        if (this.controller.store.settings.showThinking === false) continue;
-        const id = message.thinking?.id ?? `thinking:${index}:${message.timestamp}`;
+        if (this.controller.store.settings.showThinking === false || !hasThinkingContent(message)) continue;
+        const id = thinkingId(message, index);
         this.ids.push(id); this.positions.set(id, lines.length); this.hits.set(lines.length, id);
-        const open = !this.collapsedThinking.has(id);
-        const heading = `${message.thinking?.redacted ? "Thinking (redacted)" : "Thinking"}${open ? "" : " (/expand)"}`;
-        lines.push(...indentLines(wrapTextWithAnsi(dim(heading), Math.max(1, width - (width > 2 ? 2 : 0))), width,
-          `${this.selected === id ? accent(">") : dim("✻")} `));
-        if (open && (message.text || message.thinking?.redacted)) {
-          const text = message.thinking?.redacted ? "Thinking was redacted by the provider." : message.text;
-          for (const source of plain(text).split("\n")) lines.push(...wrapTextWithAnsi(source.replaceAll("\t", "  "), Math.max(1, width - (width > 4 ? 4 : 0))).map((line) => `${width > 4 ? "    " : ""}${dim(line)}`));
-        }
-        lines.push(""); continue;
+        lines.push(...thinkingLines(message, width, !this.collapsedThinking.has(id), this.selected === id));
+        continue;
       }
       if (message.role === "tool") {
         const tool = message.tool ?? { id: `legacy:${index}:${message.timestamp}`, name: "Tool output", arguments: {}, output: message.text, status: "done" };

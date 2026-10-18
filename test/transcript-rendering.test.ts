@@ -43,7 +43,7 @@ test("the complete sample conversation renders as prompt, thinking, tools, edits
     ];
     const before = structuredClone(f.session.messages);
     assert.equal(f.render(), [
-      "\u276f Fix greet() for empty names and add a test.", "", "\u273b Thinking", "",
+      "\u276f Fix greet() for empty names and add a test.", "",
       "\u25cf I'll check the function and add a test.", "", "\u25cf Read(src/greet.ts)", "  \u23bf Read 3 lines", "",
       "\u25cf Update(src/greet.ts)", "  \u23bf Added 1 line, removed 1 line", "     1 export function greet(name) {",
       "    -2   return name;", '    +2   return name || "World";', "     3 }", "",
@@ -166,6 +166,34 @@ test("Markdown, streaming text, image-only messages, legacy tools, and errors re
     assert.match(f.render(), /Partial answer now complete/);
     f.session.messages[1]!.text = "";
     assert.doesNotMatch(f.render(), /Partial answer/);
+  } finally { await f.close(); }
+});
+
+test("empty thinking never creates headings or navigation targets, but redacted placeholders remain", async () => {
+  const f = setup();
+  try {
+    f.session.messages = [
+      { role: "thinking", text: "", timestamp: 1, thinking: { id: "thinking:empty" } },
+      { role: "thinking", text: " \t\n\x1b[2J", timestamp: 2, thinking: { id: "thinking:blank" } },
+      { role: "assistant", text: "Visible reply", timestamp: 3 },
+    ];
+    const original = structuredClone(f.session.messages);
+    assert.equal(f.render(), "\u25cf Visible reply\n");
+    assert.equal(f.transcript.positions.size, 0);
+    f.transcript.toggleAll(true);
+    assert.doesNotMatch(f.render(), /Thinking/);
+    assert.deepEqual(f.session.messages, original);
+    f.session.messages[0]!.text = "Streaming reasoning";
+    assert.match(f.render(), /Thinking[^]*Streaming reasoning/);
+    f.transcript.move(1);
+    assert.equal(f.transcript.selected, "thinking:empty");
+    f.session.messages[0]!.text = "";
+    assert.doesNotMatch(f.render(), /Thinking/);
+    assert.equal(f.transcript.selected, undefined);
+    f.session.messages[0]!.thinking!.redacted = true;
+    f.session.messages[0]!.text = "NEVER_DISPLAY";
+    assert.match(f.render(), /Thinking \(redacted\)[^]*Thinking was redacted by the provider/);
+    assert.doesNotMatch(f.render(), /NEVER_DISPLAY/);
   } finally { await f.close(); }
 });
 
@@ -349,6 +377,38 @@ test("streaming redraws format only the changed suffix, including after durable 
     assert.match(f.render(), /New reply/);
     assert.equal(render.mock.callCount(), 6);
     assert.equal(clear.mock.callCount(), 0, "Incremental updates retain the unchanged interaction map");
+  } finally { await f.close(); }
+});
+
+test("incremental group caches track hidden thinking, visibility changes, errors and regrouping", async () => {
+  const f = setup();
+  try {
+    const full = new Transcript(f.controller, () => {});
+    const read = (id: string) => toolMessage({ id, name: "read", arguments: { path: `${id}.ts` }, status: "done", output: "source" });
+    const check = () => {
+      full.invalidate();
+      assert.deepEqual(f.transcript.render(100), full.render(100));
+      assert.deepEqual([...f.transcript.positions], [...full.positions]);
+      assert.equal(f.transcript.selected, full.selected);
+    };
+    const reason: Message = { role: "thinking", text: "", timestamp: 2, thinking: { id: "thinking:between" } };
+    const second = read("second");
+    f.session.messages = [read("first"), reason, second, { role: "assistant", text: "Boundary", timestamp: 4 }, read("third")];
+    check();
+    reason.text = "Streaming reasoning"; check();
+    f.transcript.toggleAll(true); full.toggleAll(true); check();
+    f.store.state.settings = { replyBehavior: "followUp", showThinking: false }; check();
+    f.store.state.settings.showThinking = true; check();
+    second.tool!.status = "error"; check();
+    second.tool!.status = "done"; check();
+    f.session.messages.splice(2, 0, { role: "thinking", text: "NEVER_DISPLAY", timestamp: 3,
+      thinking: { id: "thinking:redacted", redacted: true } }); check();
+    f.session.messages.splice(4, 1); check();
+    f.transcript.toggleAll(false); full.toggleAll(false); check();
+    reason.text = ""; check();
+    f.session.messages = structuredClone(f.session.messages); check();
+    f.session.messages.shift(); check();
+    f.session.messages.length = 1; check();
   } finally { await f.close(); }
 });
 

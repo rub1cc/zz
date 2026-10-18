@@ -82,6 +82,9 @@ class SessionList extends Dynamic {
         const count = c.store.state.sessions.filter((s) => s.projectId === row.project.id).length;
         const heading = `${selected ? ">" : " "} ${bold(oneLine(displayPath(row.project.path)))}`;
         rowLines = [`${heading}${dim(`  ${count} session${count === 1 ? "" : "s"}`)}`];
+        if (c.pendingProjectRemoval === row.project.id) {
+          rowLines.push(...wrapTextWithAnsi(red("r again to remove from list (files and sessions kept); any other key cancels"), Math.max(1, width)));
+        }
       } else {
         const { session } = row;
         const status = displayStatus(session);
@@ -302,7 +305,7 @@ export class Dashboard extends VStack implements Focusable {
   private footer(width: number): string[] {
     const c = this.controller;
     const rule = dim("-".repeat(Math.max(0, width)));
-    if (c.mode === "projects") return ["", rule, dim("a add / enter select / ctrl+x clear sessions / esc back"), c.notice ? warning(oneLine(c.notice)) : dim("Ctrl+x twice deletes all sessions in the selected project. Project and files are kept.")];
+    if (c.mode === "projects") return ["", rule, dim("a add / r remove / enter select / ctrl+x clear sessions / esc back"), c.notice ? warning(oneLine(c.notice)) : dim("r twice removes from list, keeping files and sessions. Ctrl+x twice deletes sessions only.")];
     const notice = !this.questionComposer && !this.body.rename && c.notice ? [warning(oneLine(c.notice))] : [];
     const input = this.questionComposer ? this.questionComposer.render(width, Math.max(1, this.tui.terminal.rows - this.header(width).length - 3))
       : this.composer.render(width);
@@ -440,6 +443,11 @@ export class Dashboard extends VStack implements Focusable {
       else this.questionComposer.handleInput(data);
       return;
     }
+    if (c.pendingProjectRemoval) {
+      if (data === "r") c.confirmProjectRemoval();
+      else c.cancelProjectRemoval();
+      return;
+    }
     if (c.pendingDelete) {
       if (matchesKey(data, "ctrl+x")) {
         void c.confirmDelete().catch((error: unknown) => c.fail(error)); return;
@@ -486,6 +494,7 @@ export class Dashboard extends VStack implements Focusable {
       if (matchesKey(data, "ctrl+x")) { c.requestDelete(); return; }
       if (c.mode === "projects") {
         if (data === "a" || matchesKey(data, "enter") && !c.selected) { c.dialog = { kind: "add-project" }; c.changed(); }
+        else if (data === "r") { c.requestProjectRemoval(); }
         else if (matchesKey(data, "enter")) { c.mode = "sessions"; c.changed(); }
         return;
       }
@@ -596,6 +605,7 @@ class DialogView implements Component, Focusable {
       "shift+up/down   reorder selected session within its project (dashboard)",
       "ctrl+r          rename selected session (dashboard)",
       "ctrl+x twice    delete session or all sessions in selected project", "a               add a project (in project management)",
+      "r twice         remove project from list, keeping files and sessions (project management)",
       "pgup / pgdn     scroll transcript or peek",
       "wheel           adaptive chat scrolling; Alt scrolls 5x farther",
       "ctrl+home / /top jump to the oldest chat output",

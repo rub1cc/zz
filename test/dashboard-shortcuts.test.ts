@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
@@ -95,6 +95,113 @@ test("/projects works with no configured projects and offers adding a directory"
     assert.equal(f.controller.dialog, undefined);
     assert.equal(f.store.state.projects.length, 1);
     assert.equal(f.engine.calls.length, 0);
+  } finally { await f.cleanup(); }
+});
+
+test("r twice removes a project from the list, preserving files, sessions and active work across re-add", async () => {
+  const f = setup();
+  try {
+    const session = f.add("active task", f.alpha.id, "working");
+    session.messages.push({ role: "user", text: "Keep this history", timestamp: 1 });
+    const other = f.add("other task", f.beta.id);
+    const file = join(f.alpha.path, "keep.txt");
+    writeFileSync(file, "Project files stay intact");
+    f.controller.select(`project:${f.alpha.id}`);
+    f.command("/projects");
+    f.terminal.onInput("r");
+    assert.equal(f.controller.pendingProjectRemoval, f.alpha.id);
+    assert.equal(f.store.state.projects.length, 2);
+    assert.equal(f.tui.hasOverlay(), false);
+    for (const width of [12, 40, 120]) {
+      const lines = f.app.body.render(width).map(stripTerminalSequences);
+      assert.match(lines.join(" ").replace(/\s+/g, " "), /r again to remove from list/);
+      assert.ok(lines.every((line) => visibleWidth(line) <= width));
+    }
+    f.terminal.onInput("r");
+    assert.equal(f.controller.pendingProjectRemoval, undefined);
+    assert.deepEqual(f.store.state.projects, [f.beta]);
+    assert.equal(f.controller.selection, `project:${f.beta.id}`);
+    assert.equal(f.store.state.selectedProjectId, f.beta.id);
+    assert.deepEqual(f.store.state.sessions, [session, other]);
+    assert.equal(session.status, "working");
+    assert.deepEqual(f.engine.stopped, []);
+    assert.deepEqual(f.engine.cancelled, []);
+    assert.equal(readFileSync(file, "utf8"), "Project files stay intact");
+    assert.match(f.controller.notice, /Files and sessions are kept/);
+    const restored = new Store(f.store.root);
+    assert.deepEqual(restored.state.projects, [f.beta]);
+    assert.deepEqual(restored.state.sessions, [session, other]);
+    restored.addProject(f.alpha.path);
+    assert.ok(rows(restored.state).some((row) => row.kind === "session" && row.session.id === session.id));
+    assert.equal(f.controller.addProject(f.alpha.path), true);
+    f.terminal.onInput("\r");
+    assert.ok(f.controller.currentRows.some((row) => row.kind === "session" && row.session === session));
+  } finally { await f.cleanup(); }
+});
+
+test("project removal handles empty projects, the last row and an empty list", async () => {
+  const f = setup();
+  try {
+    f.command("/projects");
+    f.terminal.onInput("r"); f.terminal.onInput("r");
+    assert.equal(f.controller.selection, `project:${f.alpha.id}`);
+    f.terminal.onInput("r"); f.terminal.onInput("r");
+    assert.deepEqual(f.store.state.projects, []);
+    assert.equal(f.controller.selection, undefined);
+    assert.equal(f.store.state.selectedProjectId, undefined);
+    assert.equal(new Store(f.store.root).state.selectedProjectId, undefined);
+    f.terminal.onInput("r");
+    assert.equal(f.controller.pendingProjectRemoval, undefined);
+    assert.match(f.app.body.render(120).join("\n"), /No projects/);
+    f.terminal.onInput("a"); f.terminal.onInput(f.alpha.path); f.terminal.onInput("\r");
+    assert.equal(f.controller.project?.id, f.alpha.id);
+  } finally { await f.cleanup(); }
+});
+
+test("any other key or selection change cancels removal without deleting sessions or triggering the key", async () => {
+  const f = setup();
+  try {
+    f.add("task", f.beta.id);
+    f.command("/projects");
+    for (const key of ["\x1b", "\r", "a", "\x18", "\x1b[B"]) {
+      f.terminal.onInput("r"); f.terminal.onInput(key);
+      assert.equal(f.controller.pendingProjectRemoval, undefined);
+      assert.equal(f.controller.pendingDelete, undefined);
+      assert.equal(f.controller.mode, "projects");
+      assert.equal(f.controller.dialog, undefined);
+      assert.equal(f.controller.selection, `project:${f.beta.id}`);
+      assert.equal(f.store.state.projects.length, 2);
+      assert.equal(f.store.state.sessions.length, 1);
+    }
+    f.terminal.onInput("r");
+    f.controller.select(`project:${f.alpha.id}`);
+    f.controller.confirmProjectRemoval();
+    assert.equal(f.store.state.projects.length, 2);
+    f.terminal.onInput("r"); f.controller.back();
+    assert.equal(f.controller.pendingProjectRemoval, undefined);
+    f.terminal.onInput("r");
+    assert.equal(f.app.composer.getValue(), "r", "The shortcut must not capture dashboard drafts");
+    f.controller.requestProjectRemoval();
+    assert.equal(f.controller.pendingProjectRemoval, undefined);
+  } finally { await f.cleanup(); }
+});
+
+test("failed project removal saves roll back the list and selection and allow retry", async (t) => {
+  const f = setup();
+  try {
+    const session = f.add("task", f.beta.id);
+    f.command("/projects");
+    const save = t.mock.method(f.store, "save", () => { throw new Error("Disk full"); });
+    f.terminal.onInput("r"); f.terminal.onInput("r");
+    assert.deepEqual(f.store.state.projects, [f.alpha, f.beta]);
+    assert.equal(f.controller.selection, `project:${f.beta.id}`);
+    assert.equal(f.store.state.selectedProjectId, f.beta.id);
+    assert.deepEqual(f.store.state.sessions, [session]);
+    assert.match(f.controller.notice, /Disk full/);
+    assert.equal(f.controller.pendingProjectRemoval, undefined);
+    save.mock.restore();
+    f.terminal.onInput("r"); f.terminal.onInput("r");
+    assert.deepEqual(new Store(f.store.root).state.projects, [f.alpha]);
   } finally { await f.cleanup(); }
 });
 
