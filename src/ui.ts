@@ -461,6 +461,8 @@ export class Dashboard extends VStack implements Focusable {
   }
 
   private revealSelection(): void {
+    // Opening a session can leave callers with stale dashboard row positions.
+    if (this.controller.mode === "session") return;
     this.body.render(Math.max(1, this.tui.terminal.columns - 1));
     const line = this.body.positions.get(this.controller.selection ?? "");
     if (line === undefined) return;

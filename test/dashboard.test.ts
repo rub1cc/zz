@@ -568,6 +568,41 @@ test("skills picker fills an explicit skill command without creating a session",
   } finally { await f.cleanup(); }
 });
 
+for (const status of ["completed", "working"] as const) {
+  test(`Enter opens and reopens ${status} sessions at the transcript end`, async () => {
+    const f = setup();
+    try {
+      f.c.send("long conversation"); await tick();
+      const session = f.store.state.sessions[0]!;
+      session.status = status;
+      session.messages = Array.from({ length: 90 }, (_, i) => ({ role: "assistant", timestamp: i, text: `Reply ${i}` }));
+      f.c.changed(); f.tui.renderNow();
+      const assertAtEnd = () => {
+        f.tui.renderNow();
+        assert.equal(f.c.mode, "session");
+        assert.equal(f.app.chatScroll.isFollowingEnd, true);
+        assert.ok(f.app.chatScroll.scrollTop > 0);
+        const screen = f.tui.getScreenLines().map(stripTerminalSequences).join("\n");
+        assert.match(screen, /Reply 89/);
+        assert.doesNotMatch(screen, /Scroll to bottom/);
+      };
+      f.terminal.onInput("\r"); assertAtEnd();
+      for (const scrollUp of [false, true]) {
+        if (scrollUp) { f.terminal.onInput("\x1b[5~"); f.tui.renderNow(); }
+        f.terminal.onInput("\x1b[D"); f.tui.renderNow();
+        assert.equal(f.c.mode, "sessions");
+        f.terminal.onInput("\r"); assertAtEnd();
+      }
+      const before = f.app.chatScroll.scrollTop;
+      session.messages.push({ role: "assistant", timestamp: 90, text: "Live update" });
+      f.c.changed(); f.tui.renderNow();
+      assert.equal(f.app.chatScroll.isFollowingEnd, true);
+      assert.ok(f.app.chatScroll.scrollTop > before);
+      assert.match(f.tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Live update/);
+    } finally { await f.cleanup(); }
+  });
+}
+
 test("chat follows output only at the end and offers click and /bottom instead of Ctrl+End", async () => {
   const f = setup();
   try {
