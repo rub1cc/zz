@@ -31,11 +31,17 @@ function diagnostics(tool: ToolActivity): { severity?: unknown; message: string 
 export function activityLabel(tool: ToolActivity, nameStyle = (name: string) => name): string {
   if (tool.name === "compact") return `${nameStyle("Context compacted")} (${oneLine(String(tool.arguments.reason ?? "manual"))})`;
   if (tool.name === "load_skill" && typeof tool.arguments.name === "string") return `${nameStyle("Skill")} ${oneLine(tool.arguments.name)}`;
+  if (["session_delegate", "session_create", "session_send", "session_read", "session_wait", "session_cancel"].includes(tool.name)) {
+    const names: Record<string, string> = { session_delegate: "Delegate", session_create: "Create session", session_send: "Message session",
+      session_read: "Read session", session_wait: "Wait for sessions", session_cancel: "Stop session" };
+    const title = typeof tool.arguments.title === "string" ? tool.arguments.title : typeof tool.arguments.sessionId === "string" ? tool.arguments.sessionId : "";
+    return `${nameStyle(names[tool.name]!)}${title ? `: ${oneLine(title)}` : ""}`;
+  }
   const path = typeof tool.arguments.path === "string" ? tool.arguments.path.replaceAll("\\", "/") : "";
   if (tool.name === "read" && /(^|\/)SKILL\.md$/i.test(path)) return `${nameStyle("Skill")} ${oneLine(path.split("/").at(-2) || "instructions")}`;
   const names: Record<string, string> = { read: "Read", write: "Write", edit: "Update", bash: "Bash", powershell: "PowerShell",
     ask_user: "Ask user", ask_question: "Ask question", ask_multiple_questions: "Ask questions",
-    task_create: "Create task", task_update: "Update tasks", task_list: "List tasks", task_get: "Get task" };
+    session_list: "List sessions", task_create: "Create task", task_update: "Update tasks", task_list: "List tasks", task_get: "Get task" };
   const name = Object.hasOwn(names, tool.name) ? names[tool.name]! : tool.name;
   const target = isShellTool(tool)
     ? typeof tool.arguments.command === "string" ? oneLine(tool.arguments.command.split(/\r\n?|\n|\u2028|\u2029/, 1)[0] ?? "").trim() : ""
@@ -153,6 +159,11 @@ function summary(tool: ToolActivity, output: string): string {
   if (tool.status === "error") return "Error (/expand)";
   if (tool.status === "interrupted") return "Interrupted; completion not confirmed. (/expand)";
   if (tool.name === "compact") return "Summary available (/expand)";
+  if (tool.name.startsWith("session_")) {
+    const labels: Record<string, string> = { session_delegate: "Worker created", session_create: "Session created", session_send: "Message admitted",
+      session_wait: "Wait recorded or results available", session_cancel: "Stop request handled", session_list: "Sessions available", session_read: "Conversation available" };
+    return `${labels[tool.name] ?? "Session operation completed"} (/expand)`;
+  }
   if (tool.name === "task_update" && Array.isArray(tool.arguments.operations)) {
     const count = tool.arguments.operations.length;
     return `Applied ${count} task operation${count === 1 ? "" : "s"} (/expand)`;
@@ -205,7 +216,7 @@ export function renderToolResponse(tool: ToolActivity, width: number, expanded: 
       } else if (tool.status === "error" && !diagnostics(tool).length && output) {
         lines.push(...indentLines([warning(fit(oneLine(textLines(output)[0] ?? ""), Math.max(1, width - (width > 4 ? 4 : 0))))], width, "    "));
       }
-    } else if ((failed || !["read", "write", "edit", "compact"].includes(tool.name) && !skill && !question && !isTaskTool(tool)) && output) {
+    } else if ((failed || !["read", "write", "edit", "compact"].includes(tool.name) && !skill && !question && !isTaskTool(tool) && !tool.name.startsWith("session_")) && output) {
       lines.push(...literal(output, width, previewPrefix, previewLimit));
     }
   } else {

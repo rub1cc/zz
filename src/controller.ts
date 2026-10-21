@@ -44,6 +44,7 @@ export class Controller {
   mode: Mode = "sessions";
   selection?: string;
   readonly collapsedProjects = new Set<string>();
+  readonly collapsedSessions = new Set<string>();
   openedSessionId?: string;
   dialog?: Dialog;
   questionForm?: QuestionForm;
@@ -87,8 +88,25 @@ export class Controller {
   }
 
   get currentRows(): Row[] {
-    return rows(this.store.state, this.mode === "projects")
-      .filter((row) => this.mode !== "sessions" || row.kind === "project" || !this.collapsedProjects.has(row.project.id));
+    const all = rows(this.store.state, this.mode === "projects");
+    const attention = new Set<string>();
+    for (const session of this.store.state.sessions) if (session.status === "needs-input") {
+      let current: Session | undefined = session;
+      while (current && !attention.has(current.id)) {
+        attention.add(current.id); current = this.session(current.delegation?.parentId ?? "");
+      }
+    }
+    return all.filter((row) => {
+      if (this.mode !== "sessions" || row.kind === "project") return true;
+      if (this.collapsedProjects.has(row.project.id)) return false;
+      if (attention.has(row.session.id)) return true;
+      const seen = new Set<string>(); let parent = row.session.delegation?.parentId;
+      while (parent && !seen.has(parent)) {
+        if (this.collapsedSessions.has(parent)) return false;
+        seen.add(parent); parent = this.session(parent)?.delegation?.parentId;
+      }
+      return true;
+    });
   }
   get selected(): Row | undefined { return this.currentRows.find((row) => rowId(row) === this.selection); }
   get project(): Project | undefined {
@@ -464,14 +482,15 @@ export class Controller {
     const selected = this.selected;
     if (this.closing || this.mode !== "sessions" || selected?.kind !== "session") return;
     const sessions = this.currentRows.filter((row): row is Extract<Row, { kind: "session" }> =>
-      row.kind === "session" && row.project.id === selected.project.id);
+      row.kind === "session" && row.project.id === selected.project.id
+        && row.session.delegation?.parentId === selected.session.delegation?.parentId);
     const index = sessions.findIndex((row) => rowId(row) === this.selection);
     const next = index + delta;
     if (next < 0 || next >= sessions.length) return;
     const ids = sessions.map((row) => row.session.id);
     [ids[index], ids[next]] = [ids[next]!, ids[index]!];
     const previous = selected.project.sessionOrder;
-    selected.project.sessionOrder = ids;
+    selected.project.sessionOrder = [...ids, ...(previous ?? []).filter((id) => !ids.includes(id))];
     try { this.store.save(); }
     catch (error) { selected.project.sessionOrder = previous; this.fail(error); return; }
     this.notice = "";
@@ -521,6 +540,14 @@ export class Controller {
     this.changed();
   }
 
+  toggleWorkers(): void {
+    const selected = this.selected;
+    if (this.mode !== "sessions" || selected?.kind !== "session"
+      || !this.store.state.sessions.some((s) => s.delegation?.parentId === selected.session.id)) return;
+    if (!this.collapsedSessions.delete(selected.session.id)) this.collapsedSessions.add(selected.session.id);
+    this.changed();
+  }
+
   open(): void {
     const selected = this.selected;
     if (selected?.kind !== "session") return;
@@ -536,7 +563,13 @@ export class Controller {
     this.pendingProjectRemoval = undefined;
     this.dialog = undefined;
     if (this.mode === "session") {
-      if (this.opened) this.collapsedProjects.delete(this.opened.projectId);
+      if (this.opened) {
+        this.collapsedProjects.delete(this.opened.projectId);
+        const seen = new Set<string>(); let parent = this.opened.delegation?.parentId;
+        while (parent && !seen.has(parent)) {
+          seen.add(parent); this.collapsedSessions.delete(parent); parent = this.session(parent)?.delegation?.parentId;
+        }
+      }
       this.selection = this.openedSessionId ? `session:${this.openedSessionId}` : this.selection;
       this.mode = "sessions";
     } else if (this.mode === "projects") this.mode = "sessions";
@@ -625,7 +658,7 @@ export class Controller {
   }
 
   private hasPendingRun(session: Session): boolean {
-    return session.status === "working" || !!session.pendingInput || !!session.followUps?.length
+    return session.status === "working" || !!session.orchestrationPending || !!session.waitingFor?.length || !!session.pendingInput || !!session.followUps?.length
       || !!session.queuedInputs?.length || this.pending.has(session.id);
   }
 

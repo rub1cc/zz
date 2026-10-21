@@ -14,6 +14,16 @@ The directory where sessions do their work. It is either a project's main checko
 A durable agent conversation and its work history, attached to one workspace.
 _Avoid_: Thread
 
+**Coordinator**:
+A session that delegates work to worker sessions and collects their results.
+
+**Worker**:
+A normal session carrying out a delegated task for a coordinator. It remains independently inspectable and can itself coordinate workers.
+_Avoid_: Hidden subagent
+
+**Delegated Task**:
+A bounded assignment from a coordinator to a worker, whose result returns to the coordinator. Finishing the assignment does not delete the worker's conversation.
+
 **Workspace Handoff**:
 A change of a session's working workspace that preserves its conversation. Files and edits stay in their original workspace.
 

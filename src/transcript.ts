@@ -4,13 +4,14 @@ import { renderShellResponse } from "./shell-response.js";
 import { ImageDisplay } from "./image-display.js";
 import type { Controller } from "./controller.js";
 import { accent, dim, fit, formatElapsed, markdownTheme, oneLine, pad, plain, shimmer, warning, workingIcon } from "./format.js";
-import { transcriptMessages, lastReplyMessage, compactionLabel, type Message, type Session, type TranscriptMessage } from "./model.js";
+import { transcriptMessages, lastReplyMessage, compactionLabel, displayStatus, sessionPreview, type Message, type Session, type TranscriptMessage } from "./model.js";
 import { answeredQuestions, formQuestion, isQuestionTool, type AnsweredQuestion, type Questionnaire } from "./questions.js";
 import { indentLines, renderToolResponse } from "./tool-response.js";
 import { renderToolGroup, toolGroups } from "./tool-groups.js";
 export { activityLabel } from "./tool-response.js";
 
 export function workLabel(session: Session): string | undefined {
+  if (displayStatus(session) === "waiting") return dim(sessionPreview(session));
   if (session.status === "working") {
     const state = session.stopped ? "Stopping..." : session.preview.startsWith("Retrying:") ? oneLine(session.preview)
       : session.preview === "Thinking..." || session.messages.at(-1)?.role === "thinking" ? "Thinking..." : "Working";
@@ -234,7 +235,7 @@ export class Transcript implements Component {
         continue;
       }
       if (message.role === "user") {
-        const answers = question && answeredQuestions(message.text, question);
+        const answers = !message.source && question && answeredQuestions(message.text, question);
         question = undefined;
         if (answers) {
           lines.push(...renderAnsweredQuestions(answers, width));
@@ -245,6 +246,7 @@ export class Transcript implements Component {
       }
       const contentWidth = Math.max(1, width - (width > 2 ? 2 : 0));
       if (message.role === "user") {
+        if (message.source) lines.push(...wrapTextWithAnsi(dim(message.source.kind === "notification" ? "Orchestration" : `From ${oneLine(message.source.title)} (agent)`), Math.max(1, width)));
         const content = plain(message.text).replaceAll("\t", "  ").split("\n")
           .flatMap((line) => wrapTextWithAnsi(line, contentWidth));
         lines.push(...indentLines(content, width, "❯ ").map((line) =>

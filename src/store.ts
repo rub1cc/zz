@@ -56,6 +56,10 @@ function isState(value: unknown): value is State {
         && p.sessionOrder.every((id) => typeof id === "string") && new Set(p.sessionOrder).size === p.sessionOrder.length))
     && state.sessions.every((s) => typeof s.id === "string" && typeof s.projectId === "string"
       && (s.conversationId === undefined || Number.isSafeInteger(s.conversationId) && s.conversationId >= 0)
+      && (s.delegation === undefined || !!s.delegation && typeof s.delegation.parentId === "string"
+        && typeof s.delegation.taskId === "string" && s.delegation.parentId !== s.id)
+      && (s.orchestrationPending === undefined || typeof s.orchestrationPending === "boolean")
+      && (s.waitingFor === undefined || Array.isArray(s.waitingFor) && s.waitingFor.every((id) => typeof id === "string"))
       && (s.tasks === undefined || Array.isArray(s.tasks) && s.tasks.every((task) => !!task
         && typeof task.id === "string" && /^[1-9][0-9]*$/.test(task.id) && typeof task.subject === "string"
         && ["pending", "in_progress", "completed"].includes(task.status)
@@ -92,6 +96,7 @@ function isState(value: unknown): value is State {
         && (s.work.finishedAt === undefined || Number.isFinite(s.work.finishedAt) && s.work.finishedAt >= s.work.startedAt))
       && Array.isArray(s.messages) && s.messages.every((m) => typeof m.text === "string"
         && ["user", "assistant", "tool", "error", "thinking"].includes(m.role) && Number.isFinite(m.timestamp)
+        && (m.source === undefined || isInputSource(m.source))
         && (m.thinking === undefined || !!m.thinking && typeof m.thinking.id === "string"
           && (m.thinking.redacted === undefined || typeof m.thinking.redacted === "boolean"))
         && (m.images === undefined || isImages(m.images))
@@ -146,8 +151,14 @@ function isToolActivity(value: ToolActivity): boolean {
     && typeof value.output === "string" && ["pending", "running", "done", "error", "interrupted"].includes(value.status);
 }
 
+function isInputSource(value: NonNullable<PendingInput["source"]>): boolean {
+  return !!value && typeof value.sessionId === "string" && typeof value.title === "string"
+    && ["message", "delegation", "notification"].includes(value.kind);
+}
+
 function isPendingInput(value: PendingInput): boolean {
   return !!value && typeof value.requestId === "string" && typeof value.prompt === "string"
+    && (value.source === undefined || isInputSource(value.source))
     && (value.images === undefined || isImages(value.images))
     && (value.whenBusy === undefined || isReplyBehavior(value.whenBusy))
     && (value.prepared === undefined || isPreparedInput(value.prepared));

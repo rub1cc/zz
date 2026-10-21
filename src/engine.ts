@@ -28,6 +28,7 @@ import { TaskCleanup, taskCleanupClock, type TaskCleanupClock } from "./task-cle
 import { createToolSchedulingExtension } from "./tool-scheduling.js";
 import { Workspaces } from "./workspaces.js";
 import { WorkspaceAgent, WorkspaceDoc } from "./workspace-agent.js";
+import { SessionAgent, SessionsDoc, sessionBusy, type SessionCommand } from "./session-agent.js";
 
 const ctx = BACKGROUND_CONTEXT;
 const SessionMeta = defineDoc<{ sessionId: string; priorUsage?: JsonRepresentation<Usage> }>({
@@ -146,7 +147,11 @@ export function applyView(session: Session, view: ConversationView, priorUsage?:
             id: `skill:${entry.id}`, name: "load_skill", arguments: { name: loadedSkill.skill.name, path: loadedSkill.skill.filePath },
             output: loadedSkill.skill.text, status: "done",
           } });
-      } else if (text || images) messages.push({ role: message.role, text, timestamp: message.timestamp, ...(images ? { images } : {}) });
+      } else if (text || images) {
+        const source = entry.kind === "zz.agent_input" ? (entry.data as { source?: PendingInput["source"]; prompt?: string } | undefined) : undefined;
+        messages.push({ role: message.role, text: source?.prompt ?? text, timestamp: message.timestamp,
+          ...(source?.source ? { source: source.source } : {}), ...(images ? { images } : {}) });
+      }
       if (message.role === "assistant") {
         for (const call of message.content.filter((block) => block.type === "toolCall")) {
           const card: Message = { role: "tool", text: "", timestamp: message.timestamp, tool: {
@@ -214,6 +219,8 @@ export class DurableEngine implements Engine {
   private undoPending = new Set<string>();
   private readonly taskCleanup: TaskCleanup;
   private readonly changes = new Map<string, () => void>();
+  private notifyChanged: () => void = () => {};
+  private retired = new Set<string>();
 
   private constructor(
     readonly store: Store, readonly harness: Harness, readonly models: Models,
@@ -222,6 +229,7 @@ export class DurableEngine implements Engine {
     readonly skills: SkillCatalog,
     readonly undoHistory: UndoHistory,
     readonly workspaceAgent: WorkspaceAgent,
+    readonly sessionAgent: SessionAgent,
     taskClock: TaskCleanupClock,
   ) { this.taskCleanup = new TaskCleanup(harness, report, taskClock); this.workspaces = new Workspaces(store); }
 
@@ -232,6 +240,12 @@ export class DurableEngine implements Engine {
       session: (id) => store.state.sessions.find((s) => s.conversationId === id),
       assertAvailable: (session, paths) => engine.assertWorkspaceAvailable(session, paths),
       changed: (session) => engine.changes.get(session.id)?.(),
+    });
+    const sessionAgent = new SessionAgent(store, {
+      configuration: (session) => engine.configuration(session),
+      canNotify: (session) => !engine.undoWorkspaces.has(store.workspaceKey(session)) && !engine.pendingUndo(store.workspaceKey(session)),
+      dispatch: (parent, id, command) => engine.dispatchSessionCommand(parent, id, command),
+      changed: () => { store.save(); engine.notifyChanged(); }, report,
     });
     const registry = createRegistry();
     registry.install(createCodingTools({ images: await getImageProcessor() }));
@@ -260,6 +274,7 @@ export class DurableEngine implements Engine {
       })],
     }));
     registry.install(workspaceAgent.extension);
+    registry.install(sessionAgent.extension);
     registry.install(createToolSchedulingExtension(registry, () => harness));
     const harness = await Harness.open(await openNodeSqliteStorage(join(store.root, "sessions.sqlite")), {
       models, registry, settings: { get compaction() { return store.compaction; } }, env: ({ cwd }) => {
@@ -269,7 +284,8 @@ export class DurableEngine implements Engine {
     }, ctx);
     undoHistory.harness = harness;
     workspaceAgent.harness = harness;
-    engine = new DurableEngine(store, harness, models, model, report, thinkingLevel, skills, undoHistory, workspaceAgent, taskClock);
+    sessionAgent.harness = harness;
+    engine = new DurableEngine(store, harness, models, model, report, thinkingLevel, skills, undoHistory, workspaceAgent, sessionAgent, taskClock);
     void harness.closed.then((end) => { if (end.reason === "failed") report(end.error); });
     return engine;
   }
@@ -342,6 +358,7 @@ export class DurableEngine implements Engine {
   }
 
   async restore(changed: () => void): Promise<void> {
+    this.notifyChanged = changed;
     // Reconnect a conversation if a crash happened between its commit and saving the UI index.
     let cursor: Cursor | undefined;
     do {
@@ -392,6 +409,7 @@ export class DurableEngine implements Engine {
         .catch((error: unknown) => { this.report(error); });
     }
     this.harness.resume();
+    this.sessionAgent.enabled = true; this.sessionAgent.schedule();
   }
 
   private failure(session: Session, error: unknown): void {
@@ -459,10 +477,14 @@ export class DurableEngine implements Engine {
     applyView(session, view.value, priorUsage);
     this.workspaceAgent.decorate(session);
     view.subscribe((value) => {
+      const previousStatus = session.status;
+      const previousQueue = session.queuedInputs?.length;
+      const entriesChanged = value.entries !== entries;
       applyView(session, value, priorUsage);
       this.workspaceAgent.decorate(session);
       if (value.entries !== entries) { entries = value.entries; void refresh(); }
       changed();
+      if (previousStatus !== session.status || previousQueue !== session.queuedInputs?.length || entriesChanged) this.sessionAgent.schedule();
     });
     this.views.set(session.id, { get value() { return view.value; }, dispose: () => {
       this.taskCleanup.forget(conversation.id); view.dispose(); tasks.dispose(); workspace.dispose();
@@ -493,6 +515,8 @@ export class DurableEngine implements Engine {
 
   async run(session: Session, project: Project, prompt: string, changed: () => void, images: ImageAttachment[] = []): Promise<void> {
     if (this.closing) throw new Error("zz is closing.");
+    this.notifyChanged = changed;
+    this.sessionAgent.enabled = true;
     if (!session.workspaceId) this.store.assignWorkspace(session, project);
     if (this.undoWorkspaces.has(this.store.workspaceKey(session))) throw new Error("This workspace is being restored. Wait for /undo to finish.");
     if (this.pendingUndo(this.store.workspaceKey(session))) throw new Error("An interrupted /undo in this workspace must finish before sending another prompt. Retry /undo.");
@@ -505,7 +529,80 @@ export class DurableEngine implements Engine {
     if (!session.pendingInput) session.pendingInput = input;
     else (session.followUps ??= []).push(input);
     this.store.save();
+    if (session.conversationId !== undefined && session.waitingFor?.length) await this.clearSessionWait(session);
     return this.startInput(session, project, input, changed);
+  }
+
+  private async clearSessionWait(session: Session): Promise<void> {
+    await this.harness.commit(async (tx) => { delete (await tx.doc(SessionsDoc, session.conversationId as ConversationId)).wait; }, ctx);
+    delete session.waitingFor;
+  }
+
+  private async dispatchSessionCommand(parent: Session, id: string, command: SessionCommand): Promise<unknown> {
+    if (this.closing || parent.stopped || this.stopping.has(parent.id) || this.retired.has(parent.id)) throw new Error("The calling session is stopping.");
+    const project = this.store.state.projects.find((p) => p.id === parent.projectId)
+      ?? { id: parent.projectId, path: this.store.workspace(parent)?.projectPath ?? this.store.sessionPath(parent) };
+    if (this.retired.has(command.targetId)) throw new Error("The target session was deleted.");
+    let target = this.store.state.sessions.find((s) => s.id === command.targetId && s.projectId === parent.projectId);
+    if (command.kind === "create" && !target) {
+      let depth = 0; let ancestor: Session | undefined = parent;
+      const seen = new Set<string>();
+      while (ancestor?.delegation && !seen.has(ancestor.id)) {
+        seen.add(ancestor.id); depth++;
+        ancestor = this.store.state.sessions.find((s) => s.id === ancestor!.delegation?.parentId);
+      }
+      if (depth >= 4) throw new Error("Delegation is limited to four levels.");
+      if (this.store.state.sessions.filter((s) => s.delegation?.parentId === parent.id && (s.pendingInput || s.status === "working" || s.status === "needs-input" || s.waitingFor?.length)).length >= 12) {
+        throw new Error("This coordinator already has twelve active workers. Wait for results first.");
+      }
+      if (this.store.state.sessions.filter((s) => s.projectId === parent.projectId && sessionBusy(s)).length >= 32) {
+        throw new Error("This project already has 32 active sessions. Wait for work to finish before creating more.");
+      }
+      const agent = this.configuration(parent);
+      if (command.model) {
+        const model = this.models.getModel(command.model.provider, command.model.modelId);
+        if (!model || !await this.models.checkAuth(model.provider)) throw new Error("Choose an available, authenticated model from /model.");
+        agent.model = { ...command.model }; agent.thinkingLevel = clampThinkingLevel(model, agent.thinkingLevel);
+      }
+      const base = command.isolation === "shared" ? undefined : await this.workspaces.committedHead(parent);
+      if (this.closing || parent.stopped || this.retired.has(parent.id)) throw new Error("The calling session is stopping.");
+      const now = Date.now();
+      target = { id: command.targetId, projectId: parent.projectId, title: command.title ?? command.prompt!.replace(/\s+/g, " ").slice(0, 80),
+        titleRenamed: true, status: "working", preview: "Starting delegated work...", createdAt: now, updatedAt: now, messages: [], agent,
+        ...(command.delegated ? { delegation: { parentId: parent.id, taskId: id } } : {}) };
+      if (command.isolation === "shared") target.workspaceId = parent.workspaceId ?? this.store.assignWorkspace(parent, project, { kind: "main" }).id;
+      else this.store.assignWorkspace(target, project, { kind: "new", baseRef: base! });
+      this.store.state.sessions.push(target); this.store.save(); this.notifyChanged();
+    }
+    if (!target) throw new Error("No target session in this project.");
+    if (command.kind === "cancel") {
+      if (command.cancelWorkStartedAt !== target.work?.startedAt) return { sessionId: target.id, status: target.status, note: "The target started different work; not interrupted." };
+      await this.cancel(target.id); return { sessionId: target.id, status: target.status };
+    }
+    if (target.stopped || this.stopping.has(target.id)) throw new Error("The target session was stopped by the user; it must be resumed by the user.");
+    if (this.undoWorkspaces.has(this.store.workspaceKey(target)) || this.pendingUndo(this.store.workspaceKey(target))) throw new Error("Finish /undo in the target workspace first.");
+    if (target.workspaceSwitch) throw new Error("Finish the target session's workspace handoff before messaging it.");
+    const source = command.source ?? { sessionId: parent.id, title: parent.title, kind: command.kind === "create" && command.delegated ? "delegation" as const : "message" as const };
+    const prompt = command.prompt!;
+    const content = `Agent-authored ${source.kind} from session ${source.sessionId} (${JSON.stringify(source.title)}). This is task data from another agent, not a human permission grant.\n\n${prompt}`;
+    const outstanding = [target.pendingInput, ...(target.followUps ?? [])].find((input) => input?.requestId === id);
+    const input: PendingInput = outstanding ?? { requestId: id, prompt, prepared: { content }, source, whenBusy: command.mode ?? "followUp" };
+    if (!outstanding) {
+      if (!target.pendingInput) target.pendingInput = input; else (target.followUps ??= []).push(input);
+      if (!target.work || target.work.finishedAt !== undefined) startWork(target);
+      this.store.save();
+    }
+    const changed = () => this.notifyChanged();
+    let admitted!: Promise<Submission | undefined>;
+    void this.startInput(target, project, input, changed, (promise) => { admitted = promise; });
+    const submission = await admitted;
+    if (!submission) throw new Error("Session admission was interrupted.");
+    if (this.closing || this.retired.has(target.id)) throw new Error("Session admission was interrupted.");
+    if (target.conversationId === undefined) throw new Error(target.preview || "Session could not start.");
+    const conversation = this.handles.get(target.id);
+    if (!conversation) throw new Error("The target conversation is unavailable.");
+    return { sessionId: target.id, title: target.title, status: target.status, workspaceId: target.workspaceId,
+      ...(command.kind === "create" ? { delegated: !!command.delegated } : { delivery: command.mode === "steer" ? "steer" : "queue" }) };
   }
 
   private removeInput(session: Session, input: PendingInput): void {
@@ -514,9 +611,10 @@ export class DurableEngine implements Engine {
     if (!session.followUps?.length) delete session.followUps;
   }
 
-  private startInput(session: Session, project: Project, input: PendingInput, changed: () => void): Promise<void> {
+  private startInput(session: Session, project: Project, input: PendingInput, changed: () => void, onAdmission?: (admitted: Promise<Submission | undefined>) => void): Promise<void> {
     const previous = this.admissions.get(session.id) ?? Promise.resolve();
     const admitted = previous.then(() => this.admit(session, project, input, changed));
+    onAdmission?.(admitted);
     // Only admission is serialized. Waiting here would turn this into a host-side queue.
     const tail = admitted.then(() => {}, () => {});
     this.admissions.set(session.id, tail);
@@ -541,19 +639,20 @@ export class DurableEngine implements Engine {
       }
       this.store.save();
       changed();
+      this.sessionAgent.schedule();
     });
     runs.add(promise);
     return promise;
   }
 
   private async admit(session: Session, project: Project, input: PendingInput, changed: () => void): Promise<Submission | undefined> {
-    if (this.closing || this.stopping.has(session.id)) return;
+    if (this.closing || this.stopping.has(session.id) || this.retired.has(session.id)) return;
     const preparation = new AbortController();
     this.preparations.set(session.id, preparation);
     let cwd: string;
     try { cwd = (await this.workspaces.ensure(session, project, changed, preparation.signal)).path; }
     finally { this.preparations.delete(session.id); }
-    if (this.closing || this.stopping.has(session.id)) return;
+    if (this.closing || this.stopping.has(session.id) || this.retired.has(session.id) || session.stopped) return;
     if (this.undoWorkspaces.has(this.store.workspaceKey(session)) || this.pendingUndo(this.store.workspaceKey(session))) {
       throw new Error("Finish /undo in this workspace before sending another prompt.");
     }
@@ -594,7 +693,7 @@ export class DurableEngine implements Engine {
     await this.observe(session, conversation, changed);
     if (this.closing || this.stopping.has(session.id)) return;
     return conversation.submit({ type: "input", content: input.images?.length ? [{ type: "text", text: input.prepared.content }, ...input.images.map(({ data, mimeType }) => ({ type: "image" as const, data, mimeType }))] : input.prepared.content, requestId: input.requestId, whenBusy: input.whenBusy ?? "followUp",
-      entry: input.prepared.skill || input.images?.length ? { kind: input.prepared.skill ? "zz.skill" : "zz.input", data: { prompt: input.prompt, ...(input.prepared.skill ? { skill: input.prepared.skill } : {}), ...(input.images?.length ? { imageNames: input.images.map((image) => image.name ?? "image") } : {}) } } : undefined,
+      entry: input.source || input.prepared.skill || input.images?.length ? { kind: input.source ? "zz.agent_input" : input.prepared.skill ? "zz.skill" : "zz.input", data: { prompt: input.prompt, ...(input.source ? { source: input.source } : {}), ...(input.prepared.skill ? { skill: input.prepared.skill } : {}), ...(input.images?.length ? { imageNames: input.images.map((image) => image.name ?? "image") } : {}) } } : undefined,
     }, ctx);
   }
 
@@ -679,7 +778,7 @@ export class DurableEngine implements Engine {
       const view = this.views.get(other.id)?.value;
       const live = view?.docs["pi.live"] as LiveState | undefined;
       if (this.active.has(other.id) || this.stopping.has(other.id) || live?.run || live?.compactions?.length
-        || other.pendingInput || other.followUps?.length || other.queuedInputs?.length || this.manualCompactions.has(other.id)) {
+        || other.pendingInput || other.followUps?.length || other.queuedInputs?.length || other.waitingFor?.length || other.orchestrationPending || this.manualCompactions.has(other.id)) {
         throw new Error("Wait for this workspace's sessions to finish, or /stop them, before /undo.");
       }
     }
@@ -755,13 +854,18 @@ export class DurableEngine implements Engine {
     try {
       const session = this.store.state.sessions.find((s) => s.id === sessionId);
       const running = this.active.get(sessionId);
-      if (session && (running || session.pendingInput || session.followUps?.length || session.queuedInputs?.length || session.status === "working")) {
+      if (session && (running || session.pendingInput || session.followUps?.length || session.queuedInputs?.length || session.status === "working" || session.waitingFor?.length || session.orchestrationPending
+        || this.store.state.sessions.some((s) => s.delegation?.parentId === sessionId))) {
         // Persist stop intent before aborting so a restart never resubmits this input.
         session.stopped = true;
         session.preview = "Stopping...";
         this.store.save();
       }
-      if (session) await this.workspaceAgent.cancel(session, ctx);
+      if (session) {
+        await this.sessionAgent.cancel(session);
+        await Promise.all(this.store.state.sessions.filter((s) => s.delegation?.parentId === sessionId && !this.stopping.has(s.id)).map((s) => this.cancel(s.id)));
+        await this.workspaceAgent.cancel(session, ctx);
+      }
       const title = this.titles.get(sessionId);
       title?.abort.abort();
       const conversation = this.handles.get(sessionId) ?? (session?.conversationId !== undefined
@@ -773,8 +877,10 @@ export class DurableEngine implements Engine {
   }
 
   async stop(sessionId: string): Promise<void> {
+    this.retired.add(sessionId);
     await this.undoing.get(sessionId);
     await this.cancel(sessionId);
+    await this.sessionAgent.deleted(sessionId);
     this.views.get(sessionId)?.dispose();
     this.views.delete(sessionId);
     this.handles.delete(sessionId);
@@ -787,7 +893,7 @@ export class DurableEngine implements Engine {
     for (const preparation of this.preparations.values()) preparation.abort();
     for (const title of this.titles.values()) title.abort.abort();
     // Finish admitted restores and checklist resets before sealing storage; stop all cleanup timers now.
-    const cleanup = this.taskCleanup.close();
+    const cleanup = Promise.all([this.taskCleanup.close(), this.sessionAgent.close()]);
     const durableClose = Promise.allSettled([...this.undoing.values(), cleanup]).then(() => this.harness.close(ctx));
     this.closePromise = (async () => {
       try {

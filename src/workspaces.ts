@@ -126,6 +126,12 @@ export class Workspaces {
     }
   }
 
+  async committedHead(session: Session, signal?: AbortSignal): Promise<string> {
+    const path = this.store.sessionPath(session);
+    if (!await repositoryRoot(path, signal)) throw new Error("Worktree isolation requires a Git project; use shared explicitly for non-Git projects.");
+    return git(path, ["rev-parse", "--verify", "HEAD^{commit}"], signal);
+  }
+
   async validateNew(project: Project, baseRef: string, branch?: string, signal?: AbortSignal): Promise<void> {
     const root = await repositoryRoot(project.path, signal);
     if (!root) throw new Error("Creating a worktree requires a Git project.");
