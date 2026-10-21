@@ -2,6 +2,7 @@ import { Input, SelectList, matchesKey, wrapTextWithAnsi, type Component, type F
 import type { Controller, Dialog } from "./controller.js";
 import { accent, bold, dim, fit, oneLine, pad, warning } from "./format.js";
 import { isCompactionTokenField, type CompactionTokenField } from "./compaction-settings.js";
+import { DEFAULT_WORKTREE_NAMING_INSTRUCTIONS } from "./worktree-name.js";
 
 const tokenLabels: Record<CompactionTokenField, string> = {
   reserveTokens: "Compaction reserve", keepRecentTokens: "Keep recent tokens", backgroundTokens: "Background lead",
@@ -18,7 +19,7 @@ export class SettingsPage implements Component, Focusable {
   private listTop = 0;
   private inputTop = 0;
   private busy = false;
-  private editing?: { field: CompactionTokenField; input: Input };
+  private editing?: { field: CompactionTokenField | "worktreeNamingInstructions"; input: Input };
 
   constructor(readonly controller: Controller, readonly tui: TuiAltScreen,
     readonly dialog: Extract<Dialog, { kind: "settings" }>) {
@@ -31,7 +32,8 @@ export class SettingsPage implements Component, Focusable {
     const behavior = c.store.settings.replyBehavior;
     const showThinking = c.store.settings.showThinking !== false;
     const policy = c.store.compaction;
-    const key = JSON.stringify([current, behavior, showThinking, policy, this.tui.terminal.rows, this.editing?.field]);
+    const namingInstructions = c.store.settings.worktreeNamingInstructions;
+    const key = JSON.stringify([current, behavior, showThinking, policy, namingInstructions, this.tui.terminal.rows, this.editing?.field]);
     if (key === this.key) return;
     const selected = this.list?.getSelectedItem()?.value ?? this.dialog.selected;
     this.key = key;
@@ -44,6 +46,7 @@ export class SettingsPage implements Component, Focusable {
       { value: "autoCompaction", label: `Auto-compaction   ${policy.enabled ? "On" : "Off"}` },
       ...(["reserveTokens", "keepRecentTokens", "backgroundTokens"] as const)
         .map((field) => ({ value: field, label: `${tokenLabels[field]}   ${tokens(policy[field])}` })),
+      { value: "worktreeNamingInstructions", label: `Worktree naming instructions   ${namingInstructions ? "Custom" : "Default"}` },
     ];
     const visible = Math.max(1, Math.min(items.length, Math.floor(this.tui.terminal.rows * 0.85) - (this.editing ? 14 : 12)));
     this.list = new SelectList(items, visible, {
@@ -62,6 +65,18 @@ export class SettingsPage implements Component, Focusable {
       c.toggleThinking();
     } else if (item.value === "autoCompaction") {
       c.setCompaction({ enabled: !c.store.compaction.enabled });
+    } else if (item.value === "worktreeNamingInstructions") {
+      const input = new Input();
+      input.setValue(c.store.settings.worktreeNamingInstructions ?? DEFAULT_WORKTREE_NAMING_INSTRUCTIONS);
+      input.handleInput("\x05");
+      input.focused = this.focused;
+      input.onSubmit = (value) => {
+        if (c.setWorktreeNamingInstructions(value)) this.editing = undefined;
+        this.refresh();
+        this.tui.requestRender();
+      };
+      this.editing = { field: "worktreeNamingInstructions", input };
+      c.notice = "";
     } else if (isCompactionTokenField(item.value)) {
       const field = item.value;
       const input = new Input();
@@ -115,6 +130,11 @@ export class SettingsPage implements Component, Focusable {
     if (selected === "showThinking") return ["Show or hide provider reasoning (thinking blocks) in all sessions.",
       "Display only: does not change the model's thinking level or request hidden reasoning.",
       "Providers that return no thinking blocks have nothing to show."];
+    if (selected === "worktreeNamingInstructions") return [
+      "Global instructions for generated names of new worktrees; existing names stay unchanged.",
+      "Explicit branch names bypass generation. Enter edits; blank restores the default. Maximum: 4000 characters.",
+      c.store.settings.worktreeNamingInstructions ?? DEFAULT_WORKTREE_NAMING_INSTRUCTIONS,
+    ];
     if (selected === "autoCompaction" || selected && isCompactionTokenField(selected)) {
       const policy = c.store.compaction;
       const window = c.engine.stats(this.dialog.sessionId ? c.session(this.dialog.sessionId) : undefined).contextWindow;
@@ -144,7 +164,8 @@ export class SettingsPage implements Component, Focusable {
     this.listTop = lines.length + 1;
     if (!this.editing || Math.floor(this.tui.terminal.rows * 0.85) >= 20) lines.push(...this.list.render(inner), "");
     if (this.editing) {
-      lines.push(dim(`Edit ${tokenLabels[this.editing.field].toLowerCase()} (tokens)`));
+      lines.push(dim(this.editing.field === "worktreeNamingInstructions" ? "Edit worktree naming instructions (blank resets default)"
+        : `Edit ${tokenLabels[this.editing.field].toLowerCase()} (tokens)`));
       this.inputTop = lines.length + 1;
       lines.push(...this.editing.input.render(inner), "");
     }

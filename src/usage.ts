@@ -46,8 +46,9 @@ export function contextEstimate(view: ContextView): ContextEstimate {
 
 export function sessionStats(session: Session, contextWindow?: number): SessionStats {
   return {
-    usage: session.usage || session.titleUsage ? sumUsage([session.usage, session.titleUsage].filter((u): u is Usage => !!u)) : undefined,
+    usage: session.usage || session.titleUsage || session.worktreeNamingUsage ? sumUsage([session.usage, session.titleUsage, session.worktreeNamingUsage].filter((u): u is Usage => !!u)) : undefined,
     titleUsage: session.titleUsage,
+    worktreeNamingUsage: session.worktreeNamingUsage,
     context: session.context,
     contextWindow: contextWindow && contextWindow > 0 ? contextWindow : undefined,
   };
@@ -85,7 +86,7 @@ export function composerStatus(settings: AgentSettings, stats: SessionStats, quo
 }
 
 export function usageDetails(stats: SessionStats): string[] {
-  const { context, contextWindow, usage, titleUsage } = stats;
+  const { context, contextWindow, usage, titleUsage, worktreeNamingUsage } = stats;
   const contextText = context ? `~${Math.round(context.tokens).toLocaleString("en-US")} tokens` : "unknown until context loads";
   const windowText = contextWindow ? `${formatTokens(contextWindow)} tokens` : "unknown (model unavailable)";
   const lines = [`Context         ${contextText}`, `Context window  ${windowText}`];
@@ -97,10 +98,11 @@ export function usageDetails(stats: SessionStats): string[] {
       `Cache read      ${number(usage.cacheRead)}`, `Cache write     ${number(usage.cacheWrite)}`,
       `Total tokens    ${number(usage.totalTokens)}`, `Estimated cost  ${formatCost(usage.cost.total)}`);
     if (context?.cacheHitRate !== undefined) lines.push(`Last cache hit  ${context.cacheHitRate.toFixed(1)}% (conversation prompt)`);
+    if (worktreeNamingUsage) lines.push(`Naming included ${number(worktreeNamingUsage.totalTokens)} tokens / ${formatCost(worktreeNamingUsage.cost.total)}`);
     if (titleUsage) lines.push(`Title included  ${number(titleUsage.totalTokens)} tokens / ${formatCost(titleUsage.cost.total)}`);
   } else lines.push("Usage not available yet.");
-  return [...lines, "", "Totals include recorded conversation, tool and title usage.",
-    "Context excludes title requests and unsent drafts; not a token limit guarantee.",
+  return [...lines, "", "Totals include recorded conversation, tool, title and worktree naming usage.",
+    "Context excludes title/naming requests and unsent drafts; not a token limit guarantee.",
     "USD estimates use provider/catalog rates, not subscription charges.",
     "Zero cost may mean unpriced usage. In-flight/unreported spend is not included."];
 }

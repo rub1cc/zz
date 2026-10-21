@@ -54,6 +54,7 @@ function session(project: Project, id: string): Session {
 function models(options: { progress?: (publish: (text: string) => void) => void; pause?: boolean; finish?: (done: (failure?: string, content?: (TextContent | ThinkingContent | ToolCall)[]) => void) => void; overflow?: boolean; started?: () => void; context?: (context: Context) => void; request?: (id: string, reasoning: SimpleStreamOptions["reasoning"]) => void;
   usage?: Usage; titleUsage?: Usage; contextWindow?: number; imageInput?: boolean;
   reply?: (context: Context) => (TextContent | ThinkingContent | ToolCall)[];
+  worktreeName?: { text?: string; fail?: boolean; pause?: boolean; context?: (context: Context) => void };
   compaction?: { fail?: boolean; pause?: boolean; started?: () => void; context?: (context: Context) => void; request?: (options?: SimpleStreamOptions) => void; usage?: Usage };
   title?: { text?: string; fail?: boolean; pause?: boolean; ignoreAbort?: boolean; finish?: (done: () => void) => void; context?: (context: Context) => void } } = {}) {
   const models = createModels();
@@ -61,9 +62,11 @@ function models(options: { progress?: (publish: (text: string) => void) => void;
     ...(options.contextWindow === undefined ? {} : { contextWindow: options.contextWindow }),
     ...(options.imageInput === false ? { input: ["text" as const] } : {}) };
   const stream = (_model: unknown, context: Context, request?: SimpleStreamOptions) => {
+    const isName = context.messages.some((m) => m.role === "system" && typeof m.content === "string" && m.content.startsWith("Generate a short Git branch name"));
     const isTitle = context.messages.some((m) => m.role === "system" && typeof m.content === "string" && m.content.startsWith("Generate a short session title"));
     const isCompaction = context.messages.some((m) => m.role === "system" && typeof m.content === "string" && m.content.startsWith("You are a context summarization assistant"));
-    if (isTitle) options.title?.context?.(context);
+    if (isName) options.worktreeName?.context?.(context);
+    else if (isTitle) options.title?.context?.(context);
     else if (isCompaction) { options.compaction?.context?.(context); options.compaction?.request?.(request); }
     else {
       options.context?.(context);
@@ -77,8 +80,8 @@ function models(options: { progress?: (publish: (text: string) => void) => void;
     };
     queueMicrotask(() => {
       if (isCompaction) options.compaction?.started?.();
-      else if (!isTitle) options.started?.();
-      if (isTitle ? options.title?.pause : isCompaction ? options.compaction?.pause : options.pause) {
+      else if (!isTitle && !isName) options.started?.();
+      if (isName ? options.worktreeName?.pause : isTitle ? options.title?.pause : isCompaction ? options.compaction?.pause : options.pause) {
         if (isTitle && options.title?.ignoreAbort) {
           options.title.finish?.(() => {
             message.content = [{ type: "text", text: "Late session title" }];
@@ -91,11 +94,11 @@ function models(options: { progress?: (publish: (text: string) => void) => void;
           events.push({ type: "error", reason: "aborted", error: message });
         };
         if (request?.signal?.aborted) abort(); else request?.signal?.addEventListener("abort", abort, { once: true });
-        if (!isTitle && !isCompaction) options.progress?.((text) => {
+        if (!isTitle && !isCompaction && !isName) options.progress?.((text) => {
           message.content = [{ type: "text", text }];
           events.push({ type: "text_delta", contentIndex: 0, delta: text, partial: structuredClone(message) });
         });
-        if (!isTitle && !isCompaction) options.finish?.((failure, content) => {
+        if (!isTitle && !isCompaction && !isName) options.finish?.((failure, content) => {
           message.content = content ?? [{ type: "text", text: "Recovered answer" }];
           if (failure) {
             message.stopReason = "error"; message.errorMessage = failure;
@@ -105,6 +108,14 @@ function models(options: { progress?: (publish: (text: string) => void) => void;
             events.push({ type: "done", reason: message.stopReason, message });
           }
         });
+        return;
+      }
+      if (isName) {
+        message.content = [{ type: "text", text: options.worktreeName?.text ?? "zz/generated-worktree" }];
+        if (options.worktreeName?.fail) {
+          message.stopReason = "error"; message.errorMessage = "Naming unavailable";
+          events.push({ type: "error", reason: "error", error: message });
+        } else events.push({ type: "done", reason: "stop", message });
         return;
       }
       if (isCompaction) {
@@ -2767,6 +2778,8 @@ test("session delegation uses an isolated normal session, explicit context, mode
     await orchestrationIdle(engine);
     assert.equal(child.delegation?.parentId, parent.id); assert.equal(child.agent?.model?.modelId, "reasoner");
     assert.notEqual(child.workspace?.id, parent.workspace?.id);
+    assert.equal(child.workspace?.branch, `zz/generated-worktree-${child.workspace!.id.slice(0, 8)}`);
+    assert.equal(child.worktreeNamingUsage?.totalTokens, 2);
     assert.equal(readFileSync(join(f.store.sessionPath(child), "marker.txt"), "utf8"), "worker implementation");
     assert.equal(readFileSync(join(f.path, "marker.txt"), "utf8"), "uncommitted parent edit");
     assert.ok(contexts.filter((c) => c.messages.some((m) => m.role === "user" && typeof m.content === "string" && m.content.startsWith("Agent-authored delegation")))
@@ -3347,5 +3360,86 @@ test("Git-discovered worktrees remain editable after their last zz session is de
     assert.equal(resumed.messages.findLast((m) => m.tool?.name === "write")!.tool!.status, "error");
     assert.match(readFileSync(join(checkout, ".git"), "utf8"), /^gitdir:/);
     assert.deepEqual(errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("worktree names use custom instructions and the task prompt, persist once, and stay outside the conversation", async () => {
+  const f = gitWorkspaceFixture(); const namingContexts: Context[] = []; const errors: unknown[] = [];
+  f.store.state.settings = { replyBehavior: "followUp", worktreeNamingInstructions: "Use feature/ and the ticket ABC-42." };
+  const task = session(f.project, "placeholder"); f.store.state.sessions.push(task);
+  const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), models({
+    worktreeName: { text: "feature/ABC-42-fix-login", context: (context) => namingContexts.push(context) },
+  }));
+  try {
+    await engine.run(task, f.project, "Fix the login redirect for ABC-42", () => {});
+    const workspace = task.workspace!;
+    assert.equal(workspace.branch, `feature/ABC-42-fix-login-${workspace.id.slice(0, 8)}`);
+    assert.equal(namingContexts.length, 1);
+    assert.equal(namingContexts[0]!.messages.at(-1)!.content, "Fix the login redirect for ABC-42");
+    assert.match(getCurrentSystemPrompt(namingContexts[0]!.messages), /Use feature\/ and the ticket ABC-42/);
+    assert.deepEqual(getCurrentTools(namingContexts[0]!.messages), []);
+    assert.ok(workspace.checkoutPath!.endsWith(`/repo/feature-abc-42-fix-login-${workspace.id.slice(0, 8)}`));
+    assert.equal(task.worktreeNamingUsage?.totalTokens, 2);
+    assert.ok(!JSON.stringify(task.messages).includes("Generate a short Git branch name"));
+    const originalPath = workspace.path;
+    await engine.run(task, f.project, "Another task", () => {});
+    assert.equal(namingContexts.length, 1); assert.equal(workspace.path, originalPath);
+    assert.equal(new Store(f.store.root).state.sessions[0]!.worktreeNamingUsage?.totalTokens, 2);
+    assert.deepEqual(errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("worktree naming failure falls back while cancellation prevents checkout creation", async () => {
+  for (const cancel of [false, true]) {
+    const f = gitWorkspaceFixture(); let requested = false;
+    const task = session(f.project, "Fix fallback"); f.store.state.sessions.push(task);
+    const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, () => {}, models({
+      worktreeName: { fail: !cancel, pause: cancel, context: () => { requested = true; } },
+    }));
+    try {
+      const run = engine.run(task, f.project, "Fix auth", () => {});
+      if (cancel) { await until(() => requested); await engine.cancel(task.id); }
+      await run;
+      assert.equal(requested, true);
+      if (cancel) {
+        assert.equal(task.stopped, true); assert.equal(existsSync(task.workspace!.path), false);
+        assert.equal(task.conversationId, undefined);
+      } else {
+        assert.equal(task.status, "completed");
+        assert.equal(task.workspace!.branch, `zz/fix-fallback-${task.workspace!.id.slice(0, 8)}`);
+        assert.equal(task.worktreeNamingUsage?.totalTokens, 2);
+      }
+    } finally { await engine.close(); f.cleanup(); }
+  }
+});
+
+test("workspace handoffs generate unnamed branches, account for usage on the real session, and preserve explicit names", async () => {
+  const f = gitWorkspaceFixture(); f.project.workspaceDefault = { kind: "main" };
+  const task = session(f.project, "handoff naming"); f.store.state.sessions.push(task);
+  let names = 0;
+  const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, () => {}, models({
+    worktreeName: { text: "zz/handoff-fix", context: () => { names++; } },
+    reply: (context) => {
+      const last = context.messages.findLast((m) => m.role !== "system");
+      return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("tools:")
+        ? JSON.parse(last.content.slice(6)) as ToolCall[] : [{ type: "text", text: "Done" }];
+    },
+  }));
+  try {
+    await engine.run(task, f.project, toolPrompt(taskCall("workspace_enter", { create: {} })), () => {});
+    await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+    assert.equal(names, 1);
+    assert.equal(task.workspace!.branch, `zz/handoff-fix-${task.workspace!.id.slice(0, 8)}`);
+    assert.equal(task.worktreeNamingUsage?.totalTokens, 2);
+    const state = await engine.harness.snapshot(WorkspaceDoc, task.conversationId as ConversationId, BACKGROUND_CONTEXT);
+    assert.equal(state?.current?.path, task.workspace!.path);
+    assert.equal(state?.current?.namingPending, false);
+    await engine.run(task, f.project, toolPrompt(taskCall("workspace_exit", {})), () => {});
+    await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+    await engine.run(task, f.project, toolPrompt(taskCall("workspace_enter", { create: { branch: "explicit/ABC-42" } })), () => {});
+    await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+    assert.equal(names, 1); assert.equal(task.workspace!.branch, "explicit/ABC-42");
+    assert.ok(task.workspace!.checkoutPath!.endsWith("/repo/explicit-abc-42"));
+    assert.equal(task.worktreeNamingUsage?.totalTokens, 2);
   } finally { await engine.close(); f.cleanup(); }
 });

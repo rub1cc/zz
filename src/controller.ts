@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { copyToClipboard } from "@earendil-works/pi-coding-agent";
-import { startWork, finishWork, isReplyBehavior, markStopped, rowId, rows, transcriptMessages, type ShellResponse, type ImageAttachment, type ReplyBehavior, type SettingsSelection, type AgentSettings, type CompactResult, type ModelOption, type Project, type Row, type Session, type SessionStats, type SkillOption, type WorkspaceSelection, type Workspace, type UndoResult, type UndoCheckpoint } from "./model.js";
+import { startWork, finishWork, isReplyBehavior, worktreeNamingInstructionsError, markStopped, rowId, rows, transcriptMessages, type ShellResponse, type ImageAttachment, type ReplyBehavior, type SettingsSelection, type AgentSettings, type CompactResult, type ModelOption, type Project, type Row, type Session, type SessionStats, type SkillOption, type WorkspaceSelection, type Workspace, type UndoResult, type UndoCheckpoint } from "./model.js";
 import { directory, isImages, Store } from "./store.js";
 import { Workspaces } from "./workspaces.js";
 import { ShellRun } from "./shell.js";
@@ -415,6 +415,23 @@ export class Controller {
     if (!isReplyBehavior(value)) { this.fail("Choose follow-up or steer."); return false; }
     const previous = this.store.state.settings;
     this.store.state.settings = { ...this.store.settings, replyBehavior: value };
+    try { this.store.save(); }
+    catch (error) { this.store.state.settings = previous; this.fail(error); return false; }
+    this.notice = "";
+    this.changed();
+    return true;
+  }
+
+  setWorktreeNamingInstructions(value: string): boolean {
+    if (this.closing) return false;
+    const error = worktreeNamingInstructionsError(value);
+    if (error) { this.fail(error); return false; }
+    const previous = this.store.state.settings;
+    const next = { ...this.store.settings };
+    const text = value.trim();
+    if (text) next.worktreeNamingInstructions = text;
+    else delete next.worktreeNamingInstructions;
+    this.store.state.settings = next;
     try { this.store.save(); }
     catch (error) { this.store.state.settings = previous; this.fail(error); return false; }
     this.notice = "";

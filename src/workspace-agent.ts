@@ -56,13 +56,14 @@ interface WorkspaceAgentHost {
   session(id: ConversationId): Session | undefined;
   assertAvailable(session: Session, paths: readonly string[]): void;
   changed(session: Session): void;
+  nameWorkspace(session: Session, signal?: AbortSignal): Promise<string | undefined>;
 }
 
 /** Tools prepare a handoff; only the generation's all-tools-settled boundary changes cwd. */
 export class WorkspaceAgent {
   harness!: Harness;
   private readonly workspaces: Workspaces;
-  constructor(private readonly store: Store, private readonly host: WorkspaceAgentHost) { this.workspaces = new Workspaces(store); }
+  constructor(private readonly store: Store, private readonly host: WorkspaceAgentHost) { this.workspaces = new Workspaces(store, (session, signal) => host.nameWorkspace(session, signal)); }
 
   readonly extension = defineExtension({
     name: "zz-workspaces",
@@ -170,8 +171,7 @@ export class WorkspaceAgent {
         if (source.kind !== "main") throw new Error("This session already has a worktree. Enter an existing workspace, return to main, or start another session.");
         await this.workspaces.validateNew(project, args.create.baseRef ?? "HEAD", args.create.branch, context.abortSignal);
         const candidate = { ...session };
-        target = this.store.assignWorkspace(candidate, project, { kind: "new", baseRef: args.create.baseRef ?? "HEAD" });
-        if (args.create.branch) target.branch = args.create.branch;
+        target = this.store.assignWorkspace(candidate, project, { kind: "new", baseRef: args.create.baseRef ?? "HEAD" }, args.create.branch);
       } else {
         target = await this.workspaces.resolve(project, args.path ?? args.workspaceId!, context.abortSignal);
       }

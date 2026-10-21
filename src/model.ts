@@ -66,14 +66,20 @@ export function isReplyBehavior(value: unknown): value is ReplyBehavior {
   return value === "followUp" || value === "steer";
 }
 
+export function worktreeNamingInstructionsError(value: unknown): string | undefined {
+  if (typeof value !== "string") return "Worktree naming instructions must be text.";
+  if (value.length > 4000) return "Worktree naming instructions must be at most 4000 characters.";
+}
+
 export interface AppSettings {
   replyBehavior: ReplyBehavior;
   showThinking?: boolean;
   compaction?: Partial<CompactionPolicy>;
+  worktreeNamingInstructions?: string;
 }
 
 export type SettingsSelection = "replyBehavior" | "model" | "thinking" | "showThinking" | "autoCompaction"
-  | "reserveTokens" | "keepRecentTokens" | "backgroundTokens";
+  | "reserveTokens" | "keepRecentTokens" | "backgroundTokens" | "worktreeNamingInstructions";
 
 export interface PendingInput {
   source?: { sessionId: string; title: string; kind: "message" | "delegation" | "notification" };
@@ -112,6 +118,8 @@ export interface Workspace {
   branch?: string;
   baseRef?: string;
   baseCommit?: string;
+  /** Generated naming is attempted once before preparing the checkout. */
+  namingPending?: boolean;
   error?: string;
 }
 
@@ -149,6 +157,7 @@ export interface ContextEstimate {
 export interface SessionStats {
   usage?: Usage;
   titleUsage?: Usage;
+  worktreeNamingUsage?: Usage;
   context?: ContextEstimate;
   contextWindow?: number;
 }
@@ -191,9 +200,10 @@ export interface Session {
   /** Cached durable activity, refreshed from pi.live on restore. Independent of the agent run. */
   compactions?: CompactionStatus[];
   compactionFailure?: CompactionFailure;
-  /** Cached presentation of the durable usage ledger, separate from title overhead. */
+  /** Cached presentation of the durable usage ledger, separate from naming overhead. */
   usage?: Usage;
   titleUsage?: Usage;
+  worktreeNamingUsage?: Usage;
   context?: ContextEstimate;
   id: string;
   conversationId?: number;

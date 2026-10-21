@@ -18,6 +18,7 @@ import { directory, isImages, Store } from "./store.js";
 import { InstructionCatalog, INTERACTION_POLICY } from "./instructions.js";
 import { getImageProcessor, prepareImageFile, referencedImages, MAX_ATTACHMENTS } from "./attachments.js";
 import { SkillCatalog } from "./skills.js";
+import { DEFAULT_WORKTREE_NAMING_INSTRUCTIONS, generateWorktreeName } from "./worktree-name.js";
 import { generateSessionTitle } from "./title.js";
 import { contextEstimate, conversationUsage, sessionStats, sumUsage } from "./usage.js";
 import { settleWithin } from "./shutdown.js";
@@ -332,7 +333,7 @@ export class DurableEngine implements Engine {
     readonly workspaceAgent: WorkspaceAgent,
     readonly sessionAgent: SessionAgent,
     taskClock: TaskCleanupClock,
-  ) { this.taskCleanup = new TaskCleanup(harness, report, taskClock); this.workspaces = new Workspaces(store); }
+  ) { this.taskCleanup = new TaskCleanup(harness, report, taskClock); this.workspaces = new Workspaces(store, (session, signal) => this.nameWorkspace(session, signal)); }
 
   static async open(store: Store, model: ModelRef | undefined, report: (error: unknown) => void, models?: Models, thinkingLevel: ModelThinkingLevel = "off", skills = new SkillCatalog(), instructions = new InstructionCatalog(), taskClock: TaskCleanupClock = taskCleanupClock): Promise<DurableEngine> {
     models ??= await ModelRuntime.create({ allowModelNetwork: false });
@@ -341,6 +342,7 @@ export class DurableEngine implements Engine {
       session: (id) => store.state.sessions.find((s) => s.conversationId === id),
       assertAvailable: (session, paths) => engine.assertWorkspaceAvailable(session, paths),
       changed: (session) => engine.changes.get(session.id)?.(),
+      nameWorkspace: (session, signal) => engine.nameWorkspace(session, signal),
     });
     const sessionAgent = new SessionAgent(store, {
       configuration: (session) => engine.configuration(session),
@@ -594,6 +596,21 @@ export class DurableEngine implements Engine {
       this.taskCleanup.forget(conversation.id); view.dispose(); tasks.dispose(); workspace.dispose();
     } });
     await refresh();
+  }
+
+  private async nameWorkspace(candidate: Session, signal?: AbortSignal): Promise<string | undefined> {
+    const session = this.store.state.sessions.find((s) => s.id === candidate.id) ?? candidate;
+    const ref = this.configuration(session).model;
+    const model = ref && this.models.getModel(ref.provider, ref.modelId);
+    if (!model || this.closing || this.stopping.has(session.id)) return;
+    const prompt = session.messages.findLast((m) => m.role === "user")?.text ?? session.pendingInput?.prompt ?? session.title;
+    return generateWorktreeName(this.models, model, prompt,
+      this.store.settings.worktreeNamingInstructions?.trim() || DEFAULT_WORKTREE_NAMING_INSTRUCTIONS,
+      signal ?? new AbortController().signal, (usage) => {
+        if (this.closing) return;
+        session.worktreeNamingUsage = sumUsage([...(session.worktreeNamingUsage ? [session.worktreeNamingUsage] : []), usage]);
+        void this.store.saveAsync().catch(this.report);
+      });
   }
 
   private startTitle(session: Session, prompt: string, changed: (persist?: boolean) => void): void {

@@ -203,6 +203,10 @@ save immediately in zz's data directory; no restart is needed.
   token budgets described under [Compaction](#compaction). Enter opens an inline
   numeric field; Enter saves, Escape discards the edit without closing settings.
   Use whole counts without commas or units. These settings are saved in zz, not Pi.
+- **Worktree naming instructions** edits the global prompt used to generate names
+  for new worktrees. Enter saves, Escape cancels, and a blank value restores the
+  built-in default. Instructions can contain up to 4000 characters. Existing
+  branches and directories are unchanged; explicit branch names bypass generation.
 - **Model** and **thinking** open the existing pickers. On the dashboard these
   configure new-task defaults; inside a session they configure only that session.
   Selecting or cancelling a picker returns to the settings page. Busy-reply
@@ -251,8 +255,15 @@ npm run dev -- --model openai/gpt-5.4 --thinking high
 ## Workspaces And Worktrees
 
 New coding tasks in Git projects get their own worktree by default. Each task
-starts from the current committed `HEAD`, on a branch such as
-`zz/fix-auth-a1b2c3d4`. Tasks outside Git use the project directory instead.
+starts from the current committed `HEAD`, on a generated branch named
+`zz/<slug>-<8uuid>`, such as `zz/fix-auth-a1b2c3d4`. The slug describes the task;
+**Worktree naming instructions** in `/settings` overrides the global generation
+instructions. Naming waits at most five seconds and falls back to the existing
+title-based naming on errors, invalid output, or timeout. Explicit branch names
+bypass generation. New directories use
+`<zz-state-root>/worktrees/<repo-basename>/<slugified-branch>`; for example,
+`~/.zz/worktrees/my-repo/zz-fix-auth-a1b2c3d4`. Existing branch names and checkout
+paths are left untouched. Tasks outside Git use the project directory instead.
 Existing sessions keep their original directories and conversations unless you
 explicitly ask the agent to switch workspace.
 
@@ -1054,7 +1065,7 @@ data directory (`~/.local/share/zz` or `$XDG_DATA_HOME/zz`) to `~/.zz`, or keep
 using it with an explicit override. Move the whole directory, not just `state.json`.
 
 - `state.json`: projects, stable project identities, defaults, session workspace bindings, and cached display history.
-- `worktrees/`: retained managed Git checkouts, grouped by project and workspace ID.
+- `worktrees/`: retained managed Git checkouts; new paths are grouped by repository basename and slugified branch name (existing paths are unchanged).
 - `state.v1.backup.json` / `state.v2.backup.json`: original indexes saved before their respective migrations.
 - `sessions.sqlite`: durable conversations, model context, tools, and checkpoints.
 - `undo/`: persistent file backups for `/undo` (may contain sensitive source contents).

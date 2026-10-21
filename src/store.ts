@@ -5,8 +5,9 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync
 import { homedir } from "node:os";
 import { StateWriter } from "./state-writer.js";
 import { compactionPolicy, compactionSettingsError } from "./compaction-settings.js";
-import { join, resolve } from "node:path";
-import { isReplyBehavior, isThinkingLevel, type ShellResponse, type ImageAttachment, type AppSettings, type AgentSettings, type PendingInput, type WorkerUpdate, type PreparedInput, type Project, type Session, type Workspace, type WorkspaceSelection, type State, type ToolActivity } from "./model.js";
+import { basename, join, resolve } from "node:path";
+import { branchDirectory } from "./worktree-name.js";
+import { isReplyBehavior, isThinkingLevel, worktreeNamingInstructionsError, type ShellResponse, type ImageAttachment, type AppSettings, type AgentSettings, type PendingInput, type WorkerUpdate, type PreparedInput, type Project, type Session, type Workspace, type WorkspaceSelection, type State, type ToolActivity } from "./model.js";
 
 export function directory(value: string): string {
   const expanded = value === "~" ? homedir() : value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
@@ -37,6 +38,7 @@ function isWorkspace(value: Workspace): boolean {
     && [value.projectPath, value.path, value.checkoutPath, value.repositoryRoot].every((s) => s === undefined || resolve(s) === s)
     && ["main", "worktree"].includes(value.kind) && typeof value.managed === "boolean"
     && ["pending", "ready", "failed"].includes(value.status)
+    && (value.namingPending === undefined || typeof value.namingPending === "boolean")
     && [value.checkoutPath, value.repositoryRoot, value.branch, value.baseRef, value.baseCommit, value.error].every((s) => s === undefined || typeof s === "string");
 }
 
@@ -69,6 +71,7 @@ function isState(value: unknown): value is State {
     && (state.defaults === undefined || isAgentSettings(state.defaults))
     && (state.settings === undefined || !!state.settings && isReplyBehavior(state.settings.replyBehavior)
       && (state.settings.showThinking === undefined || typeof state.settings.showThinking === "boolean")
+      && (state.settings.worktreeNamingInstructions === undefined || worktreeNamingInstructionsError(state.settings.worktreeNamingInstructions) === undefined)
       && (state.settings.compaction === undefined || compactionSettingsError(state.settings.compaction) === undefined))
     && state.projects.every((p) => typeof p.id === "string" && typeof p.path === "string"
       && validWorkspaceDefault(p, state)
@@ -109,6 +112,7 @@ function isState(value: unknown): value is State {
       && (s.compactionFailure === undefined || isCompactionIdentity(s.compactionFailure) && typeof s.compactionFailure.error === "string")
       && (s.usage === undefined || isUsage(s.usage))
       && (s.titleUsage === undefined || isUsage(s.titleUsage))
+      && (s.worktreeNamingUsage === undefined || isUsage(s.worktreeNamingUsage))
       && (s.context === undefined || !!s.context && nonnegative(s.context.tokens)
         && (s.context.cacheHitRate === undefined || nonnegative(s.context.cacheHitRate) && s.context.cacheHitRate <= 100))
       && ["working", "needs-input", "completed", "failed", "paused"].includes(s.status)
@@ -310,7 +314,7 @@ export class Store {
     try { return realpathSync(path); } catch { return path; }
   }
 
-  assignWorkspace(session: Session, project: Project, selection: WorkspaceSelection = project.workspaceDefault ?? { kind: "new", baseRef: "HEAD" }): Workspace {
+  assignWorkspace(session: Session, project: Project, selection: WorkspaceSelection = project.workspaceDefault ?? { kind: "new", baseRef: "HEAD" }, branch?: string): Workspace {
     let workspace: Workspace;
     if (selection.kind === "main") workspace = this.mainWorkspace(project);
     else if (selection.kind === "existing") {
@@ -320,18 +324,25 @@ export class Store {
           kind: path === project.path ? "main" : "worktree", managed: false, status: "ready" };
     } else {
       const id = randomUUID();
-      const checkoutPath = join(realpathSync(this.root), "worktrees", project.id, id);
       const slug = session.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32) || "task";
+      const name = branch ?? `zz/${slug}-${id.slice(0, 8)}`;
+      const checkoutPath = this.worktreePath(project.path, name);
       workspace = { id, projectId: project.id, projectPath: project.path, path: checkoutPath, checkoutPath,
-        kind: "worktree", managed: true, status: "pending", branch: `zz/${slug}-${id.slice(0, 8)}`, baseRef: selection.baseRef };
+        kind: "worktree", managed: true, status: "pending", branch: name, baseRef: selection.baseRef, namingPending: branch === undefined };
     }
     session.workspace = workspace;
     return workspace;
   }
 
+  worktreePath(repositoryPath: string, branch: string): string {
+    const repo = basename(repositoryPath);
+    return join(realpathSync(this.root), "worktrees", repo === "." || repo === ".." || !repo ? "repo" : repo, branchDirectory(branch));
+  }
+
   get settings(): AppSettings {
     return { replyBehavior: this.state.settings?.replyBehavior ?? "followUp",
       ...(this.state.settings?.showThinking === undefined ? {} : { showThinking: this.state.settings.showThinking }),
+      ...(this.state.settings?.worktreeNamingInstructions === undefined ? {} : { worktreeNamingInstructions: this.state.settings.worktreeNamingInstructions }),
       ...(this.state.settings?.compaction === undefined ? {} : { compaction: { ...this.state.settings.compaction } }) };
   }
 

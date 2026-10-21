@@ -52,7 +52,7 @@ async function listedWorktrees(path: string, signal?: AbortSignal): Promise<Map<
 /** Checkout creation is replayable; session deletion never owns filesystem deletion. */
 export class Workspaces {
   private readonly pending = new Map<string, Promise<Workspace>>();
-  constructor(private readonly store: Store) {}
+  constructor(private readonly store: Store, private readonly name?: (session: Session, signal?: AbortSignal) => Promise<string | undefined>) {}
 
   ensure(session: Session, project: Project, changed: () => void, signal?: AbortSignal, allowMainFallback = true, checkpoint?: (workspace: Workspace) => Promise<void>): Promise<Workspace> {
     const workspace = this.store.workspace(session) ?? this.store.assignWorkspace(session, project, { kind: "main" });
@@ -93,7 +93,22 @@ export class Workspaces {
       const base = workspace.baseRef;
       if (base.startsWith("-") || !base.trim() || /[\r\n\0]/.test(base)) throw new Error("Choose a valid Git base ref (for example HEAD or main).");
       // Pin the base before creating anything so a retried launch cannot move with HEAD.
-      workspace.baseCommit ??= await git(root, ["rev-parse", "--verify", "--end-of-options", `${base}^{commit}`], signal);
+      const baseCommit = workspace.baseCommit ?? await git(root, ["rev-parse", "--verify", "--end-of-options", `${base}^{commit}`], signal);
+      // Only newly allocated records opt into naming and the readable directory layout.
+      // Persist the choice before touching Git so retries cannot rename an existing checkout.
+      if (workspace.namingPending !== undefined && !workspace.baseCommit) {
+        if (workspace.namingPending) {
+          session.preview = "Naming workspace...";
+          changed();
+          const name = await this.name?.(session, signal);
+          signal?.throwIfAborted();
+          if (name) workspace.branch = `${name}-${workspace.id.slice(0, 8)}`;
+        }
+        workspace.checkoutPath = this.store.worktreePath(root, workspace.branch);
+        workspace.path = join(workspace.checkoutPath, relative(root, directory(project.path)));
+        workspace.namingPending = false;
+      }
+      workspace.baseCommit = baseCommit;
       workspace.path = join(workspace.checkoutPath, relative(root, directory(project.path)));
       await save();
       await mkdir(dirname(workspace.checkoutPath), { recursive: true });

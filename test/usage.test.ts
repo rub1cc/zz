@@ -214,3 +214,20 @@ test("application settings default safely, round-trip and validate delivery mode
     }
   } finally { temp.cleanup(); }
 });
+
+test("worktree naming overhead is persisted and counted once outside conversation context", () => {
+  const f = temporary();
+  try {
+    const store = new Store(f.root); const project = store.addProject(f.root);
+    const s = session(); s.projectId = project.id;
+    s.usage = structuredClone(usage); s.titleUsage = structuredClone(usage); s.worktreeNamingUsage = structuredClone(usage);
+    s.context = { tokens: 100 }; store.state.sessions.push(s); store.save();
+    const restored = new Store(f.root).state.sessions[0]!;
+    const stats = sessionStats(restored, 1000);
+    assert.equal(stats.usage?.totalTokens, 1500);
+    assert.equal(stats.context?.tokens, 100);
+    assert.deepEqual(stats.worktreeNamingUsage, usage);
+    assert.match(usageDetails(stats).join("\n"), /Naming included 500 tokens/);
+    assert.equal(sessionStats(restored).usage?.totalTokens, 1500);
+  } finally { f.cleanup(); }
+});

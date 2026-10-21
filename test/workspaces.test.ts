@@ -335,3 +335,80 @@ test("project-scoped bindings stay distinct when another project's main director
     assert.equal(a!.projectId, project.id); assert.equal(b!.projectId, otherProject.id);
   } finally { f.cleanup(); }
 });
+
+test("new checkouts use the repository basename and generated branch, then retain that choice on retries", async () => {
+  const f = temporary();
+  try {
+    const root = repository(f.root); const store = new Store(join(f.root, "data"));
+    const project = store.addProject(join(root, "pkg")); const task = session(project, "Fix auth"); store.state.sessions.push(task);
+    const workspace = store.assignWorkspace(task, project);
+    let calls = 0;
+    const manager = new Workspaces(store, async () => { calls++; return "feature/Fix-Auth"; });
+    await manager.ensure(task, project, () => {});
+    assert.equal(workspace.branch, `feature/Fix-Auth-${workspace.id.slice(0, 8)}`);
+    assert.equal(workspace.checkoutPath, join(store.root, "worktrees", "repo", `feature-fix-auth-${workspace.id.slice(0, 8)}`));
+    assert.equal(workspace.path, join(workspace.checkoutPath!, "pkg"));
+    assert.equal(git(workspace.path, "branch", "--show-current"), workspace.branch);
+    workspace.status = "pending"; task.title = "A later title"; store.save();
+    const reopened = new Store(store.root);
+    await new Workspaces(reopened, async () => assert.fail("Do not regenerate persisted names"))
+      .ensure(reopened.state.sessions[0]!, reopened.state.projects[0]!, () => {});
+    assert.equal(calls, 1);
+    assert.equal(reopened.state.sessions[0]!.workspace!.path, workspace.path);
+    assert.equal(workspace.namingPending, false);
+  } finally { f.cleanup(); }
+});
+
+test("explicit branch names bypass generation and still use the repository directory", async () => {
+  const f = temporary();
+  try {
+    const root = repository(f.root); const store = new Store(join(f.root, "data"));
+    const project = store.addProject(join(root, "pkg")); const task = session(project, "manual");
+    const workspace = store.assignWorkspace(task, project, { kind: "new", baseRef: "main" }, "custom/ABC-42");
+    await new Workspaces(store, async () => assert.fail("Explicit names bypass the LLM")).ensure(task, project, () => {});
+    assert.equal(workspace.branch, "custom/ABC-42");
+    assert.equal(workspace.checkoutPath, join(store.root, "worktrees", "repo", "custom-abc-42"));
+  } finally { f.cleanup(); }
+});
+
+test("unavailable naming retains the deterministic fallback and separate sessions remain unique", async () => {
+  const f = temporary();
+  try {
+    const root = repository(f.root); const store = new Store(join(f.root, "data")); const project = store.addProject(root);
+    const a = session(project, "Same task"); const b = session(project, "Same task");
+    const first = store.assignWorkspace(a, project); const second = store.assignWorkspace(b, project);
+    const original = first.branch;
+    const manager = new Workspaces(store, async () => undefined);
+    await manager.ensure(a, project, () => {});
+    assert.equal(first.branch, original);
+    assert.equal(first.checkoutPath, join(store.root, "worktrees", "repo", `zz-same-task-${first.id.slice(0, 8)}`));
+    assert.notEqual(first.path, second.path); assert.notEqual(first.branch, second.branch);
+  } finally { f.cleanup(); }
+});
+
+test("legacy pending checkout paths and branches do not participate in new naming", async () => {
+  const f = temporary();
+  try {
+    const root = repository(f.root); const store = new Store(join(f.root, "data")); const project = store.addProject(root);
+    const task = session(project, "old task"); const workspace = store.assignWorkspace(task, project);
+    delete workspace.namingPending;
+    workspace.checkoutPath = join(store.root, "worktrees", project.id, workspace.id); workspace.path = workspace.checkoutPath;
+    const original = { path: workspace.path, branch: workspace.branch };
+    await new Workspaces(store, async () => assert.fail("Do not rename legacy checkouts")).ensure(task, project, () => {});
+    assert.equal(workspace.path, original.path); assert.equal(workspace.branch, original.branch);
+  } finally { f.cleanup(); }
+});
+
+test("cancellation during naming creates neither a branch nor a directory", async () => {
+  const f = temporary();
+  try {
+    const root = repository(f.root); const store = new Store(join(f.root, "data")); const project = store.addProject(root);
+    const task = session(project, "cancel naming"); const workspace = store.assignWorkspace(task, project);
+    const abort = new AbortController();
+    const manager = new Workspaces(store, async () => { abort.abort(); return undefined; });
+    await assert.rejects(manager.ensure(task, project, () => {}, abort.signal), /Workspace preparation failed/);
+    assert.equal(existsSync(workspace.path), false);
+    assert.equal(git(root, "branch", "--list", workspace.branch!), "");
+    assert.equal(workspace.namingPending, true);
+  } finally { f.cleanup(); }
+});
