@@ -19,7 +19,8 @@
     "build": "tsc -p tsconfig.json",
     "package:release": "node scripts/package-release.mjs",
     "check": "tsc -p tsconfig.test.json",
-    "test": "node --import tsx --test test/*.test.ts"
+    "test": "node --import tsx --test test/*.test.ts",
+    "bench:multi-agent": "node --import tsx scripts/bench-multi-agent.mjs"
   },
   "engines": {
     "node": ">=22.19.0"

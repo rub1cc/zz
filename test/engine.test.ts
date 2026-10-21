@@ -50,7 +50,7 @@ function session(project: Project, id: string): Session {
   return { id, projectId: project.id, title: id, status: "working", preview: "Starting", createdAt: Date.now(), updatedAt: Date.now(), messages: [] };
 }
 
-function models(options: { pause?: boolean; finish?: (done: (failure?: string, content?: (TextContent | ThinkingContent | ToolCall)[]) => void) => void; overflow?: boolean; started?: () => void; context?: (context: Context) => void; request?: (id: string, reasoning: SimpleStreamOptions["reasoning"]) => void;
+function models(options: { progress?: (publish: (text: string) => void) => void; pause?: boolean; finish?: (done: (failure?: string, content?: (TextContent | ThinkingContent | ToolCall)[]) => void) => void; overflow?: boolean; started?: () => void; context?: (context: Context) => void; request?: (id: string, reasoning: SimpleStreamOptions["reasoning"]) => void;
   usage?: Usage; titleUsage?: Usage; contextWindow?: number; imageInput?: boolean;
   reply?: (context: Context) => (TextContent | ThinkingContent | ToolCall)[];
   compaction?: { fail?: boolean; pause?: boolean; started?: () => void; context?: (context: Context) => void; request?: (options?: SimpleStreamOptions) => void; usage?: Usage };
@@ -90,6 +90,10 @@ function models(options: { pause?: boolean; finish?: (done: (failure?: string, c
           events.push({ type: "error", reason: "aborted", error: message });
         };
         if (request?.signal?.aborted) abort(); else request?.signal?.addEventListener("abort", abort, { once: true });
+        if (!isTitle && !isCompaction) options.progress?.((text) => {
+          message.content = [{ type: "text", text }];
+          events.push({ type: "text_delta", contentIndex: 0, delta: text, partial: structuredClone(message) });
+        });
         if (!isTitle && !isCompaction) options.finish?.((failure, content) => {
           message.content = content ?? [{ type: "text", text: "Recovered answer" }];
           if (failure) {
@@ -2719,5 +2723,60 @@ test("workspace agent revalidates the prepared destination before committing a b
     assert.equal(moved, true); assert.equal(f.store.workspace(s)?.kind, "main");
     assert.equal(s.status, "failed"); assert.match(s.preview, /stayed in its previous checkout/);
     assert.deepEqual(errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+
+test("streaming repaints without persistence notifications and committed history still restores", async () => {
+  const f = temporary(), store = new Store(f.root), project = store.addProject(f.root);
+  const s = session(project, "streaming"); store.state.sessions.push(s);
+  let publish!: (text: string) => void;
+  let finish!: (failure?: string, content?: (TextContent | ThinkingContent | ToolCall)[]) => void;
+  let live = 0, persistent = 0;
+  let engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models({
+    pause: true, progress: (update) => { publish = update; }, finish: (done) => { finish = done; },
+  }));
+  try {
+    const running = engine.run(s, project, "streaming request", (persist = true) => { if (persist) persistent++; else live++; });
+    await until(() => !!publish);
+    // Drain title/initial admission updates before checking the live-only interval.
+    await until(() => !!s.titleUsage);
+    publish("first fragment");
+    await until(() => s.messages.at(-1)?.text === "first fragment");
+    const checkpoints = persistent, repaints = live;
+    publish("second fragment");
+    await until(() => s.messages.at(-1)?.text === "second fragment");
+    assert.equal(persistent, checkpoints);
+    assert.ok(live > repaints);
+    finish(undefined, [{ type: "text", text: "Committed final answer" }]);
+    await running;
+    assert.ok(persistent > checkpoints);
+    await engine.close();
+    const restored = new Store(f.root);
+    engine = await openEngine(restored, undefined, () => {}, models());
+    await engine.restore(() => {});
+    assert.equal(lastReply(restored.state.sessions[0]!), "Committed final answer");
+    assert.equal(restored.state.sessions[0]?.status, "completed");
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("accepted input is checkpointed before run returns and closing before admission preserves it", async () => {
+  const f = temporary(), store = new Store(f.root), project = store.addProject(f.root);
+  const s = session(project, "close-before-admission"); store.state.sessions.push(s);
+  let requests = 0;
+  let engine = await openEngine(store, { provider: "test", modelId: "mock" }, () => {}, models({ started: () => requests++ }));
+  try {
+    s.agent = engine.configuration();
+    const running = engine.run(s, project, "accepted before close", () => {});
+    assert.equal(new Store(f.root).state.sessions[0]?.pendingInput?.prompt, "accepted before close");
+    await engine.close(); await running;
+    assert.equal(requests, 0);
+    const restored = new Store(f.root);
+    assert.equal(restored.state.sessions[0]?.pendingInput?.prompt, "accepted before close");
+    engine = await openEngine(restored, undefined, () => {}, models());
+    await engine.restore(() => {});
+    await until(() => restored.state.sessions[0]?.status === "completed");
+    assert.equal(lastReply(restored.state.sessions[0]!), "Recovered answer");
+    assert.equal(restored.state.sessions[0]?.messages.filter(message => message.role === "user").length, 1);
   } finally { await engine.close(); f.cleanup(); }
 });

@@ -75,7 +75,7 @@ export class Workspaces {
     workspace.status = "pending";
     delete workspace.error;
     session.preview = "Preparing workspace...";
-    this.store.save(); changed();
+    await this.store.saveAsync(); changed();
     try {
       const root = await repositoryRoot(project.path, signal);
       if (!root) {
@@ -83,18 +83,18 @@ export class Workspaces {
         const main = this.store.mainWorkspace(project);
         session.workspaceId = main.id;
         this.store.state.workspaces = this.store.workspaces.filter((w) => w.id !== workspace.id);
-        this.store.save(); changed();
+        await this.store.saveAsync(); changed();
         return main;
       }
       if (workspace.repositoryRoot && workspace.repositoryRoot !== root) throw new Error("The project now resolves to a different repository root; inspect it before retrying.");
       workspace.repositoryRoot = root;
-      this.store.save();
+      await this.store.saveAsync();
       const base = workspace.baseRef;
       if (base.startsWith("-") || !base.trim() || /[\r\n\0]/.test(base)) throw new Error("Choose a valid Git base ref (for example HEAD or main).");
       // Pin the base before creating anything so a retried launch cannot move with HEAD.
       workspace.baseCommit ??= await git(root, ["rev-parse", "--verify", "--end-of-options", `${base}^{commit}`], signal);
       workspace.path = join(workspace.checkoutPath, relative(root, directory(project.path)));
-      this.store.save();
+      await this.store.saveAsync();
       await mkdir(dirname(workspace.checkoutPath), { recursive: true });
       const listed = await listedWorktrees(root, signal);
       const registered = listed.has(workspace.checkoutPath);
@@ -116,12 +116,12 @@ export class Workspaces {
       }
       workspace.path = directory(workspace.path);
       workspace.status = "ready";
-      this.store.save(); changed();
+      await this.store.saveAsync(); changed();
       return workspace;
     } catch (error) {
       workspace.status = "failed";
       workspace.error = error instanceof Error ? error.message : String(error);
-      this.store.save(); changed();
+      await this.store.saveAsync(); changed();
       throw new Error(`Workspace preparation failed: ${workspace.error}`, { cause: error });
     }
   }
@@ -178,7 +178,7 @@ export class Workspaces {
     const workspace: Workspace = { id: randomUUID(), projectId: project.id, projectPath: project.path, path: expected,
       checkoutPath: candidateRoot, branch: listed.get(candidateRoot)?.branch, kind: "worktree", managed: false, status: "ready" };
     this.store.workspaces.push(workspace);
-    try { this.store.save(); }
+    try { await this.store.saveAsync(); }
     catch (error) { this.store.state.workspaces = this.store.workspaces.filter((w) => w !== workspace); throw error; }
     return workspace;
   }
