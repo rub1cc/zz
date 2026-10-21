@@ -671,22 +671,24 @@ test("tool previews are compact, keyboard and mouse expandable, and stable acros
       id: "run-tests", name: "bash", arguments: { command: "npm test" }, output: "Tests passed\n14 tests\n0 failed\nFULL_OUTPUT_TAIL", status: "done", durationMs: 1100,
     } });
     const render = () => f.app.body.render(f.terminal.columns).map(stripTerminalSequences).join("\n");
-    assert.match(render(), /● Skill frontend-design/);
-    assert.match(render(), /Bash\(npm test\) \(1\.1s\)\n  ⎿ Tests passed\n    14 tests\n    0 failed/);
-    assert.doesNotMatch(render(), /skill instructions|Arguments|FULL_OUTPUT_TAIL|Ran 1 shell command/);
+    assert.match(render(), /Reading 1 file, running 1 shell command/);
+    assert.doesNotMatch(render(), /skill instructions|Arguments|FULL_OUTPUT_TAIL/);
+    f.terminal.onInput("\t"); f.terminal.onInput(" ");
+    assert.match(render(), /Read\(\/skills\/frontend-design\/SKILL.md\)/);
+    assert.doesNotMatch(render(), /skill instructions/);
     f.terminal.onInput("\t"); f.terminal.onInput(" ");
     assert.match(render(), /skill instructions that should stay hidden/);
-    // Durable replaces projected message objects on each update; the call ID owns expansion.
+    // Durable replaces projected objects; expansion belongs to call identity.
     session.messages = JSON.parse(JSON.stringify(session.messages));
     session.messages.at(-2)!.tool!.status = "done";
     assert.match(render(), /skill instructions that should stay hidden/);
     const transcript = f.app.body.transcript;
-    const y = transcript.positions.get("run-tests")! + 2;
+    const y = transcript.positions.get("run-tests")!;
     transcript.handleMouse({ type: "click", button: "left", x: 5, y, screenX: 5, screenY: y, width: 120, height: 32, shift: false, ctrl: false, alt: false });
     assert.match(render(), /Arguments[^]*FULL_OUTPUT_TAIL/);
     f.terminal.onInput("/collapse"); f.terminal.onInput("\r");
-    assert.match(render(), /Bash\(npm test\) \(1\.1s\)[^]*Tests passed/);
-    assert.doesNotMatch(render(), /skill instructions|Arguments|FULL_OUTPUT_TAIL|Ran 1 shell command/);
+    assert.match(render(), /Read 1 file, ran 1 shell command/);
+    assert.doesNotMatch(render(), /skill instructions|Arguments|FULL_OUTPUT_TAIL/);
     f.terminal.onInput("/expand"); f.terminal.onInput("\r");
     assert.match(render(), /FULL_OUTPUT_TAIL/);
     for (const width of [10, 24, 50, 120]) assert.ok(f.app.body.render(width).every((line) => visibleWidth(line) <= width));
@@ -966,14 +968,14 @@ test("session shows working status until completion and resets timing on the nex
   try {
     f.c.send("slow task"); f.c.open();
     const session = f.c.opened!;
-    session.work!.startedAt = Date.now() - 3000;
+    session.work!.startedAt = Date.now() - 12000;
     const render = () => f.app.body.render(120).map(stripTerminalSequences).join("\n");
     assert.match(render(), /[✽✻✢∙] Working/);
     for (const width of [1, 4, 10, 24, 50, 120]) {
       assert.ok(f.app.body.render(width).every((line) => visibleWidth(line) <= width));
     }
     complete(); await tick();
-    assert.match(render(), /✻ Worked for 3s · done \d{1,2}:\d{2} [AP]M/);
+    assert.match(render(), /✽ Worked for 12s/);
     const finishedAt = session.work!.finishedAt;
     f.c.changed();
     assert.equal(session.work!.finishedAt, finishedAt);

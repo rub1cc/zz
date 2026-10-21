@@ -65,3 +65,49 @@ test("metadata changes persist, while changing streamed text alone does not", ()
   assert.equal(s.agent?.thinkingLevel, "high");
   assert.equal(project(view([...entries], live("c"), docs)), true, "history replacement invalidates even at the same length");
 });
+
+test("cached streaming calls preserve block order and identity through admission without rescanning history", () => {
+  const s = session(), project = createViewProjector(s), entries = [user];
+  const content = [{ type: "text", text: "Before" },
+    { type: "toolCall", id: "a", name: "read", arguments: { path: "a.ts" } },
+    { type: "thinking", thinking: "Between" },
+    { type: "toolCall", id: "b", name: "read", arguments: { path: "b.ts" } },
+    { type: "text", text: "After" }];
+  const message = { role: "assistant", timestamp: 2, content };
+  assert.equal(project(view(entries, { run, generation: { message } })), true);
+  const preparing = s.messages.filter(item => item.tool);
+  const ids = preparing.map(item => item.tool!.id);
+  assert.deepEqual(s.messages.map(item => item.role), ["user", "assistant", "tool", "thinking", "tool", "assistant"]);
+  assert.ok(preparing.every(item => item.tool!.preparing));
+  assert.equal(project(view(entries, { run, generation: { message: { ...message, content: [...content, { type: "text", text: "More" }] } } })), false);
+  assert.deepEqual(s.messages.filter(item => item.tool).map(item => item.tool!.id), ids);
+  const admitted = [...entries, { id: 2, model: [message] }];
+  assert.equal(project(view(admitted, { run })), true);
+  assert.deepEqual(s.messages.filter(item => item.tool).map(item => item.tool!.id), ids);
+  assert.ok(s.messages.filter(item => item.tool).every(item => !item.tool!.preparing));
+  assert.ok(preparing.every(item => item.tool!.preparing), "admission does not mutate earlier streamed snapshots");
+});
+
+test("cached execution order survives result commits and never mutates prior snapshots or the base cache", () => {
+  const s = session(), project = createViewProjector(s);
+  const entries = [{ id: 1, model: [{ role: "assistant", timestamp: 2, content: [
+    { type: "toolCall", id: "a", name: "read", arguments: { path: "a.ts" } },
+    { type: "toolCall", id: "b", name: "read", arguments: { path: "b.ts" } },
+  ] }] }];
+  const slots = (a: string, b: string) => [{ callId: "a", name: "read", status: a, taskId: 10 },
+    { callId: "b", name: "read", status: b, taskId: 11 }];
+  project(view(entries, { run, tools: slots("running", "pending") }));
+  const first = s.messages;
+  project(view(entries, { run, tools: slots("done", "running") }));
+  assert.deepEqual(s.messages.map(item => item.tool?.executionOrder), [1, 2]);
+  assert.equal(first[1]?.tool?.executionOrder, undefined);
+  const completed = [...entries, { id: 2, model: ["a", "b"].map(toolCallId => ({ role: "toolResult", timestamp: 3,
+    toolCallId, toolName: "read", content: [{ type: "text", text: "Done" }], isError: false })) }];
+  project(view(completed, { run, tools: slots("done", "done") }));
+  assert.deepEqual(s.messages.map(item => item.tool?.executionOrder), [1, 2]);
+  assert.ok(s.messages.every(item => item.tool?.status === "done"));
+  const previous = s.messages;
+  project(view(completed, { run: { ...run, taskId: 2 } }));
+  assert.deepEqual(s.messages.map(item => item.tool?.executionOrder), [undefined, undefined], "new runs do not inherit cached execution metadata");
+  assert.deepEqual(previous.map(item => item.tool?.executionOrder), [1, 2]);
+});

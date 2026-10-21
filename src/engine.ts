@@ -54,24 +54,57 @@ function imagesOf(message: ModelMessage, names: string[] = []): ImageAttachment[
   return images.length ? images : undefined;
 }
 
-function thinkingMessages(message: ModelMessage, id: string): Message[] {
-  if (message.role !== "assistant") return [];
-  return message.content.flatMap((block, index) => block.type === "thinking" ? [{ role: "thinking" as const,
-    text: block.redacted ? "Thinking was redacted by the provider." : block.thinking,
-    timestamp: message.timestamp, thinking: { id: `thinking:${id}:${index}`, ...(block.redacted ? { redacted: true } : {}) } }] : []);
+/** Preserve provider block order: prose and visible reasoning are activity boundaries. */
+function assistantMessages(message: Extract<ModelMessage, { role: "assistant" }>, id: string, busy: boolean, preparing: boolean, identity: (callId: string) => string): Message[] {
+  return message.content.flatMap((block, index): Message[] => {
+    if (block.type === "thinking") return [{ role: "thinking", text: block.redacted ? "Thinking was redacted by the provider." : block.thinking,
+      timestamp: message.timestamp, thinking: { id: `thinking:${id}:${index}`, ...(block.redacted ? { redacted: true } : {}) } }];
+    if (block.type === "text") return block.text ? [{ role: "assistant", text: block.text, timestamp: message.timestamp }] : [];
+    if (block.type === "toolCall") return [{ role: "tool", text: "", timestamp: message.timestamp, tool: {
+      id: identity(block.id), callId: block.id, name: block.name, arguments: block.arguments, output: "", status: busy ? "pending" : "interrupted",
+      ...(preparing ? { preparing: true } : {}),
+    } }];
+    return [];
+  });
+}
+
+const toolIdentities = new WeakMap<Session, { entries: Map<string, string>; streaming: Map<string, string>; generation?: string }>();
+const activityStarts = new WeakMap<Session, { run: number; sequence: number; calls: Map<string, number> }>();
+
+function projectAssistant(session: Session, message: Extract<ModelMessage, { role: "assistant" }>, id: string, preparing = false): Message[] {
+  let identities = toolIdentities.get(session);
+  if (!identities) { identities = { entries: new Map(), streaming: new Map() }; toolIdentities.set(session, identities); }
+  if (preparing && identities.generation !== id) {
+    identities.streaming.clear(); identities.generation = id;
+  }
+  return assistantMessages(message, id, false, preparing, (callId) => {
+    const key = `${id}:${callId}`;
+    if (preparing) {
+      const stable = identities.streaming.get(callId) ?? key;
+      identities.streaming.set(callId, stable);
+      return stable;
+    }
+    const existing = identities.entries.get(key);
+    if (existing) return existing;
+    const stable = identities.streaming.get(callId) ?? key;
+    identities.entries.set(key, stable); identities.streaming.delete(callId);
+    return stable;
+  });
 }
 
 interface ProjectedHistory {
   messages: Message[];
   open: Map<string, { index: number; message: Message }>;
+  calls: Map<string, { index: number; message: Message }>;
   error?: string;
   needsInput: boolean;
 }
 
-function projectHistory(entries: ConversationView["entries"], timestamp: number): ProjectedHistory {
+function projectHistory(session: Session, entries: ConversationView["entries"], timestamp: number): ProjectedHistory {
   const messages: Message[] = [];
   const calls = new Map<string, Message>();
   const open: ProjectedHistory["open"] = new Map();
+  const activity: ProjectedHistory["calls"] = new Map();
   let error: string | undefined;
   let needsInput = false;
   for (const entry of entries) {
@@ -120,7 +153,19 @@ function projectHistory(entries: ConversationView["entries"], timestamp: number)
         if (isQuestionTool(message.toolName) && !message.isError && text) messages.push({ role: "assistant", text, timestamp: message.timestamp });
         continue;
       }
-      messages.push(...thinkingMessages(message, String(entry.id)));
+      if (message.role === "assistant") {
+        const projected = projectAssistant(session, message, String(entry.id));
+        for (const card of projected) {
+          if (card.tool?.callId) {
+            calls.set(card.tool.callId, card);
+            const pending = { index: messages.length, message: card };
+            open.set(card.tool.callId, pending);
+            activity.set(card.tool.callId, pending);
+          }
+          messages.push(card);
+        }
+        continue;
+      }
       const data = entry.data as { imageNames?: unknown } | undefined;
       const imageNames = data && Array.isArray(data.imageNames) ? data.imageNames.filter((name): name is string => typeof name === "string") : [];
       const images = imagesOf(message, imageNames);
@@ -132,20 +177,9 @@ function projectHistory(entries: ConversationView["entries"], timestamp: number)
             output: loadedSkill.skill.text, status: "done",
           } });
       } else if (text || images) messages.push({ role: message.role, text, timestamp: message.timestamp, ...(images ? { images } : {}) });
-      if (message.role === "assistant") {
-        for (const call of message.content.filter((block) => block.type === "toolCall")) {
-          const card: Message = { role: "tool", text: "", timestamp: message.timestamp, tool: {
-            id: `${entry.id}:${call.id}`, name: call.name, arguments: call.arguments, output: "",
-            status: "interrupted",
-          } };
-          calls.set(call.id, card);
-          open.set(call.id, { index: messages.length, message: card });
-          messages.push(card);
-        }
-      }
     }
   }
-  return { messages, open, error, needsInput };
+  return { messages, open, calls: activity, error, needsInput };
 }
 
 /** The durable view preserves entry identity for live-only document updates. */
@@ -155,7 +189,7 @@ export function createViewProjector(session: Session, priorUsage?: Usage): (view
   let history: ProjectedHistory;
   return (view) => {
     const committed = view.entries !== previous?.entries;
-    if (committed) history = projectHistory(view.entries, session.updatedAt);
+    if (committed) history = projectHistory(session, view.entries, session.updatedAt);
     applyProjectedView(session, view, priorUsage, history);
     const persist = committed || session.status !== status
       || ["pi.agent", "pi.inbox", "pi.usage"].some((key) => view.docs[key] !== previous?.docs[key]);
@@ -166,7 +200,7 @@ export function createViewProjector(session: Session, priorUsage?: Usage): (view
 }
 
 export function applyView(session: Session, view: ConversationView, priorUsage?: Usage): void {
-  applyProjectedView(session, view, priorUsage, projectHistory(view.entries, session.updatedAt));
+  applyProjectedView(session, view, priorUsage, projectHistory(session, view.entries, session.updatedAt));
 }
 
 function applyProjectedView(session: Session, view: ConversationView, priorUsage: Usage | undefined, history: ProjectedHistory): void {
@@ -184,6 +218,16 @@ function applyProjectedView(session: Session, view: ConversationView, priorUsage
   });
   session.queuedInputs = queued.length ? queued : undefined;
   const live = view.docs["pi.live"] as LiveState | undefined;
+  let starts = activityStarts.get(session);
+  if (live?.run && starts?.run !== live.run.taskId) {
+    starts = { run: live.run.taskId, sequence: 0, calls: new Map() };
+    activityStarts.set(session, starts);
+  }
+  // Observe subscriptions, not paint frames: fast or parallel calls can settle between renders.
+  for (const slot of live?.tools ?? []) if (starts && (slot.status === "running" || slot.status === "done" && slot.taskId !== undefined) && !starts.calls.has(slot.callId)) {
+    starts.calls.set(slot.callId, ++starts.sequence);
+  }
+
   if (session.work?.finishedAt === undefined && session.work?.outputTokensStart !== undefined) {
     // Completed attempts move into the ledger atomically as their live partial disappears.
     session.work.outputTokens = Math.max(0, session.usage.output - session.work.outputTokensStart)
@@ -211,11 +255,24 @@ function applyProjectedView(session: Session, view: ConversationView, priorUsage
         ? { details: slot.details, diagnostics: slot.diagnostics } : undefined;
     }
   }
+  // Completed cards can acquire their observed order after their result commits.
+  // Overlay only this run's calls, without mutating or rescanning cached history.
+  for (const [id, order] of starts?.calls ?? []) {
+    const cached = history.calls.get(id);
+    if (!cached) continue;
+    let message = calls.get(id);
+    if (!message) {
+      message = { ...cached.message, tool: { ...cached.message.tool! } };
+      messages[cached.index] = message;
+    }
+    message.tool!.executionOrder = order;
+  }
   const partial = live?.generation?.message;
   if (partial) {
-    messages.push(...thinkingMessages(partial as ModelMessage, `live:${live?.run?.taskId ?? "generation"}`));
-    const text = partial.content.filter((b) => b.type === "text").map((b) => b.text).join("\n");
-    if (text) messages.push({ role: "assistant", text, timestamp: partial.timestamp });
+    const projected = projectAssistant(session, partial as Extract<ModelMessage, { role: "assistant" }>,
+      `live:${live?.run?.taskId ?? "generation"}:${live?.generation?.attempt ?? 0}:${partial.timestamp}`, true);
+    for (const message of projected) if (message.tool) message.tool.status = live?.run ? "pending" : "interrupted";
+    messages.push(...projected);
   }
   session.messages = messages;
   const tool = live?.tools?.find((t) => t.status !== "done");

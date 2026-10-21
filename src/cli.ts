@@ -12,7 +12,7 @@ import { Dashboard, scrollToEndIndicator } from "./ui.js";
 import { displayStatus } from "./model.js";
 import { loadPi } from "./pi.js";
 import { cancelExternalEditor, isExternalEditorOpen } from "./external-editor.js";
-import { statusRefreshInterval } from "./format.js";
+import { setStatusColors, statusRefreshInterval } from "./format.js";
 import { createShutdown } from "./shutdown.js";
 import { setDiffBackground } from "./diff-background.js";
 import { upgrade } from "./upgrade.js";
@@ -149,7 +149,10 @@ async function main(): Promise<void> {
     if (shutdown.isClosing) return;
     tui.start();
     const updateDiffBackground = (colors: TerminalColors) => {
-      if (shutdown.isClosing || !setDiffBackground(colors.background)) return;
+      if (shutdown.isClosing) return;
+      const diffChanged = setDiffBackground(colors.background);
+      const statusChanged = setStatusColors(colors);
+      if (!diffChanged && !statusChanged) return;
       app?.body.transcript.invalidate();
       tui?.requestRender();
     };

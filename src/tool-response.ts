@@ -1,12 +1,14 @@
-import { initTheme, renderDiff } from "@earendil-works/pi-coding-agent";
+import path from "node:path";
+import { homedir } from "node:os";
+import { getLanguageFromPath, highlightCode, initTheme, renderDiff } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { accent, bold, dim, fit, green, oneLine, plain, red, warning } from "./format.js";
 import type { ToolActivity } from "./model.js";
 import { shadeDiffRow } from "./diff-background.js";
 
-const bullet = "\u25cf";
+const bullet = "\u2022";
 const branch = "  \u23bf ";
-const previewLimit = 6;
+const previewLimit = 3;
 const shellPreviewLimit = 3;
 let diffThemeInitialized = false;
 
@@ -20,7 +22,7 @@ function resultDetails(tool: ToolActivity): RecordValue | undefined {
   return record(details?.result) ?? record(details?.details) ?? details;
 }
 
-function diagnostics(tool: ToolActivity): { severity?: unknown; message: string }[] {
+export function toolDiagnostics(tool: ToolActivity): { severity?: unknown; message: string }[] {
   const values = record(tool.details)?.diagnostics;
   return Array.isArray(values) ? values.flatMap((value) => {
     const item = record(value);
@@ -28,36 +30,56 @@ function diagnostics(tool: ToolActivity): { severity?: unknown; message: string 
   }) : [];
 }
 
-export function activityLabel(tool: ToolActivity, nameStyle = (name: string) => name): string {
+export function compactToolPath(value: unknown, cwd?: string): string {
+  const raw = typeof value === "string" ? plain(value).replaceAll("\\", "/") : "";
+  if (cwd && path.isAbsolute(raw)) {
+    const relative = path.relative(cwd, raw);
+    if (relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) return relative;
+  }
+  const home = homedir();
+  return raw === home ? "~" : raw.startsWith(home + "/") ? "~" + raw.slice(home.length) : raw;
+}
+
+export function activityLabel(tool: ToolActivity, nameStyle = (name: string) => name, cwd?: string): string {
   if (tool.name === "compact") return `${nameStyle("Context compacted")} (${oneLine(String(tool.arguments.reason ?? "manual"))})`;
   if (tool.name === "load_skill" && typeof tool.arguments.name === "string") return `${nameStyle("Skill")} ${oneLine(tool.arguments.name)}`;
-  const path = typeof tool.arguments.path === "string" ? tool.arguments.path.replaceAll("\\", "/") : "";
-  if (tool.name === "read" && /(^|\/)SKILL\.md$/i.test(path)) return `${nameStyle("Skill")} ${oneLine(path.split("/").at(-2) || "instructions")}`;
+  const targetPath = compactToolPath(tool.arguments.path, cwd);
   const names: Record<string, string> = { read: "Read", write: "Write", edit: "Update", bash: "Bash", powershell: "PowerShell",
     ask_user: "Ask user", ask_question: "Ask question", ask_multiple_questions: "Ask questions",
     task_create: "Create task", task_update: "Update tasks", task_list: "List tasks", task_get: "Get task" };
   const name = Object.hasOwn(names, tool.name) ? names[tool.name]! : tool.name;
   const target = isShellTool(tool)
     ? typeof tool.arguments.command === "string" ? oneLine(tool.arguments.command.split(/\r\n?|\n|\u2028|\u2029/, 1)[0] ?? "").trim() : ""
-    : path;
-  return `${nameStyle(oneLine(name))}${target ? `(${oneLine(target)})` : ""}`;
+    : targetPath;
+  const offset = typeof tool.arguments.offset === "number" ? tool.arguments.offset : undefined;
+  const limit = typeof tool.arguments.limit === "number" ? tool.arguments.limit : undefined;
+  const range = tool.name === "read" && (offset !== undefined || limit !== undefined)
+    ? `:${offset ?? 1}${limit === undefined ? "" : `-${(offset ?? 1) + limit - 1}`}` : "";
+  return `${nameStyle(oneLine(name))}${target ? `(${oneLine(target)}${range})` : ""}`;
 }
 
-function isTaskTool(tool: ToolActivity): boolean {
+export function isTaskTool(tool: ToolActivity): boolean {
   return ["task_create", "task_update", "task_list", "task_get"].includes(tool.name);
+}
+
+export function hiddenTask(tool: ToolActivity): boolean {
+  return isTaskTool(tool) && tool.status !== "error" && tool.status !== "interrupted"
+    && !tool.images?.length && !toolDiagnostics(tool).some(item => item.severity === "error" || item.severity === "warn");
 }
 
 export function isShellTool(tool: ToolActivity): boolean {
   return tool.name === "bash" || tool.name === "powershell";
 }
 
-/** Only routine, nonexceptional calls can disappear into an expandable group. */
+/** Failed inspections can group; interruption, warnings and retained-output limits cannot. */
 export function canGroupTool(tool: ToolActivity): boolean {
-  if (!["done", "running", "pending"].includes(tool.status) || tool.images?.length || diagnostics(tool).length
-    || record(resultDetails(tool)?.truncation)?.truncated || /<harness>[\s\S]*<\/harness>\s*$/.test(tool.output)) return false;
+  const remarks = toolDiagnostics(tool);
+  if (tool.preparing || tool.status === "interrupted" || tool.name !== "read" && tool.images?.length
+    || remarks.some(item => tool.status !== "error" || item.severity !== "error")
+    || record(resultDetails(tool)?.truncation)?.truncated
+    || /<harness>[\s\S]*<\/harness>\s*$/.test(tool.output) && !(tool.status === "error" && remarks.length)) return false;
   if (isShellTool(tool)) return typeof tool.arguments.command === "string" && !!tool.arguments.command.trim();
-  return tool.name === "read" && typeof tool.arguments.path === "string" && !!tool.arguments.path.trim()
-    && !/(^|[\\/])SKILL\.md$/i.test(tool.arguments.path);
+  return tool.name === "read" && typeof tool.arguments.path === "string" && !!tool.arguments.path.trim();
 }
 
 function textLines(text: string): string[] {
@@ -75,28 +97,21 @@ export function indentLines(lines: string[], width: number, first: string, rest 
   return lines.map((line, index) => fit(`${usePrefix ? index === 0 ? first : rest : ""}${line}`, width));
 }
 
-function literal(text: string, width: number, prefix: string, limit = Infinity, color = (s: string) => s): string[] {
+function literal(text: string, width: number, prefix: string, limit = Infinity, color = (s: string) => s, direction: "head" | "tail" = "head"): string[] {
   const indent = width > visibleWidth(prefix) ? prefix : "";
   const contentWidth = Math.max(1, width - visibleWidth(indent));
-  const lines: string[] = [];
-  const sources = textLines(text);
-  let more = false;
-  for (const [index, source] of sources.entries()) {
-    const wrapped = wrapTextWithAnsi(source, contentWidth);
-    const remaining = limit - lines.length;
-    const offset = lines.length;
-    for (const [i, line] of wrapped.slice(0, remaining).entries()) {
-      lines.push(`${indent === branch && offset + i > 0 ? " ".repeat(visibleWidth(indent)) : indent}${color(line)}`);
-    }
-    if (wrapped.length > remaining || lines.length >= limit && index < sources.length - 1) { more = true; break; }
-  }
-  if (more) lines.push(`${indent}${dim(fit("... more (/expand)", contentWidth))}`);
+  const visual = textLines(text).flatMap(line => wrapTextWithAnsi(line, contentWidth));
+  const hidden = Math.max(0, visual.length - limit);
+  const selected = !hidden ? visual : direction === "tail" ? visual.slice(-limit) : visual.slice(0, limit);
+  const hint = dim(fit(`... +${hidden} ${direction === "tail" ? "earlier " : ""}line${hidden === 1 ? "" : "s"} (/expand)`, contentWidth));
+  const rows = hidden ? direction === "tail" ? [hint, ...selected.map(color)] : [...selected.map(color), hint] : selected.map(color);
+  const lines = rows.map((line, i) => `${i && indent === branch ? " ".repeat(indent.length) : indent}${line}`);
   return lines;
 }
 
-function outputText(tool: ToolActivity): string {
+export function toolOutput(tool: ToolActivity): string {
   // SDK diagnostics are appended to model-visible output too; render the structured version once instead.
-  return diagnostics(tool).length ? tool.output.replace(/(?:\n)?<harness>\n[^]*\n<\/harness>$/, "") : tool.output;
+  return toolDiagnostics(tool).length ? tool.output.replace(/(?:\n)?<harness>\n[^]*\n<\/harness>$/, "") : tool.output;
 }
 
 function diffText(tool: ToolActivity): string | undefined {
@@ -113,11 +128,33 @@ function appliedEdits(tool: ToolActivity): { oldText: string; newText: string }[
   });
 }
 
-function renderCodeChanges(tool: ToolActivity, width: number): string[] {
+function highlightSource(text: string, filePath: unknown): string[] {
+  const source = textLines(text).join("\n");
+  const language = typeof filePath === "string" ? getLanguageFromPath(filePath) : undefined;
+  if (!language || process.env.NO_COLOR !== undefined) return source.split("\n");
+  try { if (!diffThemeInitialized) { initTheme(); diffThemeInitialized = true; } return highlightCode(source, language); }
+  catch { return source.split("\n"); }
+}
+
+function sourceRows(text: string, width: number, filePath: unknown, limit = Infinity, numbered = false): string[] {
+  const prefix = width > 4 ? "    " : "";
+  const rows = highlightSource(text, filePath).flatMap((line, i) =>
+    wrapTextWithAnsi(`${numbered ? String(i + 1).padStart(3) + " " : ""}${line}`, Math.max(1, width - prefix.length)));
+  if (!text) return [];
+  const selected = rows.slice(0, limit).map(line => prefix + line);
+  if (rows.length > limit) selected.push(fit(prefix + dim(`... +${rows.length - limit} lines (/expand)`), width));
+  return selected;
+}
+
+function diffRows(rows: string[], width: number, expanded: boolean): string[] {
+  if (rows.length <= 24) return rows;
+  return [...(expanded ? rows : rows.slice(0, 24)), fit(dim(`    (${expanded ? "click to collapse" : `${rows.length - 24} more rows; click or /expand`})`), width)];
+}
+
+function renderCodeChanges(tool: ToolActivity, width: number, expanded: boolean, codeExpanded: boolean): string[] {
   if (tool.status !== "done") return [];
   if (tool.name === "write" && typeof tool.arguments.content === "string") {
-    const content = textLines(tool.arguments.content).map((line, i) => `${String(i + 1).padStart(3)} ${line}`).join("\n");
-    return literal(content, width, "    ");
+    return sourceRows(tool.arguments.content, width, tool.arguments.path, expanded ? Infinity : 3, true);
   }
   if (tool.name !== "edit") return [];
   const diff = diffText(tool);
@@ -128,7 +165,7 @@ function renderCodeChanges(tool: ToolActivity, width: number): string[] {
     // Sanitize source before Pi renders it, then retain its generated ANSI through wrapping.
     const rendered = renderDiff(sources.join("\n"), { filePath: typeof tool.arguments.path === "string" ? tool.arguments.path : undefined });
     const indent = width > 4 ? "    " : "";
-    return rendered.split("\n").flatMap((line, index) => {
+    const rows = rendered.split("\n").flatMap((line, index) => {
       // Pi's word matcher can normalize whitespace; never change the SDK's displayed source.
       const source = sources[index]!;
       const styled = plain(line) === source ? line : renderDiff(source);
@@ -137,20 +174,19 @@ function renderCodeChanges(tool: ToolActivity, width: number): string[] {
       return wrapTextWithAnsi(styled, contentWidth)
         .map((row) => `${indent}${shadeDiffRow(row, contentWidth, change)}`);
     });
+    return diffRows(rows, width, codeExpanded);
   }
   // Older histories may lack SDK diff metadata. Show confirmed replacement fragments,
   // not invented file context, line numbers, or diffstats.
-  return appliedEdits(tool).flatMap((edit, i) => [
+  return diffRows(appliedEdits(tool).flatMap((edit, i) => [
     ...literal(`Applied replacement ${i + 1} (line numbers unavailable)`, width, "    ", Infinity, dim),
     ...textLines(edit.oldText).flatMap((line) => literal(`- ${line}`, width, "    ", Infinity, red)),
     ...textLines(edit.newText).flatMap((line) => literal(`+ ${line}`, width, "    ", Infinity, green)),
-  ]);
+  ]), width, codeExpanded);
 }
 
 function summary(tool: ToolActivity, output: string): string {
-  if (tool.status === "pending") return `Pending...${isShellTool(tool) ? " (/expand)" : ""}`;
-  if (tool.status === "running") return `Running...${isShellTool(tool) ? " (/expand)" : ""}`;
-  if (tool.status === "error") return "Error (/expand)";
+  if (tool.preparing || tool.status === "pending" || tool.status === "running" || tool.status === "error") return "";
   if (tool.status === "interrupted") return "Interrupted; completion not confirmed. (/expand)";
   if (tool.name === "compact") return "Summary available (/expand)";
   if (tool.name === "task_update" && Array.isArray(tool.arguments.operations)) {
@@ -161,7 +197,7 @@ function summary(tool: ToolActivity, output: string): string {
   if (tool.name === "load_skill" || activityLabel(tool).startsWith("Skill ")) return "Skill instructions loaded (/expand)";
   if (tool.name === "read") {
     if (tool.images?.length) return `Read ${tool.images.length} image${tool.images.length === 1 ? "" : "s"}`;
-    return `Read ${linesLabel(countLines(output))}${record(resultDetails(tool)?.truncation)?.truncated ? " (truncated)" : ""}`;
+    return record(resultDetails(tool)?.truncation)?.truncated ? `Read ${linesLabel(countLines(output))} (truncated)` : "";
   }
   if (tool.name === "write" && typeof tool.arguments.content === "string") return `Wrote ${linesLabel(countLines(tool.arguments.content))}`;
   if (tool.name === "edit") {
@@ -179,32 +215,35 @@ function summary(tool: ToolActivity, output: string): string {
   return output ? "" : tool.images?.length ? `Returned ${tool.images.length} image${tool.images.length === 1 ? "" : "s"}` : "Done (no text output).";
 }
 
-export function renderToolResponse(tool: ToolActivity, width: number, expanded: boolean, selected: boolean): string[] {
+export interface ToolRenderOptions { cwd?: string; codeExpanded?: boolean }
+
+export function renderToolResponse(tool: ToolActivity, width: number, expanded: boolean, selected: boolean, options: ToolRenderOptions = {}): string[] {
   width = Math.max(1, width);
   const failed = tool.status === "error" || tool.status === "interrupted";
-  const color = failed ? warning : tool.status === "done" ? green : accent;
+  const color = failed ? red : tool.status === "done" ? (s: string) => s : accent;
   const marker = selected ? accent(">") : color(bullet);
-  const output = outputText(tool);
+  const output = toolOutput(tool);
   const shell = isShellTool(tool);
   const label = summary(tool, output);
   const duration = tool.durationMs === undefined ? "" : tool.durationMs < 1000 ? ` (${Math.round(tool.durationMs)}ms)` : ` (${(tool.durationMs / 1000).toFixed(1)}s)`;
   const headingWidth = Math.max(1, width - (width > 2 ? 2 : 0));
-  const title = shell
-    ? fit(activityLabel(tool, bold), Math.max(1, headingWidth - visibleWidth(duration))) + dim(duration)
-    : activityLabel(tool, bold) + (!label ? dim(duration) : "");
+  const state = tool.preparing ? "preparing..." : tool.status === "pending" ? "waiting..."
+    : tool.status === "running" ? "running..." : tool.status === "error" ? "Failed" : "";
+  const timing = shell || !label ? dim(duration) : "";
+  const nameWidth = visibleWidth(activityLabel({ ...tool, arguments: {} }));
+  const stateWidth = Math.max(0, headingWidth - visibleWidth(timing) - Math.min(headingWidth, nameWidth + 4));
+  const suffix = (state ? fit((failed ? red : dim)(` · ${state}`), stateWidth) : "") + timing;
+  const title = fit(activityLabel(tool, bold, options.cwd), Math.max(1, headingWidth - visibleWidth(suffix))) + suffix;
   const lines = indentLines([fit(title, headingWidth)], width, `${marker} `);
-  if (label) lines.push(...literal(`${label}${shell ? "" : duration}`, width, branch, Infinity, failed ? warning : dim));
+  if (label) lines.push(...literal(`${label}${shell ? "" : duration}`, width, branch, Infinity, failed ? red : dim));
   const previewPrefix = label ? "    " : branch;
   const skill = tool.name === "load_skill" || activityLabel(tool).startsWith("Skill ");
   const question = ["ask_user", "ask_question", "ask_multiple_questions"].includes(tool.name);
-  for (const line of renderCodeChanges(tool, width)) lines.push(line);
+  for (const line of renderCodeChanges(tool, width, expanded, options.codeExpanded ?? true)) lines.push(line);
   if (!expanded) {
     if (shell) {
-      if (tool.status === "done" && plain(output).trim()) {
-        lines.push(...literal(output, width, branch, shellPreviewLimit, dim));
-      } else if (tool.status === "error" && !diagnostics(tool).length && output) {
-        lines.push(...indentLines([warning(fit(oneLine(textLines(output)[0] ?? ""), Math.max(1, width - (width > 4 ? 4 : 0))))], width, "    "));
-      }
+      if (tool.status !== "pending" && plain(output).trim()) lines.push(...literal(output, width, branch, shellPreviewLimit, failed ? red : dim, "tail"));
+      else if (tool.status !== "pending") lines.push(...literal("No output", width, branch, Infinity, dim));
     } else if ((failed || !["read", "write", "edit", "compact"].includes(tool.name) && !skill && !question && !isTaskTool(tool)) && output) {
       lines.push(...literal(output, width, previewPrefix, previewLimit));
     }
@@ -214,12 +253,14 @@ export function renderToolResponse(tool: ToolActivity, width: number, expanded: 
         ...literal(text, width, "    ", Infinity, shell && title === "Output" && !failed ? dim : (s) => s));
     };
     if (Object.keys(tool.arguments).length) section("Arguments", JSON.stringify(tool.arguments, null, 2));
-    section("Output", output || (tool.status === "pending" || tool.status === "running" ? "Waiting for output..." : "No text output."));
+    if (tool.name === "read" && !failed && output) {
+      lines.push(...literal("Output", width, "    ", Infinity, dim), ...sourceRows(output, width, tool.arguments.path));
+    } else section("Output", output || (tool.status === "pending" || tool.status === "running" ? "Waiting for output..." : "No text output."));
     const details = JSON.stringify(tool.details, (_key, value) => value && typeof value === "object"
       && Object.keys(value).length === 0 ? undefined : value, 2);
     if (details && details !== "{}") section("Details", details);
   }
-  const remarks = diagnostics(tool);
+  const remarks = toolDiagnostics(tool);
   const exceptional = (remark: { severity?: unknown }) => remark.severity === "error" || remark.severity === "warn";
   const visibleRemarks = expanded ? remarks : [...remarks.filter(exceptional), ...remarks.filter((remark) => !exceptional(remark))].slice(0, 2);
   for (const diagnostic of visibleRemarks) {
