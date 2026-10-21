@@ -62,7 +62,8 @@ export class UndoDialog implements Component, Focusable {
   render(width: number): string[] {
     this.rebuild();
     const inner = Math.max(1, width - 4);
-    const lines = [bold("Restore a checkpoint"), dim("Restore conversation and tracked files to BEFORE the selected prompt."), "",
+    const lines = [bold("Restore a checkpoint"), dim("Restore conversation and tracked files to BEFORE the selected prompt."),
+      ...(this.controller.session(this.dialog.sessionId)?.workspaceUndoBoundary ? [warning("Only turns since the last workspace switch can be restored.")] : []), "",
       ...this.input.render(inner), ""];
     this.listTop = lines.length + 1;
     const list = this.list.render(inner);

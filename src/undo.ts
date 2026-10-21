@@ -9,7 +9,7 @@ import type { UndoCheckpoint } from "./model.js";
 
 const ctx = BACKGROUND_CONTEXT;
 export type UndoPoint = { id: string; run: number; at?: number; prompt: string; timestamp?: number };
-export const UndoDoc = defineDoc<{ points: UndoPoint[]; restoring?: boolean; restoreTo?: string }>({
+export const UndoDoc = defineDoc<{ points: UndoPoint[]; restoring?: boolean; restoreTo?: string; boundary?: number }>({
   kind: "zz.undo", version: 1, scope: "conversation", history: "latest", fork: "current",
   initial: () => ({ points: [] }),
 });
@@ -66,7 +66,7 @@ function same(a: FileVersion | null, b: FileVersion | null): boolean {
 export class UndoHistory {
   harness!: Harness;
   readonly root: string;
-  constructor(root: string) {
+  constructor(root: string, private readonly workspaceRoots: () => readonly string[] = () => []) {
     this.root = join(realpathSync(root), "undo");
     mkdirSync(this.root, { recursive: true, mode: 0o700 });
   }
@@ -94,7 +94,11 @@ export class UndoHistory {
           const absolute = await env.absolutePath(path, writeContext);
           if (!absolute.ok) return absolute;
           const target = absolute.value;
-          if (target === dirname(this.root) || target.startsWith(`${dirname(this.root)}/`)) {
+          const inStorage = target === dirname(this.root) || target.startsWith(`${dirname(this.root)}/`);
+          // Managed checkouts live beside durable state, but are editable source, not session storage.
+          const inWorkspace = this.workspaceRoots().some((root) => target.startsWith(`${root}/`)
+            && target !== join(root, ".git") && !target.startsWith(`${join(root, ".git")}/`));
+          if (inStorage && !inWorkspace) {
             throw new Error("Agent file edits may not overwrite zz's own session storage.");
           }
           const before = version(target);
@@ -179,7 +183,7 @@ export class UndoHistory {
     const result: UndoCheckpoint[] = [];
     const files = new Set<string>();
     let shell = false;
-    for (let index = points.length - 1; index >= 0; index--) {
+    for (let index = points.length - 1; index >= (state?.boundary ?? 0); index--) {
       const point = points[index]!;
       const journal = this.read(point);
       for (const file of journal.files) files.add(file.path);

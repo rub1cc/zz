@@ -23,6 +23,7 @@ export function composerCommands(session: boolean, selectedSession = false): Sla
     { name: "skills", description: "Find and load a skill" },
     { name: "settings", description: "Configure replies, model, reasoning and auto-compaction" },
     { name: "projects", description: "Manage project directories" },
+    { name: "workspace", description: session ? "Inspect this session's checkout" : "Choose main, new worktree, or existing workspace" },
     { name: "login", description: "Sign in to a provider (credentials shared with Pi)" },
     { name: "logout", description: "Remove stored provider credentials from zz and Pi" },
     ...(session || selectedSession ? [

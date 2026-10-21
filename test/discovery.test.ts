@@ -17,7 +17,7 @@ function provider(cwd: string, session = false, commands = true, selectedSession
 test("slash discovery filters available commands and excludes later draft lines and peek commands", async () => {
   const p = provider(process.cwd());
   const all = await suggestions(p, "/");
-  assert.deepEqual(all?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "projects", "login", "logout", "help"]);
+  assert.deepEqual(all?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "projects", "workspace", "login", "logout", "help"]);
   assert.equal((await suggestions(p, "/th"))?.items[0]?.value, "thinking");
   assert.equal(await suggestions(p, "/copy"), null);
   assert.equal((await suggestions(provider(process.cwd(), true), "/copy"))?.items[0]?.value, "copy");
@@ -26,7 +26,7 @@ test("slash discovery filters available commands and excludes later draft lines 
   assert.equal(await suggestions(p, "draft\n/mo"), null);
   assert.equal(await suggestions(provider(process.cwd(), true, false), "/mo"), null);
   const selected = await suggestions(provider(process.cwd(), false, true, true), "/");
-  assert.deepEqual(selected?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "projects", "login", "logout", "answer", "copy", "session", "tasks", "compact", "undo", "stop", "help"]);
+  assert.deepEqual(selected?.items.map((i) => i.value), ["model", "thinking", "skills", "settings", "projects", "workspace", "login", "logout", "answer", "copy", "session", "tasks", "compact", "undo", "stop", "help"]);
   const open = await suggestions(provider(process.cwd(), true), "/");
   assert.deepEqual(open?.items.map((i) => i.value), [...selected!.items.map((i) => i.value), "top", "bottom", "expand", "collapse"]);
   assert.deepEqual(composerCommands(true).filter((c) => !composerCommands(false, true).some((base) => base.name === c.name)).map((c) => c.name), ["top", "bottom", "expand", "collapse"]);

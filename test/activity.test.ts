@@ -72,3 +72,46 @@ test("failed question tool results do not display an unanswered chat question or
     assert.equal(s.messages[0]?.tool?.status, "error");
   }
 });
+
+test("projection retains interleaved prose/thinking/call boundaries and streaming call identity", () => {
+  const session: Session = { id: "ordered", projectId: "/project", title: "Order", status: "working", preview: "", createdAt: 1, updatedAt: 1, messages: [] };
+  const content = [
+    { type: "text", text: "Before" }, { type: "toolCall", id: "a", name: "read", arguments: { path: "a.ts" } },
+    { type: "thinking", thinking: "Between" }, { type: "toolCall", id: "b", name: "read", arguments: { path: "b.ts" } },
+    { type: "text", text: "After" },
+  ];
+  const message = { role: "assistant", content, timestamp: 2 };
+  applyView(session, { entries: [], docs: { "pi.live": { run: { taskId: 1, inputs: [1] }, generation: { message } } } } as unknown as ConversationView);
+  assert.deepEqual(session.messages.map(m => m.role), ["assistant", "tool", "thinking", "tool", "assistant"]);
+  const ids = session.messages.flatMap(m => m.tool ? [m.tool.id] : []);
+  assert.ok(session.messages.filter(m => m.tool).every(m => m.tool?.preparing));
+  applyView(session, { entries: [{ id: 5, model: [message] }], docs: { "pi.live": { run: { taskId: 1, inputs: [1] } } } } as unknown as ConversationView);
+  assert.deepEqual(session.messages.flatMap(m => m.tool ? [m.tool.id] : []), ids);
+  assert.ok(session.messages.filter(m => m.tool).every(m => !m.tool?.preparing));
+  assert.deepEqual(session.messages.map(m => m.role), ["assistant", "tool", "thinking", "tool", "assistant"]);
+});
+
+test("presentation identity remains unique when providers reuse native call IDs", () => {
+  const session: Session = { id: "repeated", projectId: "/project", title: "Repeated", status: "completed", preview: "", createdAt: 1, updatedAt: 1, messages: [] };
+  const call = { role: "assistant", timestamp: 2, content: [{ type: "toolCall", id: "same", name: "read", arguments: { path: "a.ts" } }] };
+  const result = { role: "toolResult", timestamp: 3, toolCallId: "same", toolName: "read", content: [{ type: "text", text: "source" }] };
+  applyView(session, { entries: [{ id: 1, model: [call] }, { id: 2, model: [result] }, { id: 3, model: [call] }, { id: 4, model: [result] }], docs: {} } as unknown as ConversationView);
+  assert.equal(new Set(session.messages.flatMap(m => m.tool ? [m.tool.id] : [])).size, 2);
+});
+
+test("execution order is observed at projection time, not at completion or paint time", () => {
+  const session: Session = { id: "starts", projectId: "/project", title: "Starts", status: "working", preview: "", createdAt: 1, updatedAt: 1, messages: [] };
+  const entries = [{ id: 1, model: [{ role: "assistant", timestamp: 2, content: [
+    { type: "toolCall", id: "a", name: "read", arguments: { path: "a.ts" } },
+    { type: "toolCall", id: "b", name: "read", arguments: { path: "b.ts" } },
+  ] }] }];
+  const view = (a: string, b: string) => ({ entries, docs: { "pi.live": { run: { taskId: 1, inputs: [1] }, tools: [
+    { callId: "a", name: "read", status: a, taskId: 10 }, { callId: "b", name: "read", status: b, taskId: 11 },
+  ] } } } as unknown as ConversationView);
+  applyView(session, view("running", "pending"));
+  applyView(session, view("running", "running"));
+  applyView(session, view("running", "done"));
+  applyView(session, view("done", "done"));
+  const orders = session.messages.flatMap(m => m.tool ? [m.tool.executionOrder] : []);
+  assert.deepEqual(orders, [1, 2]);
+});

@@ -34,6 +34,12 @@ export interface ModelOption extends ModelRef {
 export interface ImageAttachment extends ImageContent { name?: string }
 
 export interface ToolActivity {
+  /** Arguments are still being generated; never an execution claim. */
+  preparing?: boolean;
+  /** View-only observed execution order within the current durable run. */
+  executionOrder?: number;
+  /** Native ID for pairing live slots; presentation IDs remain unique across entries. */
+  callId?: string;
   images?: ImageAttachment[];
   id: string;
   name: string;
@@ -83,8 +89,29 @@ export type SessionStatus = "working" | "needs-input" | "completed" | "failed" |
 export interface Project {
   id: string;
   path: string;
+  workspaceDefault?: WorkspaceSelection;
   /** Manual dashboard order; newly created sessions appear before these IDs. */
   sessionOrder?: string[];
+}
+
+export type WorkspaceSelection = { kind: "new"; baseRef: string } | { kind: "main" }
+  | { kind: "existing"; workspaceId: string };
+
+export interface Workspace {
+  id: string;
+  projectId: string;
+  /** Retained when a project is removed from the dashboard. */
+  projectPath: string;
+  path: string;
+  kind: "main" | "worktree";
+  managed: boolean;
+  status: "pending" | "ready" | "failed";
+  checkoutPath?: string;
+  repositoryRoot?: string;
+  branch?: string;
+  baseRef?: string;
+  baseCommit?: string;
+  error?: string;
 }
 
 export interface Message {
@@ -146,6 +173,10 @@ export interface Session {
   queuedInputs?: { id: number; text: string; mode?: ReplyBehavior; imageCount?: number }[];
   agent?: AgentSettings;
   projectId: string;
+  workspaceId?: string;
+  /** Presentation caches; the durable zz.workspace document is authoritative. */
+  workspaceSwitch?: { id: string; phase: "approval" | "preparing" | "ready" | "bound"; workspaceId: string; path: string };
+  workspaceUndoBoundary?: boolean;
   title: string;
   /** Protects explicitly saved names from pending automatic title generation. */
   titleRenamed?: boolean;
@@ -182,9 +213,10 @@ export function markStopped(session: Session, now = Date.now()): void {
 }
 
 export interface State {
-  version: 1;
+  version: 1 | 2;
   projects: Project[];
   sessions: Session[];
+  workspaces?: Workspace[];
   selectedProjectId?: string;
   defaults?: AgentSettings;
   settings?: AppSettings;

@@ -167,11 +167,10 @@ files. Coding-agent extensions and MCP remain disabled.
   agent's `read` tool now uses the image processor for resizing/conversion.
   Text-only models report an error instead of silently discarding attachments.
 - Provider thinking appears in **Thinking** blocks, including during streaming;
-  empty non-redacted blocks are omitted. Thinking between grouped routine tool
-  calls stays inside the group and appears in its original position on expansion.
-  Standalone blocks still support click/keyboard expansion; grouped reasoning uses
-  the group's controls. `/expand` and `/collapse` also apply. **Show reasoning** in
-  `/settings` shows/hides all thinking blocks without affecting tool grouping and
+  empty non-redacted blocks are omitted. Visible thinking separates activity
+  groups; hiding it lets adjacent routine calls group across reasoning.
+  Standalone blocks support click/keyboard expansion. `/expand` and `/collapse`
+  also apply. **Show reasoning** in `/settings` shows/hides thinking and
   saves that global display preference. It does **not** change
   the model's thinking level; `/thinking` opens the level picker.
   Redacted thinking gets a placeholder; opaque signatures are never displayed or
@@ -249,6 +248,99 @@ npm run dev -- --model openai/gpt-5.4 --thinking high
   notice. Clipboard access uses Pi's official clipboard helper and its platform
   fallbacks.
 
+## Workspaces And Worktrees
+
+New coding tasks in Git projects get their own worktree by default. Each task
+starts from the current committed `HEAD`, on a branch such as
+`zz/fix-auth-a1b2c3d4`. Tasks outside Git use the project directory instead.
+Existing sessions keep their original directories and conversations unless you
+explicitly ask the agent to switch workspace.
+
+The dashboard shows the workspace choice above the composer and worktree labels
+beside session titles. Open `/workspace` before sending a task to choose:
+
+- **New worktree**: a separate checkout for each new session.
+- **Main checkout**: work directly in the project directory.
+- **Existing workspace**: share a checkout with another conversation.
+- **Register existing worktree**: add a Git worktree belonging to this repository.
+
+The choice is saved for that project and applies only to new sessions. Shortcuts
+on the dashboard are `/workspace main`, `/workspace new [base-ref]`, and
+`/workspace add PATH`. Base refs can be local branches, tags, commits, or existing
+remote-tracking refs; zz does not fetch automatically. Inside a session,
+`/workspace` shows its directory, ownership, and sharing, and can make that
+workspace the default for new sessions without moving the current conversation.
+
+New worktrees contain committed files, not the main checkout's uncommitted edits,
+untracked files, ignored `.env` files, or installed dependencies. Initialize
+submodules and install dependencies yourself in the workspace when needed; this
+version does not run setup hooks or copy local configuration automatically.
+Skills, instructions, file completion, image references, tools, and session shell
+commands use the session's workspace. Before a new checkout exists, dashboard
+completion and skill discovery use the project directory. For projects rooted in
+a repository subfolder, the session keeps that same relative subfolder in its
+new worktree.
+
+Checkout preparation is saved before Git creation and can recover after restart.
+Failed preparation does not run the agent in the main checkout: fix the reported
+Git problem, then reply to retry the same checkout. An established checkout that
+is missing must be restored at its original path or replaced by a new session;
+it is not silently recreated, since local work might be missing.
+
+Multiple sessions may share a workspace; their file changes are shared too.
+`/undo` waits for work in that directory, not every session in the project.
+Deleting sessions or removing projects never removes worktrees or branches.
+Unreferenced workspaces remain selectable in `/workspace`. Review and merge work
+with Git; automatic merge, worktree removal, and cleanup policies are not included.
+Worktrees separate files and branches, but are not security sandboxes.
+
+### Agent Workspace Handoffs
+
+Ask the agent to "create a worktree for this fix and continue there", "use the
+existing review workspace", or "return to the main checkout". The conversation,
+title, model, and checklist stay with the same session. The agent has three tools:
+
+- `workspace_list`: inspect the current binding and registered alternatives,
+  including branch, availability, local changes, and session sharing. Results are
+  paginated with `cursor` and `limit` (25 by default, at most 50).
+- `workspace_enter`: pass `create: { baseRef: "main" }` to create and enter a
+  worktree, optionally naming `branch`, or pass `workspaceId` from the list to
+  enter an existing one. The default creation base is committed local `HEAD`.
+- `workspace_exit`: return to the project's main directory, keeping the checkout,
+  branch, and edits you left behind. Already being in main is a no-op.
+
+Creation is only allowed from the main workspace. A session already in a worktree
+can enter an existing workspace or return to main, but cannot create another new
+one directly. Use another session for independent work. Existing worktrees must
+belong to this project and be registered first with `/workspace add PATH`.
+
+Entry into a zz-managed workspace is automatic. Entry into an external worktree
+waits for explicit approval, without another model request. Open `/workspace` in
+that session and choose Approve or Deny, or use `/workspace approve` or
+`/workspace deny`. The destination and instruction-loading scope are shown before
+you decide. Ordinary chat replies do not count as approval. A denial keeps the
+session in its original checkout. Approval requests survive restart; `/stop`
+cancels the request.
+
+Switch tools must be called alone in their tool round. zz prepares and validates
+the destination, waits for that round to settle, and commits the conversation's
+working directory and workspace binding together. It then ends the turn and
+continues automatically. Already queued replies resume in order in the new
+workspace; otherwise zz admits one deduplicated internal continuation. Tools,
+instructions, skills, completion, and direct shell all follow the new binding.
+The process-wide working directory never changes.
+
+No edits are copied, stashed, merged, or deleted. If an accepted handoff fails,
+zz keeps the previous checkout and withdraws queued replies rather than running
+them there accidentally; inspect the reported error and resend after fixing it.
+A stop after the new binding committed leaves the session in that destination,
+but cancels further work. Direct shell, undo, and manual compaction cannot overlap
+a handoff for that session or a conflicting restore.
+
+Each switch creates an **undo boundary**: `/undo` offers only turns after the most
+recent switch. Earlier conversation history, checkpoints, and file changes remain
+intact, including when you later return to the same checkout.
+
 ## Direct Shell
 
 - Start a task/reply with `!` to execute the remainder directly, for example
@@ -257,7 +349,9 @@ npm run dev -- --model openai/gpt-5.4 --thinking high
   adds a newline before sending.
 - Uses the open session, the dashboard-selected session, or the session in an
   existing peek. From a project heading, creates and opens a normal local session
-  for its response, without starting an agent. The process-wide working directory
+  for its response, without starting an agent. Existing sessions use their workspace;
+  a project-only shell uses the main directory or the selected existing workspace,
+  without creating a new worktree. The process-wide working directory
   never changes. A `!` elsewhere in ordinary prompt text is not a shell shortcut.
 - Plain stdout/stderr streams **inline as an expanded response**, with the command,
   working directory, and exit code/error. No shell popup opens. Normal transcript
@@ -518,123 +612,110 @@ only the three tools. A compatibility handler retains old `task_create` executio
 and single-task `task_update` arguments for interrupted calls, with old replay
 receipts preserved. No separate create or delete tool is advertised.
 
-Task tool cards remain in activity history, with raw data hidden until expansion;
-errors remain visible. Checklist entries record agent-reported progress, not
+Successful task-tool rows are hidden from the interactive transcript, including
+global expansion, without splitting activity groups. Failures, warning diagnostics
+and image artifacts remain visible; saved records remain unchanged. `/tasks` and
+the live checklist remain the task controls. Checklist entries record agent-reported progress, not
 independent proof of test success, and may contain sensitive project information.
 
 ## Compact Activity
 
-The conversation uses `❯` for user prompts, `●` for assistant replies and tool
-headings, and `⎿` for results. Only tool names are bold; commands, file paths and
-other heading details use normal weight. Sent user prompts use literal text on a full-width
-light-grey background with dark text, including wrapped and blank lines. Assistant
-replies keep the terminal background and Markdown formatting, including code
-fences, lists and tables. Tool calls
-and results stay paired in one compact block, updating in place while running.
+The conversation uses `❯` for literal user prompts, `●` for assistant Markdown,
+small `•` dots for tool headings, and `⎿` output gutters. Only tool names are bold.
+User prompts keep their full-width light-grey background; assistant/tool output
+keeps the terminal background.
+
+During a run, routine reads and shell calls share a replace-in-place preview:
 
 ```text
-❯ Fix greet() for empty names and add a test.
+❯ Fix authentication and run its tests.
 
-● I'll check the function and add a test.
+● I'll inspect authentication first.
 
-● Read(src/greet.ts)
-  ⎿ Read 3 lines
+  Reading auth.ts
+  ⎿ /project/src/auth.ts
 
-● Update(src/greet.ts)
-  ⎿ Added 1 line, removed 1 line
-     1 export function greet(name: string) {
-    -2   return name;
-    +2   return name.trim() || "World";
-     3 }
-
-● Write(src/greet.test.ts)
-  ⎿ Wrote 3 lines
-      1 test("empty names", () => {
-      2   expect(greet("")).toBe("World");
-      3 });
-
-● Bash(npm test -- --run)
-  ⎿ 1 test passed
-
-● Fixed empty names and added a regression test. Tests: 1 passed.
+✽ Working (3s)
 ```
 
-Edit diffs come from the SDK result, not guessed changes, and use Pi's public
-`renderDiff()` with its default system theme: green additions, red removals, and
-inverse highlighting of changed words in single-line replacement pairs when color
-is enabled. Colors and word highlights survive wrapped continuation rows. If Pi's
-word matcher changes whitespace, that row falls back to Pi's line-only rendering
-to preserve the exact SDK text. Changed diff rows get a faint green/red background,
-blended into the terminal's background and extended through wrapped rows and
-trailing space. Context rows and the transcript indent stay unpainted. The terminal
-background is queried at startup; unsupported terminals and `NO_COLOR` keep the
-existing unfilled rendering. Dark 256-color terminals use a quiet neutral fill
-instead of a stronger saturated tint. This does not add syntax coloring.
-Successful writes show all numbered content; every edit diff hunk stays visible
-without expansion. Collapsing
-a tool hides only its extra details, never its code changes. Older edits without
-SDK diff metadata show their applied replacement fragments when retained, with
-no invented file context or line numbers. Standalone Bash/PowerShell headings show
-the command in parentheses, truncated to one terminal row. Multiline commands show
-only their first line, with the SDK-supplied duration beside the heading when
-available. Successful standalone calls show up to three wrapped rows of actual
-stdout/stderr in dim text, matching normal status summaries, with a `/expand` hint
-when more remains. Expanded non-error shell output is dim too; errors and warnings
-keep their highlighting. Empty successful results
-have no result row. Running calls keep their explicit status and hide streaming
-output until expansion; errors and diagnostics remain visible. Expansion reveals
-the full command and retained output. Grouped calls keep their count-only heading.
-Errors, interruptions, pending/running states, truncation and continuation
-messages remain explicit. Failed/interrupted mutations never get a success preview.
-`read` calls for `SKILL.md` are labeled `Skill <directory name>`; that reports a
-skill-file read, not a guarantee that every instruction was followed.
-The [response inventory](docs/tui-rendering.md) documents every currently supported
-message, tool, question, shell and session-state scenario and its test coverage.
-
-Routine reads and shell calls fold into one expandable line, including calls
-separated only by provider thinking:
+When the shell starts, that same slot becomes:
 
 ```text
-● Read 1 file, ran 1 shell command (/expand)
-● Read 2 files, running 1 shell command (/expand)
+  Running npm test
+  ⎿ PASS auth.test.ts
+    PASS session.test.ts
+    All tests passed
 ```
 
-Intervening thinking stays hidden inside compact groups. Expanding a group shows
-its tools and non-empty reasoning in their original order, honoring **Show reasoning**.
-A group remains one keyboard/mouse target. Reasoning before or after its tool span
-stays standalone. Groups do not cross assistant/user messages, edits, writes, skills,
-questions, compaction, images, warnings, errors or interruptions. File counts
-use distinct path strings; shell counts are tool invocations, not the individual
-commands inside a script. Grouping is not a read-only/safety classification.
-Errors leave the group and remain visible. Tool headings stay on one row;
-compact diagnostics prioritize errors/warnings and show at most two short lines.
-User-entered `!command` output remains visible as local shell history.
-See [research and differences from Claude Code](docs/tui-rendering.md#claude-code-research)
-for the official sources behind this display policy.
+The latest useful preview stays through completion and while the next call's
+arguments stream. Before execution, complete queued calls say Waiting to read/run;
+incomplete routine arguments have no placeholder. Parallel calls select the most
+recently observed start, not whichever older operation finishes last. When prose
+resumes, the preview becomes a muted, dot-free receipt:
 
-Inside a session:
-- Click a tool heading, preview, or group to expand/collapse its arguments, output, and details.
-- Tab or Ctrl+N/P selects a tool or group; Space or Enter toggles it with an
-  empty composer. Right expands; Space/Enter collapses again. Left or Ctrl+H with an empty
-  composer returns to the dashboard without cancelling work. Text in the composer still
-  behaves as ordinary text and Enter sends it.
-- `/expand` and `/collapse` show/hide all tool details. Page Up/Down scrolls long
-  output. Expanding a group reveals all its member calls and intervening reasoning
-  when enabled. Expansion survives
-  streaming updates and resets when switching sessions.
+```text
+  Read 2 files, ran 1 shell command
 
-Activity is presentation only: compact previews do not change retained output or model context.
+● Authentication is fixed. All tests pass.
+```
 
-The transcript ends with a shimmering working/thinking, retry, or stopping indicator,
-e.g. `✻ Working (12s)`. The suffix shows elapsed time, not token counts, using
-compact days/hours/minutes/seconds such as `1m2s`, `2h3m4s`, or `1d20m15s`.
-Zero-valued units are omitted; a just-started run shows `0s`.
-Timing persists across restarts and resets with each idle-session reply; queued
-follow-ups share the current work period.
-On completion, it shows e.g. `✻ Worked for 3s · done 3:22 PM`, using your local time.
-Failures and input requests are labelled accordingly. Set `ZZ_REDUCED_MOTION=1`
-to disable shimmer animation (`NO_COLOR` also disables it); elapsed seconds still
-refresh once per second while working.
+Single calls use the same lifecycle. Historical replay shows counts, never
+invented live activity. A live run ending without prose keeps its last preview.
+File counts deduplicate lexical paths relative to the workspace, including `@`,
+`~`, `file://`, `.` and `..` aliases, without filesystem reads or resolving symlinks.
+Repeated reads show their invocation count separately. Shell calls count tool
+invocations, never inferred reads, safety, or commands within a script.
+
+- Click a group to reveal individual tool headings, then expand just the result
+  you want. Closing a group preserves individual expansion state.
+- Tab or Ctrl+N/P selects groups, visible members and thinking. Space/Enter
+  toggles the selection when the composer is empty; Right expands it.
+- `/expand` opens groups and all member details; `/collapse` closes them. These
+  also override local diff expansion. State survives redraw/resize, not session switches.
+- Visible thinking, prose, mutations, explicit skill loads, questions, compaction,
+  interruptions and unknown actions separate groups. Hidden thinking, empty text
+  and successful task-tool rows do not. A `SKILL.md` read is a normal read.
+- Failed inspections remain grouped with a leading failure count and bounded
+  diagnostic. Warnings, truncation and continuation diagnostics remain standalone.
+  Image reads can group; expanded results display the native image/fallback.
+  Non-read image artifacts remain standalone.
+- While scrolled up, a one-line contextual user prompt appears above the transcript.
+  Click it to jump to the original prompt. It hides when that original first row
+  is visible, at the bottom, and on tiny terminals.
+
+Standalone tool labels distinguish preparing, waiting, running and Failed.
+Shell headings show only the first command line and SDK-supplied duration when
+available. Output previews show the last three wrapped shell rows (including
+streaming output) and the first three generic rows. Omission hints count hidden
+visual rows. Empty shell output explicitly says No output. Full commands, retained
+output and metadata stay available on expansion. Local `!command` history is unchanged.
+
+Read headings show compact paths and requested ranges; expanded reads use language
+highlighting when recognized. Writes show a three-row numbered, highlighted preview.
+Edit diffs default to all retained rows; clicking the header/body toggles a 24-row
+preview. Diff state survives redraw and resize, and global controls override it.
+Diffs use the SDK's actual result and Pi's public `renderDiff()`; changed rows have
+subtle terminal-background-aware fills and retain word highlights through wrapping.
+Legacy edits show retained replacement fragments without invented line numbers.
+Failed/interrupted mutations never show proposed content as applied.
+
+Activity is presentation only: execution, scheduling, undo, model context and
+saved tool results are unchanged. All content is bounded by the SDK's retained
+output; a spill path does not load the file automatically. Web/browser/Agent/codemode
+integrations are not added by this renderer change.
+
+The transcript ends with a shimmering working/thinking, retry or stopping row,
+e.g. `✽ Working (1m 2s)`. The clock includes days/hours/minutes/seconds with
+intermediate zero units. Stored work statistics retain their existing lifecycle;
+queued follow-ups share the current work period. Successful runs lasting at least
+ten seconds leave a muted `✽ Worked for 12s` receipt in the observing view. Short,
+failed, cancelled or input-waiting runs leave no receipt. Receipts disappear on
+later transcript activity or session changes and are not reconstructed on replay.
+Failures and waiting states retain their explicit error/answer/continue notices.
+Shimmer follows reported terminal colors. `ZZ_REDUCED_MOTION=1` or `NO_COLOR`
+disables animation; elapsed time still refreshes once per second.
+
+See the [response inventory](docs/tui-rendering.md) for behavior and test coverage.
 
 ## Composer Discovery
 
@@ -889,14 +970,16 @@ Existing data is not moved automatically: with zz stopped, move the previous
 data directory (`~/.local/share/zz` or `$XDG_DATA_HOME/zz`) to `~/.zz`, or keep
 using it with an explicit override. Move the whole directory, not just `state.json`.
 
-- `state.json`: project list, selection, session index, and cached display history.
+- `state.json`: projects, workspaces, selection, session index, and cached display history.
+- `worktrees/`: retained managed Git checkouts, grouped by project and workspace ID.
+- `state.v1.backup.json`: original state index saved before the workspace-format migration.
 - `sessions.sqlite`: durable conversations, model context, tools, and checkpoints.
 - `undo/`: persistent file backups for `/undo` (may contain sensitive source contents).
 - A heartbeat lock permits only one dashboard per data directory. After a crash,
   allow 10 seconds for the stale lock to expire.
 
-Each session has a separate conversation and working directory; sessions can run
-concurrently. The process never changes its global working directory. Startup
+Each session has a separate conversation and an assigned workspace; sessions can run
+concurrently and may share a workspace. The process never changes its global working directory. Startup
 registers the launch directory and selects it. Closing checkpoints running work;
 reopening resumes it, deduplicating previously submitted input. Work does not run
 while zz is closed. An interrupted model request may be retried and billed again.
@@ -904,15 +987,24 @@ Forced shutdown relies on the last committed durable checkpoint; pending inputs
 were saved before execution. It does not undo effects of tools already executed.
 
 **Agents can read/write files and execute shell commands with your permissions.**
-A project directory is not a sandbox or Git worktree. Concurrent sessions in the
-same directory can edit the same files. Only use trusted projects and prompts.
+A workspace is not a sandbox. Concurrent sessions sharing a checkout can edit the
+same files. Only use trusted projects and prompts.
 zz supplies skill discovery, explicit skill loading and automatic instruction-file
 loading. Coding-agent extensions and MCP are not loaded by this application.
 
 Deleting sessions individually or by project never deletes project files. Session
 deletion removes its UI record, but the underlying durable audit history remains
 in SQLite (the current durable API has no conversation-purge operation). Back up
-the complete data directory while zz is stopped if you need to preserve it.
+the complete data directory and the original repositories while zz is stopped if
+you need to preserve managed worktrees and their Git metadata. Worktree and
+conversation paths are absolute: moving the data directory does not relocate
+existing checkouts or repair their Git links. Choose a data location before
+creating worktrees and retain existing paths when changing it.
+
+The first workspace-aware startup migrates the index to format 2, assigns stable
+project IDs, and attaches old sessions to their original directories. The original
+index is retained as `state.v1.backup.json`; old zz versions refuse the new format.
+Removing and re-adding the same directory still reconnects its retained sessions.
 
 ## Releases
 
@@ -960,6 +1052,12 @@ npm run build
 npm test
 ```
 
+Workspace tests cover real Git checkout isolation, migration, shared workspaces,
+subdirectory projects, base pinning, failed/interrupted preparation, retained
+checkouts, workspace-scoped shell/skills/undo, and narrow/wide workspace controls. Agent handoff tests cover enter/exit, current
+branch and sharing inventory, explicit approval and stale decisions, queued input
+ordering, failure withdrawal, both continuation crash gaps, binding recovery,
+cancellation, updated cwd/instructions, and undo boundaries.
 Tests cover project scoping, peek/reply/open, project removal and restoration,
 double-confirm deletion, narrow and wide-character rendering, real durable
 storage and tools with an offline test provider, interrupted-run recovery, skill
