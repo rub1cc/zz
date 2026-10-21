@@ -45,6 +45,29 @@ class Dynamic implements Component {
   invalidate(): void {}
 }
 
+function sessionTreeGutters(rows: Row[]): string[] {
+  const hasSibling: boolean[] = [];
+  const nextAtDepth: boolean[] = [];
+  // Use visible rows so folded workers do not leave dangling branches.
+  for (let index = rows.length - 1; index >= 0; index--) {
+    const row = rows[index]!;
+    if (row.kind === "project") { nextAtDepth.length = 0; continue; }
+    const depth = row.depth ?? 0;
+    hasSibling[index] = nextAtDepth[depth] ?? false;
+    nextAtDepth.length = depth + 1;
+    nextAtDepth[depth] = true;
+  }
+  const ancestors: string[] = [];
+  return rows.map((row, index) => {
+    const depth = row.kind === "session" ? row.depth ?? 0 : 0;
+    if (!depth) { ancestors.length = 0; return ""; }
+    const gutter = `${ancestors.slice(0, depth - 1).join("")}${hasSibling[index] ? "├─ " : "└─ "}`;
+    ancestors[depth - 1] = hasSibling[index] ? "│  " : "   ";
+    ancestors.length = depth;
+    return gutter;
+  });
+}
+
 class SessionList extends Dynamic {
   positions = new Map<string, number>();
   rename?: { sessionId: string; input: Input };
@@ -70,6 +93,7 @@ class SessionList extends Dynamic {
     this.renameHeight = 0;
     const lines: string[] = [];
     const rows = c.currentRows;
+    const gutters = sessionTreeGutters(rows);
     const childCounts = new Map<string, number>();
     for (const session of c.store.state.sessions) if (session.delegation) {
       const id = session.delegation.parentId; childCounts.set(id, (childCounts.get(id) ?? 0) + 1);
@@ -86,7 +110,7 @@ class SessionList extends Dynamic {
       if (row.kind === "session") titleWidths.set(row.project.id,
         Math.max(titleWidths.get(row.project.id) ?? 0, visibleWidth(titleOf(row.session))));
     }
-    for (const row of rows) {
+    for (const [index, row] of rows.entries()) {
       if (row.kind === "project" && lines.length) lines.push("");
       const id = rowId(row);
       this.positions.set(id, lines.length);
@@ -107,7 +131,7 @@ class SessionList extends Dynamic {
         }
       } else {
         const { session } = row;
-        const tree = row.depth ? `${"  ".repeat(Math.min(row.depth, 4))}|- ` : "";
+        const tree = gutters[index]!;
         const status = displayStatus(session);
         const symbol = status === "working" ? accent(workingIcon()) : status === "needs-input" ? warning("?")
           : status === "failed" ? warning("!") : status === "paused" || status === "waiting" ? dim("-") : green("∙");
