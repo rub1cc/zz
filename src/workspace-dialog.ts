@@ -10,6 +10,7 @@ export class WorkspaceDialog implements Component, Focusable {
   private step?: "base" | "path";
   private busy = false;
   private listTop = 0;
+  private approvalId?: string;
   private _focused = false;
   get focused(): boolean { return this._focused; }
   set focused(value: boolean) { this._focused = value; if (this.input) this.input.focused = value; }
@@ -20,7 +21,12 @@ export class WorkspaceDialog implements Component, Focusable {
     const session = dialog.sessionId ? controller.session(dialog.sessionId) : undefined;
     const current = session && controller.store.workspace(session);
     const defaults = project.workspaceDefault;
-    const items: SelectItem[] = session ? current?.status === "ready" ? [{ value: current.id, label: "Use this workspace for new sessions",
+    const approval = session?.workspaceSwitch?.phase === "approval";
+    this.approvalId = approval ? session.workspaceSwitch!.id : undefined;
+    const items: SelectItem[] = approval ? [
+      { value: "approve", label: "Approve external workspace", description: "Move this session's tools, instructions, and working directory there, then continue." },
+      { value: "deny", label: "Deny entry", description: "Keep this session in its current checkout. Do not move or delete any files." },
+    ] : session ? current?.status === "ready" ? [{ value: current.id, label: "Use this workspace for new sessions",
       description: "Shares this checkout; does not move this conversation." }] : [] : [
       { value: "new", label: "New worktree", description: `Separate checkout for each task, from ${defaults?.kind === "new" ? defaults.baseRef : "HEAD"}. Main directory outside Git.` },
       { value: "base", label: "New worktree from another ref...", description: "Choose a local branch, tag, commit, or existing remote-tracking ref." },
@@ -41,6 +47,12 @@ export class WorkspaceDialog implements Component, Focusable {
     const c = this.controller;
     const project = c.store.state.projects.find((p) => p.id === this.dialog.projectId);
     if (!project || this.busy) return;
+    if (value === "approve" || value === "deny") {
+      this.busy = true;
+      try { await c.approveWorkspace(value === "approve", this.dialog.sessionId, this.approvalId); }
+      finally { this.busy = false; this.tui.requestRender(); }
+      return;
+    }
     if (value === "base" || value === "import") {
       this.step = value === "base" ? "base" : "path";
       this.input = value === "base" ? new Input({ prompt: "Base ref: " }) : new DirectoryInput(() => this.tui.requestRender());
@@ -76,12 +88,17 @@ export class WorkspaceDialog implements Component, Focusable {
     const session = this.dialog.sessionId ? c.session(this.dialog.sessionId) : undefined;
     const workspace = session && c.store.workspace(session);
     const lines = [bold(session ? "Session workspace" : "Workspace for new sessions"), ""];
-    if (session) {
+    if (session?.workspaceSwitch?.phase === "approval") {
+      lines.push(...wrapTextWithAnsi(warning("Approve external checkout?"), inner),
+        ...wrapTextWithAnsi(oneLine(displayPath(session.workspaceSwitch.path)), inner),
+        ...wrapTextWithAnsi(dim("Tools and checkout instructions move there. Existing edits stay put."), inner), "");
+    } else if (session) {
+      if (session.workspaceSwitch) lines.push(dim(session.preview), "");
       const path = c.store.sessionPath(session);
       const shared = c.store.state.sessions.filter((s) => c.store.sessionPath(s) === path).length;
       lines.push(...wrapTextWithAnsi(oneLine(displayPath(path)), inner),
         ...wrapTextWithAnsi(`${c.workspaceLabel(session)} / ${shared} session${shared === 1 ? "" : "s"} / ${workspace?.managed ? "zz-managed" : "external directory"}`, inner),
-        ...wrapTextWithAnsi(dim("This conversation stays here. Session deletion keeps the checkout."), inner), "");
+        ...wrapTextWithAnsi(dim("Session deletion keeps the checkout. Agent workspace tools can request a handoff."), inner), "");
       if (workspace?.error) lines.push(...wrapTextWithAnsi(warning(oneLine(workspace.error)), inner), "");
     } else lines.push(...wrapTextWithAnsi(dim("Saved for this project. Existing conversations never move."), inner), "");
     this.listTop = lines.length + 1;

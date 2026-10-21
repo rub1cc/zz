@@ -92,3 +92,30 @@ test("workspace undo locks shared directories and permits independent checkouts"
     await f.c.showUndo(); assert.match(f.c.notice, /workspace's sessions/);
   } finally { finish?.(); await f.cleanup(); }
 });
+
+
+test("external workspace approval controls preserve drafts, reject stale decisions, and guard replies and shell", async () => {
+  const f = fixture(); const decisions: { id: string; approved: boolean }[] = [];
+  try {
+    f.c.select(`session:${f.task.id}`); f.c.open();
+    f.app.composer.setValue("unsent draft");
+    f.task.workspaceSwitch = { id: "request-1", phase: "approval", workspaceId: "destination", path: "/external/checkout" };
+    f.task.status = "needs-input";
+    f.c.engine.approveWorkspace = async (session, id, approved) => { decisions.push({ id, approved }); delete session.workspaceSwitch; };
+    f.c.showWorkspace();
+    const stale = new WorkspaceDialog(f.c, f.tui, { kind: "workspace", projectId: f.project.id, sessionId: f.task.id });
+    for (const width of [12, 24, 80, 120]) assert.ok(stale.render(width).every((line) => visibleWidth(line) <= width));
+    assert.match(stale.render(120).map(stripTerminalSequences).join("\n"), /external\/checkout/);
+    assert.equal(f.c.send("yes"), false); assert.match(f.c.notice, /Approve or deny/);
+    assert.equal(f.c.runShell("pwd"), false); assert.match(f.c.notice, /workspace handoff/);
+    f.task.workspaceSwitch!.id = "request-2";
+    stale.handleInput("\r"); await tick(); assert.equal(decisions.length, 0); assert.match(f.c.notice, /approval changed/);
+    f.c.showWorkspace(); f.terminal.onInput("\x1b[B"); f.terminal.onInput("\r"); await tick();
+    assert.deepEqual(decisions, [{ id: "request-2", approved: false }]);
+    assert.equal(f.app.composer.getValue(), "unsent draft"); assert.equal(f.task.workspaceId, f.workspace.id);
+    assert.match(f.c.notice, /denied/);
+    f.task.workspaceSwitch = { id: "request-3", phase: "approval", workspaceId: "destination", path: "/external/checkout" };
+    f.app.composer.setValue("/workspace approve"); f.terminal.onInput("\r"); await tick();
+    assert.deepEqual(decisions.at(-1), { id: "request-3", approved: true });
+  } finally { await f.cleanup(); }
+});

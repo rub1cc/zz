@@ -27,6 +27,7 @@ import { createLegacyTaskExtension, createTaskExtension, TasksDoc, updateTaskCom
 import { TaskCleanup, taskCleanupClock, type TaskCleanupClock } from "./task-cleanup.js";
 import { createToolSchedulingExtension } from "./tool-scheduling.js";
 import { Workspaces } from "./workspaces.js";
+import { WorkspaceAgent, WorkspaceDoc } from "./workspace-agent.js";
 
 const ctx = BACKGROUND_CONTEXT;
 const SessionMeta = defineDoc<{ sessionId: string; priorUsage?: JsonRepresentation<Usage> }>({
@@ -66,7 +67,7 @@ export function applyView(session: Session, view: ConversationView, priorUsage?:
   session.usage = priorUsage ? sumUsage([priorUsage, usage]) : usage;
   const inbox = view.docs["pi.inbox"] as InboxState | undefined;
   const queued = (inbox?.items ?? []).flatMap((item) => {
-    if (item.mode === "write") return [];
+    if (item.mode === "write" || item.entry?.kind === "zz.workspace_continue") return [];
     const skill = item.entry?.kind === "zz.skill" ? skillEntry(item.entry.data) : undefined;
     const text = skill?.prompt ?? (typeof item.content === "string" ? item.content
       : item.content.filter((block) => block.type === "text").map((block) => block.text).join("\n"));
@@ -90,6 +91,13 @@ export function applyView(session: Session, view: ConversationView, priorUsage?:
   let error: string | undefined;
   let needsInput = false;
   for (const entry of view.entries) {
+    if (entry.kind === "zz.workspace_continue") continue;
+    if (entry.kind === "zz.workspace_failed") {
+      const data = entry.data as { message?: string } | undefined;
+      error = data?.message ?? "Workspace handoff failed.";
+      messages.push({ role: "error", text: error, timestamp: session.updatedAt });
+      continue;
+    }
     if (entry.kind === "pi.compaction") {
       const reason = entry.data && typeof entry.data === "object" && !Array.isArray(entry.data) ? entry.data.reason : undefined;
       messages.push({ role: "tool", text: "", timestamp: entry.model?.[0]?.timestamp ?? session.updatedAt, tool: {
@@ -205,6 +213,7 @@ export class DurableEngine implements Engine {
   private readonly preparations = new Map<string, AbortController>();
   private undoPending = new Set<string>();
   private readonly taskCleanup: TaskCleanup;
+  private readonly changes = new Map<string, () => void>();
 
   private constructor(
     readonly store: Store, readonly harness: Harness, readonly models: Models,
@@ -212,11 +221,18 @@ export class DurableEngine implements Engine {
     readonly thinkingLevel: ModelThinkingLevel,
     readonly skills: SkillCatalog,
     readonly undoHistory: UndoHistory,
+    readonly workspaceAgent: WorkspaceAgent,
     taskClock: TaskCleanupClock,
   ) { this.taskCleanup = new TaskCleanup(harness, report, taskClock); this.workspaces = new Workspaces(store); }
 
   static async open(store: Store, model: ModelRef | undefined, report: (error: unknown) => void, models?: Models, thinkingLevel: ModelThinkingLevel = "off", skills = new SkillCatalog(), instructions = new InstructionCatalog(), taskClock: TaskCleanupClock = taskCleanupClock): Promise<DurableEngine> {
     models ??= await ModelRuntime.create({ allowModelNetwork: false });
+    let engine: DurableEngine;
+    const workspaceAgent = new WorkspaceAgent(store, {
+      session: (id) => store.state.sessions.find((s) => s.conversationId === id),
+      assertAvailable: (session, paths) => engine.assertWorkspaceAvailable(session, paths),
+      changed: (session) => engine.changes.get(session.id)?.(),
+    });
     const registry = createRegistry();
     registry.install(createCodingTools({ images: await getImageProcessor() }));
     const undoHistory = new UndoHistory(store.root, () => store.workspaces.filter((w) => w.managed && w.status === "ready" && w.checkoutPath).map((w) => w.checkoutPath!));
@@ -243,6 +259,7 @@ export class DurableEngine implements Engine {
         execute: async (args) => ({ output: [{ type: "text", text: questionText(questionnaire(args)) }], control: { terminate: true } }),
       })],
     }));
+    registry.install(workspaceAgent.extension);
     registry.install(createToolSchedulingExtension(registry, () => harness));
     const harness = await Harness.open(await openNodeSqliteStorage(join(store.root, "sessions.sqlite")), {
       models, registry, settings: { get compaction() { return store.compaction; } }, env: ({ cwd }) => {
@@ -251,9 +268,27 @@ export class DurableEngine implements Engine {
       }, onReport: report,
     }, ctx);
     undoHistory.harness = harness;
-    const engine = new DurableEngine(store, harness, models, model, report, thinkingLevel, skills, undoHistory, taskClock);
+    workspaceAgent.harness = harness;
+    engine = new DurableEngine(store, harness, models, model, report, thinkingLevel, skills, undoHistory, workspaceAgent, taskClock);
     void harness.closed.then((end) => { if (end.reason === "failed") report(end.error); });
     return engine;
+  }
+
+  private assertWorkspaceAvailable(session: Session, paths: readonly string[]): void {
+    if (session.stopped || this.stopping.has(session.id)) throw new Error("This session is stopping.");
+    if (session.shellResponses?.some((s) => s.status === "running" || s.status === "stopping")) throw new Error("Finish this session's direct shell command before switching workspace.");
+    if (session.compactions?.length || this.manualCompactions.has(session.id)) throw new Error("Finish compaction before switching workspace.");
+    if (paths.some((path) => this.undoWorkspaces.has(path) || this.pendingUndo(path))) throw new Error("Finish /undo in the source and destination before switching workspace.");
+  }
+
+  private switchingWorkspace(path: string): boolean {
+    return this.store.state.sessions.some((s) => s.workspaceSwitch && (this.store.sessionPath(s) === path
+      || this.store.workspaces.find((w) => w.id === s.workspaceSwitch!.workspaceId)?.path === path));
+  }
+
+  async approveWorkspace(session: Session, requestId: string, approved: boolean, changed: () => void): Promise<void> {
+    if (this.closing || this.stopping.has(session.id)) throw new Error("This session is stopping.");
+    await this.workspaceAgent.approve(session, requestId, approved, ctx); changed();
   }
 
   configuration(session?: Session): AgentSettings {
@@ -374,12 +409,19 @@ export class DurableEngine implements Engine {
   }
 
   private async observe(session: Session, conversation: Conversation, changed: () => void): Promise<void> {
+    this.changes.set(session.id, changed);
     if (this.views.has(session.id)) return;
     // Conversation views mount only built-in docs; observe our checklist separately.
     // Materialize an empty document for older conversations as well as new ones.
     await conversation.commit(async (tx) => {
       updateTaskCompletion(await tx.doc(TasksDoc, conversation.id), this.taskCleanup.clock.now());
+      const doc = await tx.doc(WorkspaceDoc, conversation.id);
+      const current = this.store.workspace(session);
+      if (!doc.current && current) doc.current = JSON.parse(JSON.stringify(current));
     }, ctx);
+    const workspace = (await this.harness.documentState(WorkspaceDoc, conversation.id, ctx))!;
+    this.workspaceAgent.sync(session, workspace.value);
+    workspace.subscribe((state) => { this.workspaceAgent.sync(session, state); changed(); });
     const tasks = (await this.harness.documentState(TasksDoc, conversation.id, ctx))!;
     const syncTasks = (state: Readonly<TaskState> | null): void => {
       session.tasks = state?.items.length ? structuredClone(state.items) : undefined;
@@ -415,13 +457,15 @@ export class DurableEngine implements Engine {
       return update;
     };
     applyView(session, view.value, priorUsage);
+    this.workspaceAgent.decorate(session);
     view.subscribe((value) => {
       applyView(session, value, priorUsage);
+      this.workspaceAgent.decorate(session);
       if (value.entries !== entries) { entries = value.entries; void refresh(); }
       changed();
     });
     this.views.set(session.id, { get value() { return view.value; }, dispose: () => {
-      this.taskCleanup.forget(conversation.id); view.dispose(); tasks.dispose();
+      this.taskCleanup.forget(conversation.id); view.dispose(); tasks.dispose(); workspace.dispose();
     } });
     await refresh();
   }
@@ -484,6 +528,7 @@ export class DurableEngine implements Engine {
       const result = await submission.wait(ctx);
       await this.contextUpdates.get(session.id);
       this.removeInput(session, input);
+      if (result.status === "unanswered" && result.reason === "workspace_handoff_failed") return;
       if (result.status === "unanswered") throw new Error(`${result.reason}${result.detail ? `: ${JSON.stringify(result.detail)}` : ""}`);
     }).catch((error: unknown) => {
       if (!this.closing) this.removeInput(session, input);
@@ -556,6 +601,7 @@ export class DurableEngine implements Engine {
   compact(session: Session, instructions: string | undefined, changed: () => void): Promise<CompactResult> {
     if (this.undoWorkspaces.has(this.store.workspaceKey(session)) || this.pendingUndo(this.store.workspaceKey(session))) return Promise.reject(new Error("Finish /undo before compacting this session."));
     if (this.closing) return Promise.reject(new Error("zz is closing."));
+    if (session.workspaceSwitch) return Promise.reject(new Error("Finish the workspace handoff before compacting."));
     if (this.stopping.has(session.id)) return Promise.reject(new Error("This session is still stopping."));
     if (this.manualCompactions.has(session.id) || session.compactions?.length) {
       return Promise.reject(new Error("This session is already compacting."));
@@ -614,6 +660,7 @@ export class DurableEngine implements Engine {
       return Promise.reject(new Error("Finish the interrupted /undo in this workspace's other session first."));
     }
     if (this.closing) return Promise.reject(new Error("zz is closing."));
+    if (this.switchingWorkspace(this.store.workspaceKey(session))) return Promise.reject(new Error("Wait for the workspace handoff to finish before /undo."));
     if (this.undoWorkspaces.has(this.store.workspaceKey(session))) return Promise.reject(new Error("This workspace is already being restored."));
     const workspaceKey = this.store.workspaceKey(session);
     this.undoWorkspaces.add(workspaceKey);
@@ -640,6 +687,7 @@ export class DurableEngine implements Engine {
     const index = state?.points.findIndex((point) => point.id === checkpointId) ?? -1;
     const point = state?.points[index];
     if (!point) throw new Error("No undo checkpoint with that ID in this conversation. Reopen /undo and choose a checkpoint.");
+    if (index < (state?.boundary ?? 0)) throw new Error("Cannot undo across a workspace switch. Earlier history and checkpoints are kept.");
     const pendingId = state?.restoring ? state.restoreTo ?? state.points.at(-1)?.id : undefined;
     if (pendingId && pendingId !== checkpointId) throw new Error("Finish restoring the previously selected checkpoint before choosing another.");
     const points = state!.points.slice(index);
@@ -669,6 +717,7 @@ export class DurableEngine implements Engine {
         if (priorUsage) meta.priorUsage = priorUsage;
         const undo = await tx.doc(UndoDoc, id);
         undo.points = structuredClone(state!.points.slice(0, index));
+        if (state!.boundary !== undefined) undo.boundary = state!.boundary;
         delete undo.restoring;
         delete undo.restoreTo;
       },
@@ -712,6 +761,7 @@ export class DurableEngine implements Engine {
         session.preview = "Stopping...";
         this.store.save();
       }
+      if (session) await this.workspaceAgent.cancel(session, ctx);
       const title = this.titles.get(sessionId);
       title?.abort.abort();
       const conversation = this.handles.get(sessionId) ?? (session?.conversationId !== undefined
@@ -728,6 +778,7 @@ export class DurableEngine implements Engine {
     this.views.get(sessionId)?.dispose();
     this.views.delete(sessionId);
     this.handles.delete(sessionId);
+    this.changes.delete(sessionId);
   }
 
   close(): Promise<void> {
@@ -749,6 +800,7 @@ export class DurableEngine implements Engine {
       } finally {
         for (const view of this.views.values()) view.dispose();
         this.views.clear();
+        this.changes.clear();
       }
     })();
     return this.closePromise;

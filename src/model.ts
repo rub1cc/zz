@@ -168,6 +168,9 @@ export interface Session {
   agent?: AgentSettings;
   projectId: string;
   workspaceId?: string;
+  /** Presentation caches; the durable zz.workspace document is authoritative. */
+  workspaceSwitch?: { id: string; phase: "approval" | "preparing" | "ready" | "bound"; workspaceId: string; path: string };
+  workspaceUndoBoundary?: boolean;
   title: string;
   /** Protects explicitly saved names from pending automatic title generation. */
   titleRenamed?: boolean;

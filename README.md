@@ -254,7 +254,8 @@ npm run dev -- --model openai/gpt-5.4 --thinking high
 New coding tasks in Git projects get their own worktree by default. Each task
 starts from the current committed `HEAD`, on a branch such as
 `zz/fix-auth-a1b2c3d4`. Tasks outside Git use the project directory instead.
-Existing sessions keep their original directories and conversations.
+Existing sessions keep their original directories and conversations unless you
+explicitly ask the agent to switch workspace.
 
 The dashboard shows the workspace choice above the composer and worktree labels
 beside session titles. Open `/workspace` before sending a task to choose:
@@ -293,6 +294,53 @@ Deleting sessions or removing projects never removes worktrees or branches.
 Unreferenced workspaces remain selectable in `/workspace`. Review and merge work
 with Git; automatic merge, worktree removal, and cleanup policies are not included.
 Worktrees separate files and branches, but are not security sandboxes.
+
+### Agent Workspace Handoffs
+
+Ask the agent to "create a worktree for this fix and continue there", "use the
+existing review workspace", or "return to the main checkout". The conversation,
+title, model, and checklist stay with the same session. The agent has three tools:
+
+- `workspace_list`: inspect the current binding and registered alternatives,
+  including branch, availability, local changes, and session sharing. Results are
+  paginated with `cursor` and `limit` (25 by default, at most 50).
+- `workspace_enter`: pass `create: { baseRef: "main" }` to create and enter a
+  worktree, optionally naming `branch`, or pass `workspaceId` from the list to
+  enter an existing one. The default creation base is committed local `HEAD`.
+- `workspace_exit`: return to the project's main directory, keeping the checkout,
+  branch, and edits you left behind. Already being in main is a no-op.
+
+Creation is only allowed from the main workspace. A session already in a worktree
+can enter an existing workspace or return to main, but cannot create another new
+one directly. Use another session for independent work. Existing worktrees must
+belong to this project and be registered first with `/workspace add PATH`.
+
+Entry into a zz-managed workspace is automatic. Entry into an external worktree
+waits for explicit approval, without another model request. Open `/workspace` in
+that session and choose Approve or Deny, or use `/workspace approve` or
+`/workspace deny`. The destination and instruction-loading scope are shown before
+you decide. Ordinary chat replies do not count as approval. A denial keeps the
+session in its original checkout. Approval requests survive restart; `/stop`
+cancels the request.
+
+Switch tools must be called alone in their tool round. zz prepares and validates
+the destination, waits for that round to settle, and commits the conversation's
+working directory and workspace binding together. It then ends the turn and
+continues automatically. Already queued replies resume in order in the new
+workspace; otherwise zz admits one deduplicated internal continuation. Tools,
+instructions, skills, completion, and direct shell all follow the new binding.
+The process-wide working directory never changes.
+
+No edits are copied, stashed, merged, or deleted. If an accepted handoff fails,
+zz keeps the previous checkout and withdraws queued replies rather than running
+them there accidentally; inspect the reported error and resend after fixing it.
+A stop after the new binding committed leaves the session in that destination,
+but cancels further work. Direct shell, undo, and manual compaction cannot overlap
+a handoff for that session or a conflicting restore.
+
+Each switch creates an **undo boundary**: `/undo` offers only turns after the most
+recent switch. Earlier conversation history, checkpoints, and file changes remain
+intact, including when you later return to the same checkout.
 
 ## Direct Shell
 
@@ -1020,7 +1068,10 @@ npm test
 
 Workspace tests cover real Git checkout isolation, migration, shared workspaces,
 subdirectory projects, base pinning, failed/interrupted preparation, retained
-checkouts, workspace-scoped shell/skills/undo, and narrow/wide workspace controls.
+checkouts, workspace-scoped shell/skills/undo, and narrow/wide workspace controls. Agent handoff tests cover enter/exit, current
+branch and sharing inventory, explicit approval and stale decisions, queued input
+ordering, failure withdrawal, both continuation crash gaps, binding recovery,
+cancellation, updated cwd/instructions, and undo boundaries.
 Tests cover project scoping, peek/reply/open, project removal and restoration,
 double-confirm deletion, narrow and wide-character rendering, real durable
 storage and tools with an offline test provider, interrupted-run recovery, skill

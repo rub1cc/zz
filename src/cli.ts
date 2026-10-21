@@ -38,7 +38,9 @@ With an empty composer: enter opens a session; space peeks and lets you reply.
 ctrl+j inserts a newline; enter sends. ctrl+g edits the draft in $VISUAL/$EDITOR (default vim).
 /projects manages projects; Escape returns to the dashboard.
 /workspace selects main, new worktree, or existing checkout for new tasks.
-Git tasks default to separate worktrees from committed HEAD; existing sessions stay put.
+Git tasks default to separate worktrees from committed HEAD; existing sessions stay put unless asked to switch.
+Ask the agent to create/enter a worktree or return to main; the same conversation continues.
+/workspace approve or /workspace deny decides a pending external-checkout request.
 On the dashboard, shift+up/down reorders sessions within a project; ctrl+r renames the selected session.
 ctrl+x twice deletes a session or all sessions in the selected project. ctrl+c quits.
 If shutdown stalls, press ctrl+c again to force exit (automatic after 5 seconds).

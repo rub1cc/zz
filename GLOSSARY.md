@@ -14,6 +14,12 @@ The directory where sessions do their work. It is either a project's main checko
 A durable agent conversation and its work history, attached to one workspace.
 _Avoid_: Thread
 
+**Workspace Handoff**:
+A change of a session's working workspace that preserves its conversation. Files and edits stay in their original workspace.
+
+**Workspace Undo Boundary**:
+The point where a session changes workspace, beyond which earlier work cannot be undone from the new workspace.
+
 **Managed Worktree**:
 A separate Git checkout created by zz, rather than an existing checkout registered by the user.
 

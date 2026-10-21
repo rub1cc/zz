@@ -73,6 +73,10 @@ function isState(value: unknown): value is State {
       && typeof s.title === "string" && typeof s.preview === "string"
       && (s.titleRenamed === undefined || typeof s.titleRenamed === "boolean")
       && (s.stopped === undefined || typeof s.stopped === "boolean")
+      && (s.workspaceUndoBoundary === undefined || typeof s.workspaceUndoBoundary === "boolean")
+      && (s.workspaceSwitch === undefined || !!s.workspaceSwitch && typeof s.workspaceSwitch.id === "string"
+        && typeof s.workspaceSwitch.workspaceId === "string" && typeof s.workspaceSwitch.path === "string"
+        && ["approval", "preparing", "ready", "bound"].includes(s.workspaceSwitch.phase))
       && (s.agent === undefined || isAgentSettings(s.agent))
       && (s.compactions === undefined || Array.isArray(s.compactions) && s.compactions.every(isCompaction))
       && (s.compactionFailure === undefined || isCompactionIdentity(s.compactionFailure) && typeof s.compactionFailure.error === "string")

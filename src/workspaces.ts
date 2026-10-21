@@ -55,16 +55,16 @@ export class Workspaces {
   private readonly pending = new Map<string, Promise<Workspace>>();
   constructor(private readonly store: Store) {}
 
-  ensure(session: Session, project: Project, changed: () => void, signal?: AbortSignal): Promise<Workspace> {
+  ensure(session: Session, project: Project, changed: () => void, signal?: AbortSignal, allowMainFallback = true): Promise<Workspace> {
     const workspace = this.store.workspace(session) ?? this.store.assignWorkspace(session, project, { kind: "main" });
     const running = this.pending.get(workspace.id);
     if (running) return running;
-    const promise = this.prepare(session, project, workspace, changed, signal).finally(() => this.pending.delete(workspace.id));
+    const promise = this.prepare(session, project, workspace, changed, signal, allowMainFallback).finally(() => this.pending.delete(workspace.id));
     this.pending.set(workspace.id, promise);
     return promise;
   }
 
-  private async prepare(session: Session, project: Project, workspace: Workspace, changed: () => void, signal?: AbortSignal): Promise<Workspace> {
+  private async prepare(session: Session, project: Project, workspace: Workspace, changed: () => void, signal: AbortSignal | undefined, allowMainFallback: boolean): Promise<Workspace> {
     if (workspace.status === "ready") {
       directory(workspace.path);
       return workspace;
@@ -79,7 +79,7 @@ export class Workspaces {
     try {
       const root = await repositoryRoot(project.path, signal);
       if (!root) {
-        if (workspace.repositoryRoot) throw new Error("The Git repository used for this launch is unavailable; refusing to switch to the main directory.");
+        if (workspace.repositoryRoot || !allowMainFallback) throw new Error("The Git repository used for this launch is unavailable; refusing to switch to the main directory.");
         const main = this.store.mainWorkspace(project);
         session.workspaceId = main.id;
         this.store.state.workspaces = this.store.workspaces.filter((w) => w.id !== workspace.id);
@@ -123,6 +123,44 @@ export class Workspaces {
       workspace.error = error instanceof Error ? error.message : String(error);
       this.store.save(); changed();
       throw new Error(`Workspace preparation failed: ${workspace.error}`, { cause: error });
+    }
+  }
+
+  async validateNew(project: Project, baseRef: string, branch?: string, signal?: AbortSignal): Promise<void> {
+    const root = await repositoryRoot(project.path, signal);
+    if (!root) throw new Error("Creating a worktree requires a Git project.");
+    if (!baseRef.trim() || baseRef.startsWith("-") || /[\r\n\0]/.test(baseRef)) throw new Error("Choose a valid Git base ref.");
+    await git(root, ["rev-parse", "--verify", "--end-of-options", `${baseRef}^{commit}`], signal);
+    if (branch !== undefined) {
+      if (branch.startsWith("-") || /[\r\n\0]/.test(branch)) throw new Error("Choose a valid new branch name.");
+      await git(root, ["check-ref-format", "--branch", branch], signal);
+      const ref = `refs/heads/${branch}`;
+      if ((await git(root, ["for-each-ref", "--format=%(refname)", ref], signal)).split("\n").includes(ref)) throw new Error("The requested branch already exists. Choose another name or enter its registered workspace.");
+    }
+  }
+
+  async validateExisting(project: Project, workspace: Workspace, signal?: AbortSignal): Promise<void> {
+    if (directory(workspace.path) !== workspace.path) throw new Error("Workspace path now resolves elsewhere; inspect it before entering.");
+    if (workspace.kind === "main") return;
+    const root = await repositoryRoot(project.path, signal);
+    const target = await repositoryRoot(workspace.path, signal);
+    if (!root || !target || !(await listedWorktrees(root, signal)).has(target)) throw new Error("The destination is no longer a worktree of this project.");
+    const expected = directory(join(target, relative(root, directory(project.path))));
+    if (workspace.path !== expected) throw new Error("Destination no longer matches this project's relative directory.");
+  }
+
+  async describe(workspace: Workspace, signal?: AbortSignal): Promise<{ available: boolean; isGit?: boolean; branch?: string; hasLocalChanges?: boolean; error?: string }> {
+    try {
+      directory(workspace.path);
+      const root = await repositoryRoot(workspace.path, signal);
+      if (!root) return { available: true, isGit: false };
+      let branch: string;
+      try { branch = await git(workspace.path, ["symbolic-ref", "--quiet", "--short", "HEAD"], signal); }
+      catch { branch = `detached ${await git(workspace.path, ["rev-parse", "--short", "HEAD"], signal)}`; }
+      return { available: true, isGit: true, branch, hasLocalChanges: !!(await git(workspace.path, ["status", "--porcelain", "-z", "--untracked-files=normal"], signal)) };
+    } catch (error) {
+      signal?.throwIfAborted();
+      return { available: false, error: error instanceof Error ? error.message : String(error) };
     }
   }
 

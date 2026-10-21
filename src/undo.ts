@@ -9,7 +9,7 @@ import type { UndoCheckpoint } from "./model.js";
 
 const ctx = BACKGROUND_CONTEXT;
 export type UndoPoint = { id: string; run: number; at?: number; prompt: string; timestamp?: number };
-export const UndoDoc = defineDoc<{ points: UndoPoint[]; restoring?: boolean; restoreTo?: string }>({
+export const UndoDoc = defineDoc<{ points: UndoPoint[]; restoring?: boolean; restoreTo?: string; boundary?: number }>({
   kind: "zz.undo", version: 1, scope: "conversation", history: "latest", fork: "current",
   initial: () => ({ points: [] }),
 });
@@ -183,7 +183,7 @@ export class UndoHistory {
     const result: UndoCheckpoint[] = [];
     const files = new Set<string>();
     let shell = false;
-    for (let index = points.length - 1; index >= 0; index--) {
+    for (let index = points.length - 1; index >= (state?.boundary ?? 0); index--) {
       const point = points[index]!;
       const journal = this.read(point);
       for (const file of journal.files) files.add(file.path);

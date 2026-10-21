@@ -268,11 +268,12 @@ export class Dashboard extends VStack implements Focusable {
     if (command === "/settings" || command === "/config") { this.controller.showSettings(); return true; }
     if (/^\/workspace(?:\s|$)/.test(command)) {
       if (command === "/workspace") this.controller.showWorkspace();
-      else if (this.controller.mode === "session") this.controller.fail("Use /workspace to inspect this session. Change workspace defaults from the dashboard; existing sessions never move.");
+      else if (command === "/workspace approve" || command === "/workspace deny") void this.controller.approveWorkspace(command.endsWith("approve"));
+      else if (this.controller.mode === "session") this.controller.fail("Use /workspace to inspect this session. Change defaults from the dashboard, or ask the agent to enter or exit a workspace.");
       else if (command === "/workspace main") this.controller.selectWorkspace({ kind: "main" });
       else if (/^\/workspace new(?:\s|$)/.test(command)) this.controller.selectWorkspace({ kind: "new", baseRef: command.slice("/workspace new".length).trim() || "HEAD" });
       else if (/^\/workspace add\s+/.test(command)) void this.controller.importWorkspace(command.slice("/workspace add".length).trim());
-      else this.controller.fail("Usage: /workspace, /workspace main, /workspace new [base-ref], /workspace add PATH");
+      else this.controller.fail("Usage: /workspace, /workspace approve|deny, /workspace main, /workspace new [base-ref], /workspace add PATH");
       return true;
     }
     if (command === "/projects") { this.controller.toggleProjects(); return true; }
@@ -353,7 +354,8 @@ export class Dashboard extends VStack implements Focusable {
       this.tui.terminal.rows - this.header(width).length - input.length - notice.length - 3));
     return ["",
       ...(!this.questionComposer && c.mode === "session" ? this.taskDisplay.render(c.opened, width, taskBudget, this.tui.terminal.rows) : []),
-      ...notice, ...(c.mode === "sessions" && c.project ? [dim(oneLine(`Workspace: ${c.workspaceDefaultLabel()} /workspace`))] : []), ...input,
+      ...notice, ...(c.mode === "session" && c.opened?.workspaceSwitch?.phase === "approval"
+        ? [warning("External checkout needs approval: /workspace (or /workspace approve / deny)")] : []), ...(c.mode === "sessions" && c.project ? [dim(oneLine(`Workspace: ${c.workspaceDefaultLabel()} /workspace`))] : []), ...input,
       composerStatus(c.configuration, c.engine.stats(c.mode === "session" ? c.opened : undefined),
         c.auth?.codexQuota?.value(c.configuration.model?.provider))];
   }
@@ -425,6 +427,10 @@ export class Dashboard extends VStack implements Focusable {
         this.questionViews.set(key, this.questionComposer);
         if (this.questionViews.size > 20) this.questionViews.delete(this.questionViews.keys().next().value!);
       }
+    }
+    if (c.dialog?.kind === "workspace" && c.dialog.sessionId) {
+      const requestId = c.session(c.dialog.sessionId)?.workspaceSwitch?.id;
+      if (c.dialog.requestId !== requestId) c.dialog = { ...c.dialog, requestId };
     }
     if (c.dialog !== this.activeDialog) {
       const previousDialog = this.activeDialog;
@@ -580,6 +586,7 @@ class DialogView implements Component, Focusable {
       const dialog = controller.dialog;
       if (dialog?.kind === "add-project") return controller.addProject(text.trim());
       if (dialog?.kind === "peek") {
+        if (text.trim() === "/workspace approve" || text.trim() === "/workspace deny") { void controller.approveWorkspace(text.trim().endsWith("approve"), dialog.sessionId); return "command"; }
         if (text.trim() === "/tasks") { controller.showTasks(dialog.sessionId); return "command"; }
         if (text.trimStart().startsWith("!")) { controller.runShell(text.trimStart().slice(1), dialog.sessionId); return "command"; }
         return controller.send(text, dialog.sessionId, images);

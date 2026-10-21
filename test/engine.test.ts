@@ -21,14 +21,17 @@ import { InstructionCatalog } from "../src/instructions.js";
 import { image, png } from "./image-fixtures.js";
 import { SkillCatalog } from "../src/skills.js";
 import { UndoDoc } from "../src/undo.js";
+import { WorkspaceDoc } from "../src/workspace-agent.js";
+import { Workspaces } from "../src/workspaces.js";
 import { createTask, legacyTaskExtension, legacyUpdateTaskParameters, taskExtension, TasksDoc, type TaskOperation } from "../src/tasks.js";
 import type { TaskCleanupClock } from "../src/task-cleanup.js";
 import { ManualTaskClock } from "./task-cleanup-fixtures.js";
-import { temporary, tick } from "./helpers.js";
+import { temporary, tick, FakeTerminal } from "./helpers.js";
 import { pendingQuestion } from "../src/questions.js";
 import { structuredQuestions } from "./question-fixtures.js";
 import { Transcript } from "../src/transcript.js";
-import { stripTerminalSequences } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, TuiAltScreen } from "@earendil-works/pi-tui";
+import { Dashboard } from "../src/ui.js";
 
 async function until(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 3000;
@@ -2380,5 +2383,341 @@ test("workspace preparation failures never start a provider and retry keeps the 
     await engine.restore(() => {}); const loaded = restored.state.sessions[0]!;
     await engine.run(loaded, restored.state.projects[0]!, "read marker", () => {});
     assert.equal(loaded.workspaceId, workspaceId); assert.equal(loaded.status, "completed"); assert.ok(requests > 0);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+
+test("workspace agent creates and enters at a durable boundary, continues automatically, and exits without deleting", async () => {
+  const f = gitWorkspaceFixture(); const errors: unknown[] = [];
+  f.project.workspaceDefault = { kind: "main" };
+  const s = session(f.project, "handoff"); f.store.state.sessions.push(s);
+  const prompts: string[] = [];
+  const runtime = models({ context: (context) => {
+    prompts.push(getCurrentSystemPrompt(context.messages));
+    const tools = getCurrentTools(context.messages).filter((tool) => tool.name.startsWith("workspace_"));
+    assert.deepEqual(tools.map((tool) => tool.name), ["workspace_list", "workspace_enter", "workspace_exit"]);
+    assert.ok(tools.every((tool) => (tool.parameters as { type?: string }).type === "object"));
+  }, reply: (context) => {
+    const last = context.messages.findLast((message) => message.role !== "system");
+    return last?.role === "user" && typeof last.content === "string" && last.content.startsWith("tools:")
+      ? JSON.parse(last.content.slice(6)) as ToolCall[] : [{ type: "text", text: "Done" }];
+  } });
+  const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), runtime);
+  try {
+    writeFileSync(join(f.path, ".pi", "APPEND_SYSTEM.md"), "MAIN_ONLY_INSTRUCTIONS");
+    await engine.run(s, f.project, toolPrompt(writeCall("marker.txt", "main edits stay")), () => {});
+    const conversationId = s.conversationId;
+    const before = (await engine.undoCheckpoints(s))[0]!;
+    await engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { create: { baseRef: "main", branch: "zz/agent-fix" } })), () => {});
+    await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+    const target = f.store.workspace(s)!;
+    assert.equal(target.kind, "worktree"); assert.equal(target.branch, "zz/agent-fix"); assert.equal(s.conversationId, conversationId);
+    assert.equal(readFileSync(join(target.path, "marker.txt"), "utf8"), "committed main");
+    assert.equal(readFileSync(join(f.path, "marker.txt"), "utf8"), "main edits stay");
+    assert.equal(s.status, "completed");
+    assert.equal((await (await engine.harness.conversation(conversationId as ConversationId, BACKGROUND_CONTEXT))!.agent(BACKGROUND_CONTEXT)).cwd, target.path);
+    assert.match(prompts.at(-1)!, /CHECKOUT_INSTRUCTIONS/); assert.doesNotMatch(prompts.at(-1)!, /MAIN_ONLY_INSTRUCTIONS/);
+    assert.ok(prompts.at(-1)!.includes(target.path));
+    const doc = await engine.harness.snapshot(WorkspaceDoc, conversationId as ConversationId, BACKGROUND_CONTEXT);
+    assert.equal(doc?.current?.id, target.id); assert.equal(doc?.switches, 1); assert.equal(doc?.pending, undefined);
+    assert.equal(s.workspaceUndoBoundary, true);
+    assert.ok(s.messages.every((m) => m.role !== "user" || !m.text.startsWith("Continue the user's task")));
+    await assert.rejects(engine.undo(s, before.id, () => {}), /Cannot undo across a workspace switch/);
+    await engine.run(s, f.project, toolPrompt(writeCall("marker.txt", "isolated edits")), () => {});
+    await engine.run(s, f.project, toolPrompt(taskCall("workspace_exit", {})), () => {});
+    await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+    assert.equal(f.store.workspace(s)?.kind, "main"); assert.equal(s.conversationId, conversationId);
+    assert.match(prompts.at(-1)!, /MAIN_ONLY_INSTRUCTIONS/);
+    assert.equal(readFileSync(join(target.path, "marker.txt"), "utf8"), "isolated edits");
+    assert.equal(readFileSync(join(f.path, "marker.txt"), "utf8"), "main edits stay");
+    assert.deepEqual(errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("workspace agent rejects mixed tool rounds, repeated creation from a worktree, and foreign workspace IDs", async () => {
+  const f = gitWorkspaceFixture(); const errors: unknown[] = [];
+  const s = session(f.project, "restricted"); f.store.state.sessions.push(s);
+  const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
+  try {
+    await engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { create: { baseRef: "main" } }), writeCall("marker.txt", "ordinary write")), () => {});
+    assert.match(s.messages.find((m) => m.tool?.name === "workspace_enter")?.tool?.output ?? "", /alone in a tool round/);
+    const original = s.workspaceId;
+    await engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { create: {} })), () => {});
+    assert.match(s.messages.findLast((m) => m.tool?.name === "workspace_enter")?.tool?.output ?? "", /already has a worktree/);
+    assert.equal(s.workspaceId, original);
+    await engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { workspaceId: "foreign" })), () => {});
+    assert.match(s.messages.findLast((m) => m.tool?.name === "workspace_enter")?.tool?.output ?? "", /belonging to this project/);
+    assert.equal(s.workspaceId, original); assert.deepEqual(errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("workspace agent waits for explicit external approval and resumes its tool after approval", async () => {
+  const f = gitWorkspaceFixture(); const errors: unknown[] = [];
+  const external = join(f.root, "external"); f.git("worktree", "add", "-b", "external", external);
+  const target = await new Workspaces(f.store).import(f.project, external);
+  const s = session(f.project, "external entry"); f.store.state.sessions.push(s);
+  const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
+  try {
+    const running = engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { workspaceId: target.id })), () => {});
+    await until(() => s.workspaceSwitch?.phase === "approval");
+    assert.equal(s.status, "needs-input"); assert.notEqual(s.workspaceId, target.id);
+    await engine.approveWorkspace(s, s.workspaceSwitch!.id, true, () => {});
+    await running; await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+    assert.equal(s.workspaceId, target.id); assert.equal(s.status, "completed"); assert.equal(s.workspaceSwitch, undefined);
+    assert.deepEqual(errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+
+test("workspace agent external approval survives restart, denial keeps the old binding, and stop cancels the wait", async () => {
+  for (const approve of [false, true]) {
+    const f = gitWorkspaceFixture(); const errors: unknown[] = [];
+    const external = join(f.root, "external"); f.git("worktree", "add", "-b", "external", external);
+    const target = await new Workspaces(f.store).import(f.project, external);
+    const s = session(f.project, "approval recovery"); f.store.state.sessions.push(s);
+    let engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
+    try {
+      const running = engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { workspaceId: target.id })), () => {});
+      await until(() => s.workspaceSwitch?.phase === "approval");
+      const source = s.workspaceId; const requestId = s.workspaceSwitch!.id; const conversationId = s.conversationId;
+      await engine.close(); await running;
+      const restored = new Store(f.store.root);
+      engine = await openEngine(restored, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
+      await engine.restore(() => {}); const loaded = restored.state.sessions[0]!;
+      await until(() => loaded.workspaceSwitch?.phase === "approval");
+      assert.equal(loaded.workspaceSwitch!.id, requestId); assert.equal(loaded.conversationId, conversationId);
+      assert.equal(loaded.workspaceId, source);
+      if (approve) {
+        await engine.cancel(loaded.id);
+        assert.equal(loaded.stopped, true); assert.equal(loaded.workspaceId, source); assert.equal(loaded.workspaceSwitch, undefined);
+      } else {
+        await engine.approveWorkspace(loaded, requestId, false, () => {});
+        await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+        assert.equal(loaded.workspaceId, source); assert.equal(loaded.workspaceSwitch, undefined);
+        await assert.rejects(engine.approveWorkspace(loaded, requestId, true, () => {}), /no longer pending/);
+        assert.equal(readFileSync(join(external, "marker.txt"), "utf8"), "committed main");
+      }
+      assert.deepEqual(errors, []);
+    } finally { await engine.close(); f.cleanup(); }
+  }
+});
+
+test("workspace agent recovers binding and continuation crash gaps without duplicate worktrees or messages", async () => {
+  for (const afterSubmit of [false, true]) {
+    const f = gitWorkspaceFixture(); const errors: unknown[] = [];
+    f.project.workspaceDefault = { kind: "main" };
+    const s = session(f.project, "binding recovery"); f.store.state.sessions.push(s);
+    let engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
+    try {
+      await engine.run(s, f.project, "establish", () => {});
+      const oldIndex = readFileSync(f.store.file, "utf8");
+      const conversationId = s.conversationId;
+      const get = engine.harness.conversation.bind(engine.harness); let reached = false;
+      engine.harness.conversation = async (...args) => {
+        const conversation = await get(...args);
+        if (conversation) {
+          const submit = conversation.submit.bind(conversation);
+          conversation.submit = async (draft, context) => {
+            if (draft.entry?.kind !== "zz.workspace_continue") return submit(draft, context);
+            const result = afterSubmit ? await submit(draft, context) : undefined;
+            reached = true;
+            await new Promise<void>((_resolve, reject) => {
+              if (context.abortSignal?.aborted) reject(new Error("interrupted"));
+              else context.abortSignal?.addEventListener("abort", () => reject(new Error("interrupted")), { once: true });
+            });
+            return result!;
+          };
+        }
+        return conversation;
+      };
+      const running = engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { create: { baseRef: "main" } })), () => {});
+      await until(() => reached);
+      const targetId = s.workspaceId; const targetPath = f.store.sessionPath(s);
+      assert.notEqual(targetPath, f.path);
+      await engine.close(); await running;
+      writeFileSync(f.store.file, oldIndex);
+      const restored = new Store(f.store.root);
+      engine = await openEngine(restored, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
+      await engine.restore(() => {}); await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+      const loaded = restored.state.sessions[0]!;
+      assert.equal(loaded.conversationId, conversationId); assert.equal(loaded.workspaceId, targetId);
+      assert.equal(restored.sessionPath(loaded), targetPath); assert.equal(loaded.status, "completed");
+      const conversation = (await engine.harness.conversation(conversationId as ConversationId, BACKGROUND_CONTEXT))!;
+      const entries = (await conversation.entries({}, 200, undefined, BACKGROUND_CONTEXT)).items;
+      assert.equal(entries.filter((e) => e.kind === "zz.workspace_continue").length, 1);
+      assert.equal(entries.filter((e) => e.kind === "zz.workspace_switched").length, 1);
+      assert.equal(restored.workspaces.filter((w) => w.managed).length, 1);
+      const doc = await engine.harness.snapshot(WorkspaceDoc, conversationId as ConversationId, BACKGROUND_CONTEXT);
+      assert.equal(doc?.pending, undefined); assert.equal(doc?.switches, 1); assert.deepEqual(errors, []);
+    } finally { await engine.close(); f.cleanup(); }
+  }
+});
+
+test("workspace agent preserves queued reply order and runs queued tools in the destination", async () => {
+  const f = gitWorkspaceFixture(); const errors: unknown[] = [];
+  f.project.workspaceDefault = { kind: "main" };
+  const external = join(f.root, "external"); f.git("worktree", "add", "-b", "external", external);
+  const target = await new Workspaces(f.store).import(f.project, external);
+  const s = session(f.project, "queued handoff"); f.store.state.sessions.push(s);
+  const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
+  try {
+    const first = engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { workspaceId: target.id })), () => {});
+    await until(() => s.workspaceSwitch?.phase === "approval");
+    const second = engine.run(s, f.project, toolPrompt(writeCall("marker.txt", "queued reply wrote here")), () => {});
+    await until(() => !!s.queuedInputs?.length);
+    await engine.approveWorkspace(s, s.workspaceSwitch!.id, true, () => {});
+    await Promise.all([first, second]); await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+    assert.equal(readFileSync(join(external, "marker.txt"), "utf8"), "queued reply wrote here");
+    assert.equal(readFileSync(join(f.path, "marker.txt"), "utf8"), "committed main");
+    const conversation = (await engine.harness.conversation(s.conversationId as ConversationId, BACKGROUND_CONTEXT))!;
+    const inputs = (await conversation.entries({}, 200, undefined, BACKGROUND_CONTEXT)).items.filter((e) => e.model?.some((m) => m.role === "user")).reverse();
+    assert.equal(inputs.filter((e) => e.kind === "zz.workspace_continue").length, 0);
+    assert.equal(inputs.length, 2); assert.deepEqual(errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+
+test("workspace agent list reports actual dirty state and sharing, and schemas reject ambiguous entry", async () => {
+  const f = gitWorkspaceFixture(); f.project.workspaceDefault = { kind: "main" };
+  const s = session(f.project, "workspace inventory"); f.store.state.sessions.push(s);
+  const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, () => {}, undoModels());
+  try {
+    writeFileSync(join(f.path, "marker.txt"), "dirty main");
+    const other = session(f.project, "sharing main"); f.store.assignWorkspace(other, f.project, { kind: "main" }); f.store.state.sessions.push(other);
+    await engine.run(s, f.project, toolPrompt(taskCall("workspace_list", {})), () => {});
+    const inventory = JSON.parse(s.messages.find((m) => m.tool?.name === "workspace_list")!.tool!.output) as { currentWorkspaceId: string; workspaces: { workspaceId: string; hasLocalChanges: boolean; sessions: number; branch: string }[] };
+    assert.equal(inventory.currentWorkspaceId, s.workspaceId);
+    const current = inventory.workspaces.find((w) => w.workspaceId === s.workspaceId)!;
+    assert.equal(current.hasLocalChanges, true); assert.equal(current.sessions, 2); assert.equal(current.branch, "main");
+    const original = s.workspaceId;
+    const invalidArgs: Parameters<typeof taskCall>[1][] = [{}, { create: {}, workspaceId: original! }, { create: { baseRef: "missing" } }, { workspaceId: original!, remove: true }];
+    for (const args of invalidArgs) {
+      await engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", args)), () => {});
+      assert.equal(s.messages.findLast((m) => m.tool?.name === "workspace_enter")?.tool?.status, "error");
+      assert.equal(s.workspaceId, original);
+    }
+    await engine.run(s, f.project, toolPrompt(taskCall("workspace_exit", {})), () => {});
+    assert.match(s.messages.findLast((m) => m.tool?.name === "workspace_exit")?.tool?.output ?? "", /unchanged/);
+    assert.equal(f.store.workspaces.filter((w) => w.managed).length, 0);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("workspace agent entry blocks overlapping shell and undo, and cancellation withdraws queued replies", async () => {
+  const f = gitWorkspaceFixture(); f.project.workspaceDefault = { kind: "main" };
+  const external = join(f.root, "external"); f.git("worktree", "add", "-b", "external", external);
+  const target = await new Workspaces(f.store).import(f.project, external);
+  const s = session(f.project, "guard handoff"); f.store.state.sessions.push(s);
+  const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, () => {}, undoModels());
+  try {
+    await engine.run(s, f.project, "establish", () => {});
+    s.shellResponses = [{ id: "busy", command: "sleep", cwd: f.path, text: "", timestamp: 1, updatedAt: 1, status: "running", droppedBytes: 0, droppedLines: 0 }];
+    await engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { create: {} })), () => {});
+    assert.match(s.messages.findLast((m) => m.tool?.name === "workspace_enter")?.tool?.output ?? "", /direct shell/);
+    s.shellResponses[0]!.status = "done";
+    const other = session(f.project, "target user"); f.store.assignWorkspace(other, f.project, { kind: "existing", workspaceId: target.id }); f.store.state.sessions.push(other);
+    await engine.run(other, f.project, "establish target", () => {});
+    const running = engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { workspaceId: target.id })), () => {});
+    await until(() => s.workspaceSwitch?.phase === "approval");
+    await assert.rejects(undoLatest(engine, other), /handoff to finish/);
+    await assert.rejects(engine.compact(s, undefined, () => {}), /handoff before compacting/);
+    const queued = engine.run(s, f.project, toolPrompt(writeCall("should-not-exist.txt", "cancel me")), () => {});
+    await until(() => !!s.queuedInputs?.length);
+    await engine.cancel(s.id); await Promise.all([running, queued]);
+    assert.equal(f.store.workspace(s)?.kind, "main"); assert.equal(s.workspaceSwitch, undefined);
+    assert.equal(existsSync(join(f.path, "should-not-exist.txt")), false); assert.equal(existsSync(join(external, "should-not-exist.txt")), false);
+    assert.equal(s.queuedInputs, undefined);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("workspace agent undo stays after the boundary even when returning to a previously edited checkout", async () => {
+  const f = gitWorkspaceFixture(); f.project.workspaceDefault = { kind: "main" };
+  const s = session(f.project, "undo boundary"); f.store.state.sessions.push(s);
+  const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, () => {}, undoModels());
+  try {
+    await engine.run(s, f.project, toolPrompt(writeCall("marker.txt", "original workspace edits")), () => {});
+    const old = (await engine.undoCheckpoints(s))[0]!;
+    await engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { create: {} })), () => {}); await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+    const target = f.store.sessionPath(s);
+    await engine.run(s, f.project, toolPrompt(writeCall("marker.txt", "new workspace edits")), () => {});
+    await undoLatest(engine, s);
+    assert.equal(f.store.sessionPath(s), target);
+    assert.equal(readFileSync(join(target, "marker.txt"), "utf8"), "committed main");
+    assert.equal(readFileSync(join(f.path, "marker.txt"), "utf8"), "original workspace edits");
+    await assert.rejects(engine.undo(s, old.id, () => {}), /Cannot undo across/);
+    await engine.run(s, f.project, toolPrompt(taskCall("workspace_exit", {})), () => {}); await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+    await assert.rejects(engine.undo(s, old.id, () => {}), /Cannot undo across/);
+    assert.equal(readFileSync(join(f.path, "marker.txt"), "utf8"), "original workspace edits");
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+
+test("workspace agent approval works through the terminal UI and updates shell, discovery, and undo context", async () => {
+  const f = gitWorkspaceFixture(); f.project.workspaceDefault = { kind: "main" };
+  const external = join(f.root, "external"); f.git("worktree", "add", "-b", "external", external);
+  const target = await new Workspaces(f.store).import(f.project, external);
+  const s = session(f.project, "UI handoff"); f.store.state.sessions.push(s);
+  const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, () => {}, undoModels());
+  const controller = new Controller(f.store, engine); const terminal = new FakeTerminal();
+  const tui = new TuiAltScreen(terminal, false); const app = new Dashboard(controller, tui, () => {});
+  tui.setLayoutRoot(app); tui.setFocus(app); tui.start(); app.sync();
+  try {
+    controller.select(`session:${s.id}`); controller.open();
+    const running = engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { workspaceId: target.id })), () => controller.changed(true));
+    await until(() => s.workspaceSwitch?.phase === "approval");
+    app.composer.setValue("keep this draft"); controller.showWorkspace(); tui.renderNow();
+    assert.match(tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Approve external checkout/);
+    terminal.onInput("\r"); await running; await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+    assert.equal(s.workspaceId, target.id); assert.equal(controller.openedSessionId, s.id);
+    assert.equal(controller.executionProject(s)?.path, external); assert.equal(app.composer.getValue(), "keep this draft");
+    assert.equal(controller.runShell("pwd"), true); await controller.shellRun!.done; await tick();
+    assert.equal(s.shellResponses?.at(-1)?.cwd, external); assert.equal(s.shellResponses?.at(-1)?.text.trim(), external);
+    await controller.showUndo();
+    assert.equal(controller.dialog?.kind, "undo"); tui.renderNow();
+    assert.match(tui.getScreenLines().map(stripTerminalSequences).join("\n"), /last workspace switch/);
+  } finally { app.dispose(); await controller.close(); tui.stop(); f.cleanup(); }
+});
+
+
+test("workspace agent failed preparation keeps the binding and does not execute queued replies in the old checkout", async () => {
+  const f = gitWorkspaceFixture(); const errors: unknown[] = []; f.project.workspaceDefault = { kind: "main" };
+  const external = join(f.root, "external"); f.git("worktree", "add", "-b", "external", external);
+  const target = await new Workspaces(f.store).import(f.project, external);
+  const s = session(f.project, "failed handoff"); f.store.state.sessions.push(s);
+  const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
+  try {
+    const running = engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { workspaceId: target.id })), () => {});
+    await until(() => s.workspaceSwitch?.phase === "approval"); const original = s.workspaceId;
+    const queued = engine.run(s, f.project, toolPrompt(writeCall("marker.txt", "must never run")), () => {});
+    await until(() => !!s.queuedInputs?.length);
+    renameSync(external, `${external}.moved`);
+    await engine.approveWorkspace(s, s.workspaceSwitch!.id, true, () => {});
+    await Promise.all([running, queued]); await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+    assert.equal(s.workspaceId, original); assert.equal(s.status, "failed"); assert.equal(s.workspaceSwitch, undefined);
+    assert.equal(readFileSync(join(f.path, "marker.txt"), "utf8"), "committed main");
+    assert.equal(readFileSync(join(`${external}.moved`, "marker.txt"), "utf8"), "committed main");
+    assert.equal(s.queuedInputs, undefined); assert.match(s.preview, /handoff did not complete/); assert.deepEqual(errors, []);
+    const doc = await engine.harness.snapshot(WorkspaceDoc, s.conversationId as ConversationId, BACKGROUND_CONTEXT);
+    assert.equal(doc?.pending, undefined); assert.equal(doc?.switches, undefined);
+    assert.match(Object.values(doc!.receipts)[0]!, /failed/);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("workspace agent revalidates the prepared destination before committing a binding", async () => {
+  const f = gitWorkspaceFixture(); const errors: unknown[] = []; f.project.workspaceDefault = { kind: "main" };
+  const s = session(f.project, "boundary recheck"); f.store.state.sessions.push(s);
+  const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
+  try {
+    let moved = false;
+    const changed = () => {
+      if (!moved && s.workspaceSwitch?.phase === "ready") {
+        moved = true; const path = f.store.workspaces.find((w) => w.id === s.workspaceSwitch!.workspaceId)!.path;
+        renameSync(path, `${path}.moved`);
+      }
+    };
+    await engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { create: {} })), changed);
+    await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
+    assert.equal(moved, true); assert.equal(f.store.workspace(s)?.kind, "main");
+    assert.equal(s.status, "failed"); assert.match(s.preview, /stayed in its previous checkout/);
+    assert.deepEqual(errors, []);
   } finally { await engine.close(); f.cleanup(); }
 });

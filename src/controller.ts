@@ -23,6 +23,7 @@ export interface Engine {
   listModels(): Promise<ModelOption[]>;
   configure(change: Partial<AgentSettings>, session?: Session): Promise<void>;
   listSkills(project: Project): Promise<SkillOption[]>;
+  approveWorkspace?(session: Session, requestId: string, approved: boolean, changed: () => void): Promise<void>;
 }
 
 export type Mode = "sessions" | "projects" | "session";
@@ -36,7 +37,7 @@ export type Dialog =
   | { kind: "skills"; sessionId?: string; skills: SkillOption[] }
   | { kind: "usage" | "tasks"; sessionId: string }
   | { kind: "undo"; sessionId: string; checkpoints: UndoCheckpoint[] }
-  | { kind: "workspace"; projectId: string; sessionId?: string }
+  | { kind: "workspace"; projectId: string; sessionId?: string; requestId?: string }
   | { kind: "help" };
 
 export class Controller {
@@ -122,8 +123,24 @@ export class Controller {
   showWorkspace(): void {
     const project = this.project;
     if (!project) { this.fail("Select a project first."); return; }
-    this.dialog = { kind: "workspace", projectId: project.id, sessionId: this.mode === "session" ? this.openedSessionId : undefined };
+    this.dialog = { kind: "workspace", projectId: project.id, sessionId: this.mode === "session" ? this.openedSessionId : undefined,
+      requestId: this.mode === "session" ? this.opened?.workspaceSwitch?.id : undefined };
     this.notice = ""; this.changed();
+  }
+
+  async approveWorkspace(approved: boolean, sessionId?: string, expectedRequestId?: string): Promise<void> {
+    const session = sessionId ? this.session(sessionId) : this.mode === "session" ? this.opened : this.selected?.kind === "session" ? this.selected.session : undefined;
+    const request = session?.workspaceSwitch;
+    if (this.closing || !session || request?.phase !== "approval" || !this.engine.approveWorkspace) {
+      this.fail("No external workspace approval is pending for this session."); return;
+    }
+    if (expectedRequestId !== undefined && request.id !== expectedRequestId) { this.fail("Workspace approval changed. Reopen /workspace before deciding."); return; }
+    try {
+      await this.engine.approveWorkspace(session, request.id, approved, () => this.changed(true));
+      if (this.dialog?.kind === "workspace" && this.dialog.sessionId === session.id) this.dialog = undefined;
+      this.notice = approved ? "External workspace approved. Switching and continuing..." : "Workspace entry denied. The session stays in its current checkout.";
+      this.changed(true);
+    } catch (error) { this.fail(error); }
   }
 
   selectWorkspace(selection: WorkspaceSelection): boolean {
@@ -262,6 +279,7 @@ export class Controller {
     let session = replyTo ? this.session(replyTo) : this.mode === "session" ? this.opened : this.selected?.kind === "session" ? this.selected.session : undefined;
     const project = session ? this.store.state.projects.find((project) => project.id === session!.projectId) : !replyTo ? this.project : undefined;
     if (!project) { this.fail("Select a project or open a session before running a shell command."); return false; }
+    if (session?.workspaceSwitch) { this.fail("Finish or cancel this session's workspace handoff before running a direct shell command."); return false; }
     const shellWorkspace = session ? this.store.workspaceKey(session) : this.executionProject()?.path;
     if (shellWorkspace && this.undoing.has(shellWorkspace)) { this.fail("Wait for this workspace's /undo to finish before running a shell command."); return false; }
     if (session && this.store.workspace(session)?.status !== undefined && this.store.workspace(session)?.status !== "ready") {
@@ -533,6 +551,7 @@ export class Controller {
   async compact(instructions?: string): Promise<void> {
     const session = this.mode === "session" ? this.opened : this.selected?.kind === "session" ? this.selected.session : undefined;
     if (!session) { this.fail("Open or select a session first to compact it."); return; }
+    if (session.workspaceSwitch) { this.fail("Finish the workspace handoff before compacting."); return; }
     if (this.closing || this.cancelling.has(session.id)) return;
     if (this.compacting.has(session.id) || session.compactions?.length) {
       this.fail("This session is already compacting."); return;
@@ -555,6 +574,10 @@ export class Controller {
 
   private undoReady(session: Session): boolean {
     if (this.closing || this.undoing.has(this.store.workspaceKey(session))) return false;
+    if (this.store.state.sessions.some((s) => s.workspaceSwitch && (this.store.sessionPath(s) === this.store.sessionPath(session)
+      || this.store.workspaces.find((w) => w.id === s.workspaceSwitch!.workspaceId)?.path === this.store.sessionPath(session)))) {
+      this.fail("Wait for the workspace handoff to finish before /undo."); return false;
+    }
     const busy = this.store.state.sessions.some((other) => this.store.workspaceKey(other) === this.store.workspaceKey(session)
       && (this.canStop(other) || this.deletingSessions.has(other.id)));
     if (busy || this.configuring || this.activeShell && this.store.workspaceKey(this.session(this.activeShell.sessionId)!) === this.store.workspaceKey(session)) { this.fail("Wait for this workspace's sessions and direct shell command to finish before /undo. Use /stop for agent work."); return false; }
@@ -571,7 +594,7 @@ export class Controller {
       const checkpoints = await this.engine.undoCheckpoints(session);
       if (this.closing || this.dialog !== previousDialog || this.mode !== mode || this.undoTarget()?.id !== session.id) return;
       if (!this.undoReady(session)) return;
-      if (!checkpoints.length) { this.fail("No undo checkpoints yet. Only turns started after undo support was added can be restored."); return; }
+      if (!checkpoints.length) { this.fail(session.workspaceUndoBoundary ? "No undo checkpoints since the last workspace switch. Earlier history and files are kept." : "No undo checkpoints yet. Only turns started after undo support was added can be restored."); return; }
       this.dialog = { kind: "undo", sessionId: session.id, checkpoints };
       this.notice = "";
       this.changed();
@@ -766,6 +789,7 @@ export class Controller {
     if (images.length && this.engine.supportsImages?.(session) === false) {
       this.fail("This model does not accept images. Choose an image-capable model with /model."); return false;
     }
+    if (session?.workspaceSwitch?.phase === "approval") { this.fail("Approve or deny the external checkout with /workspace before replying."); return false; }
     const selection = project.workspaceDefault;
     const workspaceKey = session ? this.store.workspaceKey(session) : selection?.kind === "main" || selection?.kind === "existing"
       ? this.executionProject()?.path : undefined;
