@@ -26,6 +26,7 @@ import { askQuestionParameters, askMultipleQuestionsParameters, isQuestionTool, 
 import { createLegacyTaskExtension, createTaskExtension, TasksDoc, updateTaskCompletion, type TaskState } from "./tasks.js";
 import { TaskCleanup, taskCleanupClock, type TaskCleanupClock } from "./task-cleanup.js";
 import { createToolSchedulingExtension } from "./tool-scheduling.js";
+import { Workspaces } from "./workspaces.js";
 
 const ctx = BACKGROUND_CONTEXT;
 const SessionMeta = defineDoc<{ sessionId: string; priorUsage?: JsonRepresentation<Usage> }>({
@@ -199,7 +200,9 @@ export class DurableEngine implements Engine {
   private closing = false;
   private closePromise?: Promise<void>;
   private undoing = new Map<string, Promise<UndoResult>>();
-  private undoProjects = new Set<string>();
+  private undoWorkspaces = new Set<string>();
+  private readonly workspaces: Workspaces;
+  private readonly preparations = new Map<string, AbortController>();
   private undoPending = new Set<string>();
   private readonly taskCleanup: TaskCleanup;
 
@@ -210,13 +213,13 @@ export class DurableEngine implements Engine {
     readonly skills: SkillCatalog,
     readonly undoHistory: UndoHistory,
     taskClock: TaskCleanupClock,
-  ) { this.taskCleanup = new TaskCleanup(harness, report, taskClock); }
+  ) { this.taskCleanup = new TaskCleanup(harness, report, taskClock); this.workspaces = new Workspaces(store); }
 
   static async open(store: Store, model: ModelRef | undefined, report: (error: unknown) => void, models?: Models, thinkingLevel: ModelThinkingLevel = "off", skills = new SkillCatalog(), instructions = new InstructionCatalog(), taskClock: TaskCleanupClock = taskCleanupClock): Promise<DurableEngine> {
     models ??= await ModelRuntime.create({ allowModelNetwork: false });
     const registry = createRegistry();
     registry.install(createCodingTools({ images: await getImageProcessor() }));
-    const undoHistory = new UndoHistory(store.root);
+    const undoHistory = new UndoHistory(store.root, () => store.workspaces.filter((w) => w.managed && w.status === "ready" && w.checkoutPath).map((w) => w.checkoutPath!));
     registry.install(undoHistory.extension);
     registry.install(createTaskExtension(() => taskClock.now()));
     registry.install(createLegacyTaskExtension(() => taskClock.now()));
@@ -281,7 +284,7 @@ export class DurableEngine implements Engine {
 
   async configure(change: Partial<AgentSettings>, session?: Session): Promise<void> {
     if (this.closing) throw new Error("zz is closing.");
-    if (session && (this.undoProjects.has(session.projectId) || this.pendingUndo(session.projectId))) throw new Error("Wait for /undo to finish first.");
+    if (session && (this.undoWorkspaces.has(this.store.workspaceKey(session)) || this.pendingUndo(this.store.workspaceKey(session)))) throw new Error("Wait for /undo to finish first.");
     const thinkingOnly = change.thinkingLevel !== undefined && change.model === undefined;
     if (!thinkingOnly && session && (this.active.has(session.id) || session.status === "working" || session.compactions?.length || this.manualCompactions.has(session.id))) throw new Error("Wait for this session to finish first.");
     const current = this.configuration(session);
@@ -348,7 +351,7 @@ export class DurableEngine implements Engine {
     for (const session of this.store.state.sessions) {
       if (session.stopped) { await this.cancel(session.id); continue; }
       const inputs = [session.pendingInput, ...(session.followUps ?? [])].filter((input): input is PendingInput => !!input);
-      const project = this.store.state.projects.find((p) => p.id === session.projectId) ?? { id: session.projectId, path: session.projectId };
+      const project = this.store.state.projects.find((p) => p.id === session.projectId) ?? { id: session.projectId, path: this.store.workspace(session)?.projectPath ?? this.store.sessionPath(session) };
       // Replay the saved request IDs, including admissions committed just before a crash.
       for (const input of inputs) void this.startInput(session, project, input, changed)
         .catch((error: unknown) => { this.report(error); });
@@ -446,8 +449,9 @@ export class DurableEngine implements Engine {
 
   async run(session: Session, project: Project, prompt: string, changed: () => void, images: ImageAttachment[] = []): Promise<void> {
     if (this.closing) throw new Error("zz is closing.");
-    if (this.undoProjects.has(session.projectId)) throw new Error("This project is being restored. Wait for /undo to finish.");
-    if (this.pendingUndo(session.projectId)) throw new Error("An interrupted /undo in this project must finish before sending another prompt. Retry /undo.");
+    if (!session.workspaceId) this.store.assignWorkspace(session, project);
+    if (this.undoWorkspaces.has(this.store.workspaceKey(session))) throw new Error("This workspace is being restored. Wait for /undo to finish.");
+    if (this.pendingUndo(this.store.workspaceKey(session))) throw new Error("An interrupted /undo in this workspace must finish before sending another prompt. Retry /undo.");
     if (this.stopping.has(session.id)) throw new Error("This session is still stopping. Try again when it is idle.");
     delete session.stopped;
     if (!session.pendingInput && session.work?.finishedAt !== undefined) session.work = undefined;
@@ -499,12 +503,21 @@ export class DurableEngine implements Engine {
 
   private async admit(session: Session, project: Project, input: PendingInput, changed: () => void): Promise<Submission | undefined> {
     if (this.closing || this.stopping.has(session.id)) return;
+    const preparation = new AbortController();
+    this.preparations.set(session.id, preparation);
+    let cwd: string;
+    try { cwd = (await this.workspaces.ensure(session, project, changed, preparation.signal)).path; }
+    finally { this.preparations.delete(session.id); }
+    if (this.closing || this.stopping.has(session.id)) return;
+    if (this.undoWorkspaces.has(this.store.workspaceKey(session)) || this.pendingUndo(this.store.workspaceKey(session))) {
+      throw new Error("Finish /undo in this workspace before sending another prompt.");
+    }
     if (!input.prepared) {
       const references = referencedImages(input.prompt);
       if ((input.images?.length ?? 0) + references.length > MAX_ATTACHMENTS) throw new Error(`Attach at most ${MAX_ATTACHMENTS} images per message.`);
-      const images = await Promise.all(references.map((path) => prepareImageFile(path, project.path)));
+      const images = await Promise.all(references.map((path) => prepareImageFile(path, cwd)));
       // Save bytes with the prepared input: queued work and crash recovery never reread mutable source files.
-      const prepared = await this.skills.prepare(project.path, input.prompt);
+      const prepared = await this.skills.prepare(cwd, input.prompt);
       input.images = [...(input.images ?? []), ...images];
       input.prepared = prepared;
       this.store.save();
@@ -522,7 +535,7 @@ export class DurableEngine implements Engine {
       config.thinkingLevel = clampThinkingLevel(model, this.configuration(session).thinkingLevel);
       if (this.closing || this.stopping.has(session.id)) return;
       conversation = await this.harness.createConversation({
-        ownership: { kind: "ownerless" }, agent: { cwd: directory(project.path), ...config },
+        ownership: { kind: "ownerless" }, agent: { cwd: directory(cwd), ...config },
         init: async (tx, id) => { (await tx.doc(SessionMeta, id)).sessionId = session.id; },
       }, ctx);
       session.conversationId = conversation.id;
@@ -541,7 +554,7 @@ export class DurableEngine implements Engine {
   }
 
   compact(session: Session, instructions: string | undefined, changed: () => void): Promise<CompactResult> {
-    if (this.undoProjects.has(session.projectId) || this.pendingUndo(session.projectId)) return Promise.reject(new Error("Finish /undo before compacting this session."));
+    if (this.undoWorkspaces.has(this.store.workspaceKey(session)) || this.pendingUndo(this.store.workspaceKey(session))) return Promise.reject(new Error("Finish /undo before compacting this session."));
     if (this.closing) return Promise.reject(new Error("zz is closing."));
     if (this.stopping.has(session.id)) return Promise.reject(new Error("This session is still stopping."));
     if (this.manualCompactions.has(session.id) || session.compactions?.length) {
@@ -587,8 +600,8 @@ export class DurableEngine implements Engine {
     }
   }
 
-  private pendingUndo(projectId: string): boolean {
-    return this.store.state.sessions.some((session) => session.projectId === projectId && this.undoPending.has(session.id));
+  private pendingUndo(workspaceKey: string): boolean {
+    return this.store.state.sessions.some((session) => this.store.workspaceKey(session) === workspaceKey && this.undoPending.has(session.id));
   }
 
   async undoCheckpoints(session: Session): Promise<UndoCheckpoint[]> {
@@ -597,14 +610,15 @@ export class DurableEngine implements Engine {
   }
 
   undo(session: Session, checkpointId: string, changed: () => void): Promise<UndoResult> {
-    if (this.store.state.sessions.some((other) => other.projectId === session.projectId && other.id !== session.id && this.undoPending.has(other.id))) {
-      return Promise.reject(new Error("Finish the interrupted /undo in this project's other session first."));
+    if (this.store.state.sessions.some((other) => this.store.workspaceKey(other) === this.store.workspaceKey(session) && other.id !== session.id && this.undoPending.has(other.id))) {
+      return Promise.reject(new Error("Finish the interrupted /undo in this workspace's other session first."));
     }
     if (this.closing) return Promise.reject(new Error("zz is closing."));
-    if (this.undoProjects.has(session.projectId)) return Promise.reject(new Error("This project is already being restored."));
-    this.undoProjects.add(session.projectId);
+    if (this.undoWorkspaces.has(this.store.workspaceKey(session))) return Promise.reject(new Error("This workspace is already being restored."));
+    const workspaceKey = this.store.workspaceKey(session);
+    this.undoWorkspaces.add(workspaceKey);
     const promise = this.undoSession(session, checkpointId, changed).finally(() => {
-      this.undoProjects.delete(session.projectId);
+      this.undoWorkspaces.delete(workspaceKey);
       this.undoing.delete(session.id);
     });
     this.undoing.set(session.id, promise);
@@ -614,12 +628,12 @@ export class DurableEngine implements Engine {
   private async undoSession(session: Session, checkpointId: string, changed: () => void): Promise<UndoResult> {
     const conversation = this.handles.get(session.id);
     if (!conversation) throw new Error("Nothing to undo. Send a task first.");
-    for (const other of this.store.state.sessions.filter((item) => item.projectId === session.projectId)) {
+    for (const other of this.store.state.sessions.filter((item) => this.store.workspaceKey(item) === this.store.workspaceKey(session))) {
       const view = this.views.get(other.id)?.value;
       const live = view?.docs["pi.live"] as LiveState | undefined;
       if (this.active.has(other.id) || this.stopping.has(other.id) || live?.run || live?.compactions?.length
         || other.pendingInput || other.followUps?.length || other.queuedInputs?.length || this.manualCompactions.has(other.id)) {
-        throw new Error("Wait for this project's sessions to finish, or /stop them, before /undo.");
+        throw new Error("Wait for this workspace's sessions to finish, or /stop them, before /undo.");
       }
     }
     const state = await this.harness.snapshot(UndoDoc, conversation.id, ctx);
@@ -688,6 +702,7 @@ export class DurableEngine implements Engine {
 
   private async cancelSession(sessionId: string): Promise<void> {
     this.stopping.add(sessionId);
+    this.preparations.get(sessionId)?.abort();
     try {
       const session = this.store.state.sessions.find((s) => s.id === sessionId);
       const running = this.active.get(sessionId);
@@ -718,6 +733,7 @@ export class DurableEngine implements Engine {
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
+    for (const preparation of this.preparations.values()) preparation.abort();
     for (const title of this.titles.values()) title.abort.abort();
     // Finish admitted restores and checklist resets before sealing storage; stop all cleanup timers now.
     const cleanup = this.taskCleanup.close();

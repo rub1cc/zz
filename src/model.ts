@@ -83,8 +83,29 @@ export type SessionStatus = "working" | "needs-input" | "completed" | "failed" |
 export interface Project {
   id: string;
   path: string;
+  workspaceDefault?: WorkspaceSelection;
   /** Manual dashboard order; newly created sessions appear before these IDs. */
   sessionOrder?: string[];
+}
+
+export type WorkspaceSelection = { kind: "new"; baseRef: string } | { kind: "main" }
+  | { kind: "existing"; workspaceId: string };
+
+export interface Workspace {
+  id: string;
+  projectId: string;
+  /** Retained when a project is removed from the dashboard. */
+  projectPath: string;
+  path: string;
+  kind: "main" | "worktree";
+  managed: boolean;
+  status: "pending" | "ready" | "failed";
+  checkoutPath?: string;
+  repositoryRoot?: string;
+  branch?: string;
+  baseRef?: string;
+  baseCommit?: string;
+  error?: string;
 }
 
 export interface Message {
@@ -146,6 +167,7 @@ export interface Session {
   queuedInputs?: { id: number; text: string; mode?: ReplyBehavior; imageCount?: number }[];
   agent?: AgentSettings;
   projectId: string;
+  workspaceId?: string;
   title: string;
   /** Protects explicitly saved names from pending automatic title generation. */
   titleRenamed?: boolean;
@@ -182,9 +204,10 @@ export function markStopped(session: Session, now = Date.now()): void {
 }
 
 export interface State {
-  version: 1;
+  version: 1 | 2;
   projects: Project[];
   sessions: Session[];
+  workspaces?: Workspace[];
   selectedProjectId?: string;
   defaults?: AgentSettings;
   settings?: AppSettings;

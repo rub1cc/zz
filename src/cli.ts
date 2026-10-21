@@ -37,6 +37,8 @@ New tasks run in the selected project. Up/down or ctrl+p/ctrl+n navigates the li
 With an empty composer: enter opens a session; space peeks and lets you reply.
 ctrl+j inserts a newline; enter sends. ctrl+g edits the draft in $VISUAL/$EDITOR (default vim).
 /projects manages projects; Escape returns to the dashboard.
+/workspace selects main, new worktree, or existing checkout for new tasks.
+Git tasks default to separate worktrees from committed HEAD; existing sessions stay put.
 On the dashboard, shift+up/down reorders sessions within a project; ctrl+r renames the selected session.
 ctrl+x twice deletes a session or all sessions in the selected project. ctrl+c quits.
 If shutdown stalls, press ctrl+c again to force exit (automatic after 5 seconds).
@@ -45,7 +47,7 @@ Left Arrow returns to the dashboard when the composer is empty; work continues.
 /settings (or /config) configures busy replies, reasoning display and auto-compaction token budgets.
 /stop cancels the open or selected session without deleting its history.
 /copy [N] copies the Nth-latest assistant or shell response from the open or selected session (default 1).
-!command runs a local shell in this project (e.g. !pwd), without sending it to the model.
+!command runs a local shell in this session's workspace (e.g. !pwd), without sending it to the model.
 Shell output streams inline as a saved response. /stop stops all work in that session.
 /compact [instructions] summarizes older context, even with auto-compaction Off in /settings.
 /undo opens a checkpoint picker; Enter restores the selection, Escape cancels (not shell effects).

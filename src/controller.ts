@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { copyToClipboard } from "@earendil-works/pi-coding-agent";
-import { startWork, finishWork, isReplyBehavior, markStopped, rowId, rows, transcriptMessages, type ShellResponse, type ImageAttachment, type ReplyBehavior, type SettingsSelection, type AgentSettings, type CompactResult, type ModelOption, type Project, type Row, type Session, type SessionStats, type SkillOption, type UndoResult, type UndoCheckpoint } from "./model.js";
+import { startWork, finishWork, isReplyBehavior, markStopped, rowId, rows, transcriptMessages, type ShellResponse, type ImageAttachment, type ReplyBehavior, type SettingsSelection, type AgentSettings, type CompactResult, type ModelOption, type Project, type Row, type Session, type SessionStats, type SkillOption, type WorkspaceSelection, type Workspace, type UndoResult, type UndoCheckpoint } from "./model.js";
 import { directory, isImages, Store } from "./store.js";
+import { Workspaces } from "./workspaces.js";
 import { ShellRun } from "./shell.js";
 import { AuthFlow, type AuthAccess, type AuthAction } from "./auth.js";
 import type { CompactionPolicy } from "@earendil-works/pi-durable";
@@ -35,6 +36,7 @@ export type Dialog =
   | { kind: "skills"; sessionId?: string; skills: SkillOption[] }
   | { kind: "usage" | "tasks"; sessionId: string }
   | { kind: "undo"; sessionId: string; checkpoints: UndoCheckpoint[] }
+  | { kind: "workspace"; projectId: string; sessionId?: string }
   | { kind: "help" };
 
 export class Controller {
@@ -94,6 +96,63 @@ export class Controller {
   }
   get opened(): Session | undefined { return this.store.state.sessions.find((s) => s.id === this.openedSessionId); }
   session(id: string): Session | undefined { return this.store.state.sessions.find((s) => s.id === id); }
+  executionProject(session?: Session): Project | undefined {
+    const project = session ? this.store.state.projects.find((p) => p.id === session.projectId) : this.project;
+    if (!project) return;
+    const selected = project.workspaceDefault;
+    const path = session ? this.store.sessionPath(session) : selected?.kind === "existing"
+      ? this.store.workspaces.find((w) => w.id === selected.workspaceId && w.projectId === project.id)?.path ?? project.path : project.path;
+    return { ...project, path };
+  }
+
+  workspaceLabel(session: Session): string {
+    const workspace = this.store.workspace(session);
+    if (!workspace || workspace.kind === "main") return "main checkout";
+    return `${workspace.branch ?? "worktree"}${workspace.status === "ready" ? "" : ` (${workspace.status === "pending" ? "preparing" : "setup failed"})`}`;
+  }
+
+  workspaceDefaultLabel(): string {
+    const selection = this.project?.workspaceDefault;
+    if (!selection || selection.kind === "new") return `New worktree / base ${selection?.baseRef ?? "HEAD"} (main directory outside Git)`;
+    if (selection.kind === "main") return "Main checkout";
+    const workspace = this.store.workspaces.find((w) => w.id === selection.workspaceId);
+    return workspace?.branch ?? workspace?.path ?? "Missing workspace";
+  }
+
+  showWorkspace(): void {
+    const project = this.project;
+    if (!project) { this.fail("Select a project first."); return; }
+    this.dialog = { kind: "workspace", projectId: project.id, sessionId: this.mode === "session" ? this.openedSessionId : undefined };
+    this.notice = ""; this.changed();
+  }
+
+  selectWorkspace(selection: WorkspaceSelection): boolean {
+    const project = this.project;
+    if (this.closing || !project) return false;
+    if (selection.kind === "existing" && !this.store.workspaces.some((w) => w.id === selection.workspaceId && w.projectId === project.id && w.status === "ready")) {
+      this.fail("Choose a ready workspace belonging to this project."); return false;
+    }
+    if (selection.kind === "new" && (!selection.baseRef.trim() || selection.baseRef.startsWith("-") || /[\r\n\0]/.test(selection.baseRef))) {
+      this.fail("Choose a valid base ref, such as HEAD or main."); return false;
+    }
+    const previous = project.workspaceDefault;
+    project.workspaceDefault = selection;
+    try { this.store.save(); }
+    catch (error) { project.workspaceDefault = previous; this.fail(error); return false; }
+    this.dialog = undefined; this.notice = "Workspace default saved for new sessions; existing sessions stay where they are.";
+    this.changed(); return true;
+  }
+
+  async importWorkspace(path: string): Promise<Workspace | undefined> {
+    const project = this.project;
+    if (!project || this.closing) return;
+    try {
+      const workspace = await new Workspaces(this.store).import(project, path);
+      if (!this.closing && this.project?.id === project.id) this.selectWorkspace({ kind: "existing", workspaceId: workspace.id });
+      return workspace;
+    } catch (error) { if (!this.closing) this.fail(error); }
+  }
+
   get configuration(): AgentSettings { return this.engine.configuration(this.mode === "session" ? this.opened : undefined); }
 
   showAuth(action: AuthAction, provider?: string): void {
@@ -203,18 +262,23 @@ export class Controller {
     let session = replyTo ? this.session(replyTo) : this.mode === "session" ? this.opened : this.selected?.kind === "session" ? this.selected.session : undefined;
     const project = session ? this.store.state.projects.find((project) => project.id === session!.projectId) : !replyTo ? this.project : undefined;
     if (!project) { this.fail("Select a project or open a session before running a shell command."); return false; }
-    if (this.undoing.has(project.id)) { this.fail("Wait for this project's /undo to finish before running a shell command."); return false; }
+    const shellWorkspace = session ? this.store.workspaceKey(session) : this.executionProject()?.path;
+    if (shellWorkspace && this.undoing.has(shellWorkspace)) { this.fail("Wait for this workspace's /undo to finish before running a shell command."); return false; }
+    if (session && this.store.workspace(session)?.status !== undefined && this.store.workspace(session)?.status !== "ready") {
+      this.fail("Wait for workspace preparation to finish, or reply to retry failed setup."); return false;
+    }
     if (project.id === this.deletingProjectId || session && this.deletingSessions.has(session.id)) {
       this.fail("This session is being deleted. Wait before running a shell command."); return false;
     }
     let cwd: string;
-    try { cwd = directory(project.path); }
+    try { cwd = directory(session ? this.store.sessionPath(session) : this.executionProject()?.path ?? project.path); }
     catch (error) { this.fail(error); return false; }
     const created = !session;
     const now = Date.now();
     if (!session) {
       session = { id: randomUUID(), projectId: project.id, title: `!${command.trim().replace(/\s+/g, " ")}`.slice(0, 80),
         status: "completed", preview: "Running shell command...", createdAt: now, updatedAt: now, messages: [], agent: this.engine.configuration() };
+      this.store.assignWorkspace(session, project, project.workspaceDefault?.kind === "existing" ? project.workspaceDefault : { kind: "main" });
       this.store.state.sessions.push(session);
     }
     const timestamp = Math.max(now, session.messages.at(-1)?.timestamp ?? 0, session.shellResponses?.at(-1)?.timestamp ?? 0);
@@ -314,7 +378,7 @@ export class Controller {
   }
 
   async skills(): Promise<void> {
-    const project = this.project;
+    const project = this.executionProject(this.mode === "session" ? this.opened : undefined);
     const mode = this.mode;
     const sessionId = mode === "session" ? this.openedSessionId : undefined;
     if (!project) { this.fail("Select a project first."); return; }
@@ -490,10 +554,10 @@ export class Controller {
   }
 
   private undoReady(session: Session): boolean {
-    if (this.closing || this.undoing.has(session.projectId)) return false;
-    const busy = this.store.state.sessions.some((other) => other.projectId === session.projectId
+    if (this.closing || this.undoing.has(this.store.workspaceKey(session))) return false;
+    const busy = this.store.state.sessions.some((other) => this.store.workspaceKey(other) === this.store.workspaceKey(session)
       && (this.canStop(other) || this.deletingSessions.has(other.id)));
-    if (busy || this.configuring || this.activeShell?.projectId === session.projectId) { this.fail("Wait for this project's sessions and direct shell command to finish before /undo. Use /stop for agent work."); return false; }
+    if (busy || this.configuring || this.activeShell && this.store.workspaceKey(this.session(this.activeShell.sessionId)!) === this.store.workspaceKey(session)) { this.fail("Wait for this workspace's sessions and direct shell command to finish before /undo. Use /stop for agent work."); return false; }
     return true;
   }
 
@@ -522,7 +586,8 @@ export class Controller {
       this.fail("Open /undo and select a checkpoint first."); return;
     }
     if (!this.undoReady(session)) return;
-    this.undoing.add(session.projectId);
+    const workspaceKey = this.store.workspaceKey(session);
+    this.undoing.add(workspaceKey);
     this.notice = "Restoring the selected checkpoint...";
     this.changed();
     try {
@@ -533,7 +598,7 @@ export class Controller {
       this.store.save();
       return result;
     } catch (error) { this.fail(error); }
-    finally { this.undoing.delete(session.projectId); this.changed(); }
+    finally { this.undoing.delete(workspaceKey); this.changed(); }
   }
 
   private hasPendingRun(session: Session): boolean {
@@ -701,7 +766,10 @@ export class Controller {
     if (images.length && this.engine.supportsImages?.(session) === false) {
       this.fail("This model does not accept images. Choose an image-capable model with /model."); return false;
     }
-    if (this.undoing.has(project.id)) { this.fail("This project is being restored. Wait for /undo to finish."); return false; }
+    const selection = project.workspaceDefault;
+    const workspaceKey = session ? this.store.workspaceKey(session) : selection?.kind === "main" || selection?.kind === "existing"
+      ? this.executionProject()?.path : undefined;
+    if (workspaceKey && this.undoing.has(workspaceKey)) { this.fail("This workspace is being restored. Wait for /undo to finish."); return false; }
     if (project.id === this.deletingProjectId) { this.fail("This project's sessions are being deleted."); return false; }
     if (target && (this.cancelling.has(target) || this.deletingSessions.has(target))) {
       this.fail("This session is stopping. Wait until it is idle before sending another.");

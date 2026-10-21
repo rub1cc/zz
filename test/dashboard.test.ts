@@ -113,7 +113,7 @@ test("dashboard header shows the running version, new-session defaults, selected
   } finally { await f.cleanup(); }
 });
 
-test("dashboard project headings show Git branches without changing session headers", async () => {
+test("dashboard project headings and session headers show Git branch context", async () => {
   const f = setup();
   try {
     // Leave the dashboard while initializing so its first query reads the new repository.
@@ -138,7 +138,7 @@ test("dashboard project headings show Git branches without changing session head
     f.tui.renderNow();
     const lines = f.tui.getScreenLines().map(stripTerminalSequences);
     assert.equal(lines[0]!.trimEnd(), "Fix login");
-    assert.equal(lines[1]!.trimEnd(), `${displayPath(f.pa.path)}  completed`);
+    assert.equal(lines[1]!.trimEnd(), `${displayPath(f.pa.path)} fix/login completed`);
   } finally { await f.cleanup(); }
 });
 
@@ -1527,7 +1527,7 @@ test("checkpoint restore refuses busy projects, blocks sends, preserves new draf
     f.c.send("task"); await tick(); f.c.open();
     const s = f.c.opened!;
     s.status = "working";
-    await f.c.showUndo(); assert.match(f.c.notice, /Wait for this project's sessions/);
+    await f.c.showUndo(); assert.match(f.c.notice, /Wait for this workspace's sessions/);
     assert.equal(f.engine.undos.length, 0);
     s.status = "completed";
     f.engine.undo = async () => new Promise((resolve) => { finish = resolve; });

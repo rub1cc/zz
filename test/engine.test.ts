@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -1447,7 +1448,7 @@ test("undo refuses a running project and works after stopping the turn", async (
     const running = f.engine.run(f.s, f.project, toolPrompt({ type: "toolCall", id: "shell", name: "bash",
       arguments: { command: "printf 'UNDO_BUSY_TEST\n'; sleep 30" } }), () => {});
     await until(() => f.s.messages.some((message) => message.tool?.output.includes("UNDO_BUSY_TEST")));
-    await assert.rejects(undoLatest(f.engine, f.s), /Wait for this project's sessions/);
+    await assert.rejects(undoLatest(f.engine, f.s), /Wait for this workspace's sessions/);
     await f.engine.cancel(f.s.id); await running;
     const result = await undoLatest(f.engine, f.s);
     assert.equal(result.shell, true);
@@ -2288,4 +2289,96 @@ test("engine tool rounds wait for shell mutations before admitting following fil
     assert.equal(read.output, "after");
     assert.deepEqual(f.errors, []);
   } finally { await f.engine.close(); f.cleanup(); }
+});
+
+
+function gitWorkspaceFixture() {
+  const temp = temporary();
+  const path = join(temp.root, "repo"); mkdirSync(path);
+  const git = (...args: string[]) => execFileSync("git", ["-C", path, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  git("init", "-b", "main"); git("config", "user.name", "Test"); git("config", "user.email", "test@example.test");
+  writeFileSync(join(path, "marker.txt"), "committed main");
+  mkdirSync(join(path, ".pi")); writeFileSync(join(path, ".pi", "APPEND_SYSTEM.md"), "CHECKOUT_INSTRUCTIONS");
+  git("add", "."); git("commit", "-qm", "Initial");
+  const store = new Store(join(temp.root, "data")); const project = store.addProject(path);
+  return { ...temp, path, git, store, project };
+}
+
+test("Git tasks get distinct workspaces, workspace instructions and persistent conversations", async () => {
+  const f = gitWorkspaceFixture(); const errors: unknown[] = [];
+  let engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
+  try {
+    writeFileSync(join(f.path, "marker.txt"), "dirty main");
+    const a = session(f.project, "first"); const b = session(f.project, "second");
+    f.store.state.sessions.push(a, b);
+    await Promise.all([engine.run(a, f.project, toolPrompt(writeCall("marker.txt", "first workspace")), () => {}),
+      engine.run(b, f.project, toolPrompt(writeCall("marker.txt", "second workspace")), () => {})]);
+    const wa = f.store.workspace(a)!; const wb = f.store.workspace(b)!;
+    assert.notEqual(wa.path, wb.path); assert.equal(wa.status, "ready");
+    assert.equal(readFileSync(join(wa.path, "marker.txt"), "utf8"), "first workspace");
+    assert.equal(readFileSync(join(wb.path, "marker.txt"), "utf8"), "second workspace");
+    assert.equal(readFileSync(join(f.path, "marker.txt"), "utf8"), "dirty main");
+    const conversationId = a.conversationId;
+    const conversation = await engine.harness.conversation(a.conversationId as ConversationId, BACKGROUND_CONTEXT);
+    assert.equal((await conversation!.agent(BACKGROUND_CONTEXT)).cwd, wa.path);
+    const firstWorkspace = wa.path;
+    await engine.run(a, f.project, toolPrompt(writeCall(f.store.file, "not state"), writeCall(join(wa.checkoutPath!, ".git"), "not git metadata")), () => {});
+    assert.equal(JSON.parse(readFileSync(f.store.file, "utf8")).version, 2);
+    assert.match(readFileSync(join(wa.checkoutPath!, ".git"), "utf8"), /^gitdir:/);
+    assert.ok(a.messages.filter((m) => m.tool?.status === "error").length >= 2);
+    await engine.close();
+    const restored = new Store(f.store.root);
+    let requestPrompt = "";
+    engine = await openEngine(restored, { provider: "test", modelId: "mock" }, (e) => errors.push(e), models({ context: (context) => {
+      requestPrompt = getCurrentSystemPrompt(context.messages);
+    } }));
+    await engine.restore(() => {});
+    const loaded = restored.state.sessions[0]!;
+    await engine.run(loaded, restored.state.projects[0]!, "read marker", () => {});
+    assert.equal(loaded.conversationId, conversationId); assert.equal(restored.sessionPath(loaded), firstWorkspace);
+    assert.match(loaded.messages.at(-1)!.text, /first workspace/);
+    assert.match(requestPrompt, /CHECKOUT_INSTRUCTIONS/); assert.ok(requestPrompt.includes(firstWorkspace));
+    assert.equal(restored.workspaces.filter((w) => w.managed).length, 2); assert.deepEqual(errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("undo coordinates shared checkouts but not independent workspaces", async () => {
+  const f = gitWorkspaceFixture();
+  const runtime = undoModels();
+  const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, () => {}, runtime);
+  try {
+    const a = session(f.project, "undo isolated"); const b = session(f.project, "other workspace");
+    f.store.state.sessions.push(a, b);
+    await engine.run(a, f.project, toolPrompt(writeCall("marker.txt", "changed")), () => {});
+    await engine.run(b, f.project, "done", () => {});
+    assert.equal(readFileSync(join(f.store.sessionPath(a), "marker.txt"), "utf8"), "changed");
+    b.pendingInput = { requestId: "other-work", prompt: "later" };
+    await undoLatest(engine, a);
+    assert.equal(readFileSync(join(f.store.sessionPath(a), "marker.txt"), "utf8"), "committed main");
+    delete b.pendingInput;
+    await engine.run(a, f.project, toolPrompt(writeCall("marker.txt", "changed again")), () => {});
+    const shared = session(f.project, "review same checkout");
+    f.store.assignWorkspace(shared, f.project, { kind: "existing", workspaceId: a.workspaceId! });
+    shared.pendingInput = { requestId: "shared-work", prompt: "later" }; f.store.state.sessions.push(shared);
+    await assert.rejects(undoLatest(engine, a), /workspace's sessions/);
+    delete shared.pendingInput;
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("workspace preparation failures never start a provider and retry keeps the saved checkout identity", async () => {
+  const f = gitWorkspaceFixture(); let requests = 0;
+  f.project.workspaceDefault = { kind: "new", baseRef: "missing-ref" };
+  let engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, () => {}, models({ started: () => requests++ }));
+  try {
+    const task = session(f.project, "retry setup"); f.store.state.sessions.push(task);
+    await engine.run(task, f.project, "read marker", () => {});
+    assert.equal(requests, 0); assert.equal(task.status, "failed"); assert.equal(task.conversationId, undefined);
+    const workspaceId = task.workspaceId; const workspace = f.store.workspace(task)!;
+    assert.equal(workspace.status, "failed"); workspace.baseRef = "main"; f.store.save();
+    await engine.close(); const restored = new Store(f.store.root);
+    engine = await openEngine(restored, { provider: "test", modelId: "mock" }, () => {}, models({ started: () => requests++ }));
+    await engine.restore(() => {}); const loaded = restored.state.sessions[0]!;
+    await engine.run(loaded, restored.state.projects[0]!, "read marker", () => {});
+    assert.equal(loaded.workspaceId, workspaceId); assert.equal(loaded.status, "completed"); assert.ok(requests > 0);
+  } finally { await engine.close(); f.cleanup(); }
 });

@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProgramStatus, Terminal } from "@earendil-works/pi-tui";
 import type { Engine } from "../src/controller.js";
@@ -6,7 +7,8 @@ import { sessionStats } from "../src/usage.js";
 import type { ImageAttachment, AgentSettings, CompactResult, ModelOption, Project, Session, SkillOption } from "../src/model.js";
 
 export function temporary(): { root: string; cleanup(): void } {
-  const root = mkdtempSync(join(process.cwd(), ".zz-test-"));
+  // Ordinary fixture projects must not inherit the source repository's Git checkout.
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "zz-test-"));
   return { root, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 

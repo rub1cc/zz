@@ -190,7 +190,7 @@ test("cached task state is backward compatible, validated and preserved without 
     createTask(tasks, { subject: "Pending", activeForm: "Working", description: "Requirements" });
     store.state.sessions[0]!.tasks = tasks.items; store.save();
     assert.deepEqual(new Store(f.root).state.sessions[0]?.tasks, tasks.items);
-    assert.equal(new Store(f.root).state.version, 1);
+    assert.equal(new Store(f.root).state.version, 2);
     const valid = readFileSync(store.file, "utf8");
     for (const invalid of [null, {}, [{ id: "0", subject: "Bad", status: "pending", blockedBy: [] }],
       [{ ...tasks.items[0], status: "blocked" }], [{ ...tasks.items[0], description: 42 }],

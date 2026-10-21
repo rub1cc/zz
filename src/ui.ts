@@ -22,6 +22,7 @@ import { composerCommands } from "./discovery.js";
 import { composerStatus, usageDetails } from "./usage.js";
 import { TaskDisplay, taskDetails, taskProgress, taskVisibleLimit, type TaskDisplayClock } from "./task-display.js";
 import { GitBranches } from "./git-branches.js";
+import { WorkspaceDialog } from "./workspace-dialog.js";
 import { version } from "./version.js";
 
 export const scrollToEndIndicator = () => accent("[ Scroll to bottom (/bottom) ]");
@@ -68,10 +69,15 @@ class SessionList extends Dynamic {
     this.renameHeight = 0;
     const lines: string[] = [];
     const rows = c.currentRows;
+    const titleOf = (session: Session) => {
+      const workspace = c.store.workspace(session);
+      const branch = workspace?.status === "ready" ? this.branches.value(workspace.path) : undefined;
+      return `${oneLine(session.title)}${workspace?.kind === "worktree" ? ` [${oneLine(branch ?? c.workspaceLabel(session))}]` : ""}`;
+    };
     const titleWidths = new Map<string, number>();
     for (const row of rows) {
       if (row.kind === "session") titleWidths.set(row.project.id,
-        Math.max(titleWidths.get(row.project.id) ?? 0, visibleWidth(oneLine(row.session.title))));
+        Math.max(titleWidths.get(row.project.id) ?? 0, visibleWidth(titleOf(row.session))));
     }
     for (const row of rows) {
       if (row.kind === "project" && lines.length) lines.push("");
@@ -109,7 +115,7 @@ class SessionList extends Dynamic {
         } else {
           const progress = taskProgress(session.tasks);
           const time = `${progress ? `${progress}  ` : ""}${age(activityTimestamp(session))}`;
-          const title = oneLine(session.title);
+          const title = titleOf(session);
           const titleWidth = titleWidths.get(row.project.id)!;
           const label = status === "completed" ? "Done" : status === "needs-input" ? "Needs input"
             : status === "working" ? "Working" : status === "failed" ? "Failed" : "Paused";
@@ -260,6 +266,15 @@ export class Dashboard extends VStack implements Focusable {
       return true;
     }
     if (command === "/settings" || command === "/config") { this.controller.showSettings(); return true; }
+    if (/^\/workspace(?:\s|$)/.test(command)) {
+      if (command === "/workspace") this.controller.showWorkspace();
+      else if (this.controller.mode === "session") this.controller.fail("Use /workspace to inspect this session. Change workspace defaults from the dashboard; existing sessions never move.");
+      else if (command === "/workspace main") this.controller.selectWorkspace({ kind: "main" });
+      else if (/^\/workspace new(?:\s|$)/.test(command)) this.controller.selectWorkspace({ kind: "new", baseRef: command.slice("/workspace new".length).trim() || "HEAD" });
+      else if (/^\/workspace add\s+/.test(command)) void this.controller.importWorkspace(command.slice("/workspace add".length).trim());
+      else this.controller.fail("Usage: /workspace, /workspace main, /workspace new [base-ref], /workspace add PATH");
+      return true;
+    }
     if (command === "/projects") { this.controller.toggleProjects(); return true; }
     if (command === "/session") { this.controller.showUsage(); return true; }
     if (command === "/tasks") { this.controller.showTasks(); return true; }
@@ -304,7 +319,15 @@ export class Dashboard extends VStack implements Focusable {
   private header(_width: number): string[] {
     const c = this.controller;
     if (c.mode === "projects") return [`${bold("Projects")}  ${dim("add and remove directories")}`, ""];
-    if (c.mode === "session" && c.opened) return [bold(oneLine(c.opened.title)), `${dim(oneLine(displayPath(c.project?.path ?? "")))}  ${dim(displayStatus(c.opened))}`, ""];
+    if (c.mode === "session" && c.opened) {
+      const path = c.store.sessionPath(c.opened);
+      const shared = c.store.state.sessions.filter((s) => c.store.sessionPath(s) === path).length;
+      const branch = this.branches.value(path);
+      if (c.store.workspace(c.opened)?.kind === "worktree") return [bold(oneLine(c.opened.title)),
+        dim(oneLine(`${branch ?? c.workspaceLabel(c.opened)} / ${displayStatus(c.opened)}${shared > 1 ? ` / shared by ${shared} sessions` : ""}`)),
+        dim(oneLine(displayPath(path)))];
+      return [bold(oneLine(c.opened.title)), dim(oneLine(`${displayPath(path)}  ${branch ?? c.workspaceLabel(c.opened)}${shared > 1 ? ` / shared by ${shared} sessions` : ""}  ${displayStatus(c.opened)}`)), ""];
+    }
     const visible = c.store.state.sessions.filter((s) => c.store.state.projects.some((p) => p.id === s.projectId));
     const count = (status: string) => visible.filter((s) => displayStatus(s) === status).length;
     const extra = count("failed") + count("paused");
@@ -330,7 +353,7 @@ export class Dashboard extends VStack implements Focusable {
       this.tui.terminal.rows - this.header(width).length - input.length - notice.length - 3));
     return ["",
       ...(!this.questionComposer && c.mode === "session" ? this.taskDisplay.render(c.opened, width, taskBudget, this.tui.terminal.rows) : []),
-      ...notice, ...input,
+      ...notice, ...(c.mode === "sessions" && c.project ? [dim(oneLine(`Workspace: ${c.workspaceDefaultLabel()} /workspace`))] : []), ...input,
       composerStatus(c.configuration, c.engine.stats(c.mode === "session" ? c.opened : undefined),
         c.auth?.codexQuota?.value(c.configuration.model?.provider))];
   }
@@ -339,7 +362,9 @@ export class Dashboard extends VStack implements Focusable {
 
   sync(): void {
     const c = this.controller;
-    this.branches.sync(c.mode === "session" ? [] : c.store.state.projects.map((project) => project.path));
+    const visibleWorkspaceIds = new Set(c.store.state.sessions.filter((s) => c.store.state.projects.some((p) => p.id === s.projectId)).map((s) => s.workspaceId));
+    this.branches.sync(c.mode === "session" ? c.opened ? [c.store.sessionPath(c.opened)] : []
+      : [...c.store.state.projects.map((project) => project.path), ...c.store.workspaces.filter((w) => w.status === "ready" && visibleWorkspaceIds.has(w.id)).map((w) => w.path)]);
     const quotaSettings = c.dialog?.kind === "peek" ? c.engine.configuration(c.session(c.dialog.sessionId)) : c.configuration;
     c.auth?.codexQuota?.select(c.mode === "projects" ? undefined : quotaSettings.model?.provider);
     this.taskDisplay.sync(c.store.state.sessions);
@@ -348,7 +373,7 @@ export class Dashboard extends VStack implements Focusable {
       this.composer.setHistory(promptHistory(c.mode === "session" ? c.opened : undefined));
     }
     this.composer.setAttachmentScope(c.mode === "session" ? `session:${c.openedSessionId}` : `new:${c.project?.path}`);
-    const project = c.project;
+    const project = c.executionProject(c.mode === "session" ? c.opened : undefined);
     this.composer.setDiscovery(project && c.mode !== "projects"
       ? { cwd: project.path, commands: true, session: c.mode === "session", selectedSession: c.selected?.kind === "session" } : undefined,
       project ? { list: () => c.engine.listSkills(project) } : undefined);
@@ -419,7 +444,7 @@ export class Dashboard extends VStack implements Focusable {
           if (c.mode === "session" && c.openedSessionId === undoSessionId && !this.composer.hasContent) {
             this.composer.setValue(result.prompt); c.changed();
           }
-        }) : c.dialog.kind === "settings" ? new SettingsPage(c, this.tui, c.dialog) : new DialogView(c, this.tui, this.taskDisplay), {
+        }) : c.dialog.kind === "workspace" ? new WorkspaceDialog(c, this.tui, c.dialog) : c.dialog.kind === "settings" ? new SettingsPage(c, this.tui, c.dialog) : new DialogView(c, this.tui, this.taskDisplay), {
         width: "88%", maxHeight: "85%", margin: 1,
       });
     }
@@ -547,7 +572,7 @@ class DialogView implements Component, Focusable {
     const dialog = controller.dialog;
     if (this.input instanceof Composer && dialog?.kind === "peek") {
       this.input.setHistory(promptHistory(controller.session(dialog.sessionId)));
-      const project = controller.store.state.projects.find((p) => p.id === controller.session(dialog.sessionId)?.projectId);
+      const project = controller.executionProject(controller.session(dialog.sessionId));
       if (project) this.input.setDiscovery({ cwd: project.path, commands: false, session: true },
         { list: () => controller.engine.listSkills(project) });
     }
@@ -585,7 +610,7 @@ class DialogView implements Component, Focusable {
   render(width: number): string[] {
     const c = this.controller;
     const dialog = c.dialog;
-    if (!dialog || dialog.kind === "model" || dialog.kind === "thinking" || dialog.kind === "skills" || dialog.kind === "settings") return [];
+    if (!dialog || dialog.kind === "workspace" || dialog.kind === "model" || dialog.kind === "thinking" || dialog.kind === "skills" || dialog.kind === "settings") return [];
     const inner = Math.max(1, width - 4);
     const frame = (lines: string[]) => [
       `+${"-".repeat(Math.max(0, width - 2))}+`,
@@ -621,7 +646,7 @@ class DialogView implements Component, Focusable {
       "/               search commands available in this view",
       "@               search files; @image.png attaches on send",
       "ctrl+v          paste a clipboard image, copied files or text",
-      "!command        run a local shell command in this project's directory",
+      "!command        run a local shell command in this session's workspace",
       "backspace       remove an inline [Image #N] tag and its attachment",
       "/settings       replies, model, reasoning display and auto-compaction",
       "tab             complete a path at the cursor",

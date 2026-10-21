@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync
 import { homedir } from "node:os";
 import { compactionPolicy, compactionSettingsError } from "./compaction-settings.js";
 import { join, resolve } from "node:path";
-import { isReplyBehavior, isThinkingLevel, type ShellResponse, type ImageAttachment, type AppSettings, type AgentSettings, type PendingInput, type PreparedInput, type Project, type State, type ToolActivity } from "./model.js";
+import { isReplyBehavior, isThinkingLevel, type ShellResponse, type ImageAttachment, type AppSettings, type AgentSettings, type PendingInput, type PreparedInput, type Project, type Session, type Workspace, type WorkspaceSelection, type State, type ToolActivity } from "./model.js";
 
 export function directory(value: string): string {
   const expanded = value === "~" ? homedir() : value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
@@ -19,15 +19,39 @@ export function displayPath(path: string): string {
   return path === home ? "~" : path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path;
 }
 
+function isWorkspaceSelection(value: WorkspaceSelection): boolean {
+  return !!value && (value.kind === "main" || value.kind === "new" && typeof value.baseRef === "string" && !!value.baseRef.trim()
+    || value.kind === "existing" && typeof value.workspaceId === "string");
+}
+
+function validWorkspaceDefault(project: Project, workspaces?: Workspace[]): boolean {
+  const selection = project.workspaceDefault;
+  return selection === undefined || isWorkspaceSelection(selection) && (selection.kind !== "existing"
+    || !!workspaces?.some((w) => w.id === selection.workspaceId && w.projectId === project.id));
+}
+
+function isWorkspace(value: Workspace): boolean {
+  return !!value && [value.id, value.projectId, value.projectPath, value.path].every((s) => typeof s === "string" && !!s)
+    && [value.projectPath, value.path, value.checkoutPath, value.repositoryRoot].every((s) => s === undefined || resolve(s) === s)
+    && ["main", "worktree"].includes(value.kind) && typeof value.managed === "boolean"
+    && ["pending", "ready", "failed"].includes(value.status)
+    && [value.checkoutPath, value.repositoryRoot, value.branch, value.baseRef, value.baseCommit, value.error].every((s) => s === undefined || typeof s === "string");
+}
+
 function isState(value: unknown): value is State {
   if (!value || typeof value !== "object") return false;
   const state = value as State;
-  return state.version === 1 && Array.isArray(state.projects) && Array.isArray(state.sessions)
+  return (state.version === 1 || state.version === 2 && Array.isArray(state.workspaces)) && Array.isArray(state.projects) && Array.isArray(state.sessions)
+    && (state.workspaces === undefined || Array.isArray(state.workspaces) && state.workspaces.every(isWorkspace)
+      && new Set(state.workspaces.map((w) => w.id)).size === state.workspaces.length)
+    && state.sessions.every((s) => s.workspaceId === undefined || typeof s.workspaceId === "string"
+      && !!state.workspaces?.some((w) => w.id === s.workspaceId && w.projectId === s.projectId))
     && (state.defaults === undefined || isAgentSettings(state.defaults))
     && (state.settings === undefined || !!state.settings && isReplyBehavior(state.settings.replyBehavior)
       && (state.settings.showThinking === undefined || typeof state.settings.showThinking === "boolean")
       && (state.settings.compaction === undefined || compactionSettingsError(state.settings.compaction) === undefined))
     && state.projects.every((p) => typeof p.id === "string" && typeof p.path === "string"
+      && validWorkspaceDefault(p, state.workspaces)
       && (p.sessionOrder === undefined || Array.isArray(p.sessionOrder)
         && p.sessionOrder.every((id) => typeof id === "string") && new Set(p.sessionOrder).size === p.sessionOrder.length))
     && state.sessions.every((s) => typeof s.id === "string" && typeof s.projectId === "string"
@@ -142,8 +166,81 @@ export class Store {
       if (!isState(value)) throw new Error(`Invalid zz state: ${this.file}. Restore it from a backup; it has not been overwritten.`);
       this.state = value;
     } else {
-      this.state = { version: 1, projects: [], sessions: [] };
+      this.state = { version: 2, projects: [], sessions: [], workspaces: [] };
     }
+    if (this.state.version === 1) this.migrateWorkspaces();
+  }
+
+  get workspaces(): Workspace[] { return this.state.workspaces ??= []; }
+
+  private migrateWorkspaces(): void {
+    const backup = join(this.root, "state.v1.backup.json");
+    if (!existsSync(backup)) writeFileSync(backup, readFileSync(this.file), { flag: "wx", mode: 0o600 });
+    this.state.version = 2;
+    this.state.workspaces = [];
+    const identities = new Map<string, Project>();
+    for (const project of this.state.projects) identities.set(project.id, project);
+    for (const session of this.state.sessions) {
+      if (!identities.has(session.projectId) && resolve(session.projectId) === session.projectId) {
+        identities.set(session.projectId, { id: session.projectId, path: session.projectId });
+      }
+    }
+    for (const [oldId, project] of identities) {
+      project.id = randomUUID();
+      this.mainWorkspace(project);
+      for (const session of this.state.sessions) if (session.projectId === oldId) {
+        session.projectId = project.id; session.workspaceId = this.mainWorkspace(project).id;
+      }
+      if (this.state.selectedProjectId === oldId) this.state.selectedProjectId = project.id;
+    }
+    this.save();
+  }
+
+  mainWorkspace(project: Project): Workspace {
+    let workspace = this.workspaces.find((w) => w.projectId === project.id && w.kind === "main");
+    if (!workspace) {
+      workspace = { id: randomUUID(), projectId: project.id, projectPath: project.path, path: project.path,
+        kind: "main", managed: false, status: "ready" };
+      this.workspaces.push(workspace);
+    }
+    return workspace;
+  }
+
+  workspace(session: Session): Workspace | undefined {
+    return this.workspaces.find((w) => w.id === session.workspaceId && w.projectId === session.projectId);
+  }
+
+  sessionPath(session: Session): string {
+    const workspace = this.workspace(session);
+    if (session.workspaceId && !workspace) throw new Error("Session workspace is missing. Restore state from a backup.");
+    const path = workspace?.path ?? this.state.projects.find((p) => p.id === session.projectId)?.path
+      ?? this.workspaces.find((w) => w.projectId === session.projectId && w.kind === "main")?.path;
+    if (!path) throw new Error("Session has no workspace directory.");
+    return path;
+  }
+
+  workspaceKey(session: Session): string {
+    const path = this.sessionPath(session);
+    try { return realpathSync(path); } catch { return path; }
+  }
+
+  assignWorkspace(session: Session, project: Project, selection: WorkspaceSelection = project.workspaceDefault ?? { kind: "new", baseRef: "HEAD" }): Workspace {
+    let workspace: Workspace;
+    if (selection.kind === "main") workspace = this.mainWorkspace(project);
+    else if (selection.kind === "existing") {
+      const existing = this.workspaces.find((w) => w.id === selection.workspaceId && w.projectId === project.id);
+      if (!existing) throw new Error("Selected workspace no longer exists. Choose /workspace again.");
+      workspace = existing;
+    } else {
+      const id = randomUUID();
+      const checkoutPath = join(realpathSync(this.root), "worktrees", project.id, id);
+      const slug = session.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32) || "task";
+      workspace = { id, projectId: project.id, projectPath: project.path, path: checkoutPath, checkoutPath,
+        kind: "worktree", managed: true, status: "pending", branch: `zz/${slug}-${id.slice(0, 8)}`, baseRef: selection.baseRef };
+      this.workspaces.push(workspace);
+    }
+    session.workspaceId = workspace.id;
+    return workspace;
   }
 
   get settings(): AppSettings {
@@ -158,9 +255,10 @@ export class Store {
     const path = directory(value);
     let project = this.state.projects.find((p) => p.path === path);
     if (!project) {
-      // Directory identity also reconnects sessions when a removed project is re-added.
-      project = { id: path, path };
+      const retained = this.workspaces.find((w) => w.kind === "main" && w.projectPath === path);
+      project = { id: retained?.projectId ?? randomUUID(), path };
       this.state.projects.push(project);
+      this.mainWorkspace(project);
     }
     this.state.selectedProjectId = project.id;
     this.save();

@@ -249,6 +249,51 @@ npm run dev -- --model openai/gpt-5.4 --thinking high
   notice. Clipboard access uses Pi's official clipboard helper and its platform
   fallbacks.
 
+## Workspaces And Worktrees
+
+New coding tasks in Git projects get their own worktree by default. Each task
+starts from the current committed `HEAD`, on a branch such as
+`zz/fix-auth-a1b2c3d4`. Tasks outside Git use the project directory instead.
+Existing sessions keep their original directories and conversations.
+
+The dashboard shows the workspace choice above the composer and worktree labels
+beside session titles. Open `/workspace` before sending a task to choose:
+
+- **New worktree**: a separate checkout for each new session.
+- **Main checkout**: work directly in the project directory.
+- **Existing workspace**: share a checkout with another conversation.
+- **Register existing worktree**: add a Git worktree belonging to this repository.
+
+The choice is saved for that project and applies only to new sessions. Shortcuts
+on the dashboard are `/workspace main`, `/workspace new [base-ref]`, and
+`/workspace add PATH`. Base refs can be local branches, tags, commits, or existing
+remote-tracking refs; zz does not fetch automatically. Inside a session,
+`/workspace` shows its directory, ownership, and sharing, and can make that
+workspace the default for new sessions without moving the current conversation.
+
+New worktrees contain committed files, not the main checkout's uncommitted edits,
+untracked files, ignored `.env` files, or installed dependencies. Initialize
+submodules and install dependencies yourself in the workspace when needed; this
+version does not run setup hooks or copy local configuration automatically.
+Skills, instructions, file completion, image references, tools, and session shell
+commands use the session's workspace. Before a new checkout exists, dashboard
+completion and skill discovery use the project directory. For projects rooted in
+a repository subfolder, the session keeps that same relative subfolder in its
+new worktree.
+
+Checkout preparation is saved before Git creation and can recover after restart.
+Failed preparation does not run the agent in the main checkout: fix the reported
+Git problem, then reply to retry the same checkout. An established checkout that
+is missing must be restored at its original path or replaced by a new session;
+it is not silently recreated, since local work might be missing.
+
+Multiple sessions may share a workspace; their file changes are shared too.
+`/undo` waits for work in that directory, not every session in the project.
+Deleting sessions or removing projects never removes worktrees or branches.
+Unreferenced workspaces remain selectable in `/workspace`. Review and merge work
+with Git; automatic merge, worktree removal, and cleanup policies are not included.
+Worktrees separate files and branches, but are not security sandboxes.
+
 ## Direct Shell
 
 - Start a task/reply with `!` to execute the remainder directly, for example
@@ -257,7 +302,9 @@ npm run dev -- --model openai/gpt-5.4 --thinking high
   adds a newline before sending.
 - Uses the open session, the dashboard-selected session, or the session in an
   existing peek. From a project heading, creates and opens a normal local session
-  for its response, without starting an agent. The process-wide working directory
+  for its response, without starting an agent. Existing sessions use their workspace;
+  a project-only shell uses the main directory or the selected existing workspace,
+  without creating a new worktree. The process-wide working directory
   never changes. A `!` elsewhere in ordinary prompt text is not a shell shortcut.
 - Plain stdout/stderr streams **inline as an expanded response**, with the command,
   working directory, and exit code/error. No shell popup opens. Normal transcript
@@ -889,14 +936,16 @@ Existing data is not moved automatically: with zz stopped, move the previous
 data directory (`~/.local/share/zz` or `$XDG_DATA_HOME/zz`) to `~/.zz`, or keep
 using it with an explicit override. Move the whole directory, not just `state.json`.
 
-- `state.json`: project list, selection, session index, and cached display history.
+- `state.json`: projects, workspaces, selection, session index, and cached display history.
+- `worktrees/`: retained managed Git checkouts, grouped by project and workspace ID.
+- `state.v1.backup.json`: original state index saved before the workspace-format migration.
 - `sessions.sqlite`: durable conversations, model context, tools, and checkpoints.
 - `undo/`: persistent file backups for `/undo` (may contain sensitive source contents).
 - A heartbeat lock permits only one dashboard per data directory. After a crash,
   allow 10 seconds for the stale lock to expire.
 
-Each session has a separate conversation and working directory; sessions can run
-concurrently. The process never changes its global working directory. Startup
+Each session has a separate conversation and an assigned workspace; sessions can run
+concurrently and may share a workspace. The process never changes its global working directory. Startup
 registers the launch directory and selects it. Closing checkpoints running work;
 reopening resumes it, deduplicating previously submitted input. Work does not run
 while zz is closed. An interrupted model request may be retried and billed again.
@@ -904,15 +953,24 @@ Forced shutdown relies on the last committed durable checkpoint; pending inputs
 were saved before execution. It does not undo effects of tools already executed.
 
 **Agents can read/write files and execute shell commands with your permissions.**
-A project directory is not a sandbox or Git worktree. Concurrent sessions in the
-same directory can edit the same files. Only use trusted projects and prompts.
+A workspace is not a sandbox. Concurrent sessions sharing a checkout can edit the
+same files. Only use trusted projects and prompts.
 zz supplies skill discovery, explicit skill loading and automatic instruction-file
 loading. Coding-agent extensions and MCP are not loaded by this application.
 
 Deleting sessions individually or by project never deletes project files. Session
 deletion removes its UI record, but the underlying durable audit history remains
 in SQLite (the current durable API has no conversation-purge operation). Back up
-the complete data directory while zz is stopped if you need to preserve it.
+the complete data directory and the original repositories while zz is stopped if
+you need to preserve managed worktrees and their Git metadata. Worktree and
+conversation paths are absolute: moving the data directory does not relocate
+existing checkouts or repair their Git links. Choose a data location before
+creating worktrees and retain existing paths when changing it.
+
+The first workspace-aware startup migrates the index to format 2, assigns stable
+project IDs, and attaches old sessions to their original directories. The original
+index is retained as `state.v1.backup.json`; old zz versions refuse the new format.
+Removing and re-adding the same directory still reconnects its retained sessions.
 
 ## Releases
 
@@ -960,6 +1018,9 @@ npm run build
 npm test
 ```
 
+Workspace tests cover real Git checkout isolation, migration, shared workspaces,
+subdirectory projects, base pinning, failed/interrupted preparation, retained
+checkouts, workspace-scoped shell/skills/undo, and narrow/wide workspace controls.
 Tests cover project scoping, peek/reply/open, project removal and restoration,
 double-confirm deletion, narrow and wide-character rendering, real durable
 storage and tools with an offline test provider, interrupted-run recovery, skill
