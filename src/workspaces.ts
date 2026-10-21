@@ -3,7 +3,6 @@ import { mkdir, realpath } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { promisify } from "node:util";
-import { randomUUID } from "node:crypto";
 import type { Project, Session, Workspace } from "./model.js";
 import { directory, Store } from "./store.js";
 
@@ -55,46 +54,48 @@ export class Workspaces {
   private readonly pending = new Map<string, Promise<Workspace>>();
   constructor(private readonly store: Store) {}
 
-  ensure(session: Session, project: Project, changed: () => void, signal?: AbortSignal, allowMainFallback = true): Promise<Workspace> {
+  ensure(session: Session, project: Project, changed: () => void, signal?: AbortSignal, allowMainFallback = true, checkpoint?: (workspace: Workspace) => Promise<void>): Promise<Workspace> {
     const workspace = this.store.workspace(session) ?? this.store.assignWorkspace(session, project, { kind: "main" });
-    const running = this.pending.get(workspace.id);
+    const key = JSON.stringify([workspace.projectId, workspace.id]);
+    const running = this.pending.get(key);
     if (running) return running;
-    const promise = this.prepare(session, project, workspace, changed, signal, allowMainFallback).finally(() => this.pending.delete(workspace.id));
-    this.pending.set(workspace.id, promise);
+    const promise = this.prepare(session, project, workspace, changed, signal, allowMainFallback, checkpoint).finally(() => this.pending.delete(key));
+    this.pending.set(key, promise);
     return promise;
   }
 
-  private async prepare(session: Session, project: Project, workspace: Workspace, changed: () => void, signal: AbortSignal | undefined, allowMainFallback: boolean): Promise<Workspace> {
+  private async prepare(session: Session, project: Project, workspace: Workspace, changed: () => void, signal: AbortSignal | undefined, allowMainFallback: boolean, checkpoint?: (workspace: Workspace) => Promise<void>): Promise<Workspace> {
     if (workspace.status === "ready") {
-      directory(workspace.path);
+      await this.validateExisting(project, workspace, signal);
+      await this.store.saveAsync();
       return workspace;
     }
     if (!workspace.managed || !workspace.checkoutPath || !workspace.branch || !workspace.baseRef) {
       throw new Error("Workspace preparation metadata is incomplete. Choose another workspace for a new session.");
     }
+    const save = async () => { await this.store.saveAsync(); await checkpoint?.(workspace); changed(); };
     workspace.status = "pending";
     delete workspace.error;
     session.preview = "Preparing workspace...";
-    await this.store.saveAsync(); changed();
+    await save();
     try {
       const root = await repositoryRoot(project.path, signal);
       if (!root) {
         if (workspace.repositoryRoot || !allowMainFallback) throw new Error("The Git repository used for this launch is unavailable; refusing to switch to the main directory.");
         const main = this.store.mainWorkspace(project);
-        session.workspaceId = main.id;
-        this.store.state.workspaces = this.store.workspaces.filter((w) => w.id !== workspace.id);
+        session.workspace = main;
         await this.store.saveAsync(); changed();
         return main;
       }
       if (workspace.repositoryRoot && workspace.repositoryRoot !== root) throw new Error("The project now resolves to a different repository root; inspect it before retrying.");
       workspace.repositoryRoot = root;
-      await this.store.saveAsync();
+      await save();
       const base = workspace.baseRef;
       if (base.startsWith("-") || !base.trim() || /[\r\n\0]/.test(base)) throw new Error("Choose a valid Git base ref (for example HEAD or main).");
       // Pin the base before creating anything so a retried launch cannot move with HEAD.
       workspace.baseCommit ??= await git(root, ["rev-parse", "--verify", "--end-of-options", `${base}^{commit}`], signal);
       workspace.path = join(workspace.checkoutPath, relative(root, directory(project.path)));
-      await this.store.saveAsync();
+      await save();
       await mkdir(dirname(workspace.checkoutPath), { recursive: true });
       const listed = await listedWorktrees(root, signal);
       const registered = listed.has(workspace.checkoutPath);
@@ -116,12 +117,12 @@ export class Workspaces {
       }
       workspace.path = directory(workspace.path);
       workspace.status = "ready";
-      await this.store.saveAsync(); changed();
+      await save();
       return workspace;
     } catch (error) {
       workspace.status = "failed";
       workspace.error = error instanceof Error ? error.message : String(error);
-      await this.store.saveAsync(); changed();
+      await save();
       throw new Error(`Workspace preparation failed: ${workspace.error}`, { cause: error });
     }
   }
@@ -141,18 +142,24 @@ export class Workspaces {
       if (branch.startsWith("-") || /[\r\n\0]/.test(branch)) throw new Error("Choose a valid new branch name.");
       await git(root, ["check-ref-format", "--branch", branch], signal);
       const ref = `refs/heads/${branch}`;
-      if ((await git(root, ["for-each-ref", "--format=%(refname)", ref], signal)).split("\n").includes(ref)) throw new Error("The requested branch already exists. Choose another name or enter its registered workspace.");
+      if ((await git(root, ["for-each-ref", "--format=%(refname)", ref], signal)).split("\n").includes(ref)) throw new Error("The requested branch already exists. Choose another name or enter its existing worktree.");
     }
   }
 
   async validateExisting(project: Project, workspace: Workspace, signal?: AbortSignal): Promise<void> {
     if (directory(workspace.path) !== workspace.path) throw new Error("Workspace path now resolves elsewhere; inspect it before entering.");
-    if (workspace.kind === "main") return;
+    if (workspace.kind === "main") {
+      if (workspace.path !== project.path) throw new Error("Main workspace no longer matches the project's directory.");
+      return;
+    }
     const root = await repositoryRoot(project.path, signal);
     const target = await repositoryRoot(workspace.path, signal);
-    if (!root || !target || !(await listedWorktrees(root, signal)).has(target)) throw new Error("The destination is no longer a worktree of this project.");
+    const listed = root ? await listedWorktrees(root, signal) : undefined;
+    if (!root || !target || !listed?.has(target)) throw new Error("The destination is no longer a worktree of this project.");
     const expected = directory(join(target, relative(root, directory(project.path))));
     if (workspace.path !== expected) throw new Error("Destination no longer matches this project's relative directory.");
+    workspace.checkoutPath = target;
+    workspace.branch = listed.get(target)?.branch;
   }
 
   async describe(workspace: Workspace, signal?: AbortSignal): Promise<{ available: boolean; isGit?: boolean; branch?: string; hasLocalChanges?: boolean; error?: string }> {
@@ -170,22 +177,42 @@ export class Workspaces {
     }
   }
 
-  async import(project: Project, value: string): Promise<Workspace> {
-    const path = directory(value);
-    const root = await repositoryRoot(project.path);
-    if (!root) throw new Error("Existing worktrees require a Git project.");
-    const listed = await listedWorktrees(root);
-    const candidateRoot = await repositoryRoot(path);
-    if (!candidateRoot || !listed.has(candidateRoot)) throw new Error("Choose a Git worktree belonging to this project.");
-    const expected = directory(join(candidateRoot, relative(root, directory(project.path))));
-    if (path !== candidateRoot && path !== expected) throw new Error("Choose the worktree root or this project's directory within it.");
-    const existing = this.store.workspaces.find((w) => w.projectId === project.id && w.path === expected);
-    if (existing) return existing;
-    const workspace: Workspace = { id: randomUUID(), projectId: project.id, projectPath: project.path, path: expected,
-      checkoutPath: candidateRoot, branch: listed.get(candidateRoot)?.branch, kind: "worktree", managed: false, status: "ready" };
-    this.store.workspaces.push(workspace);
-    try { await this.store.saveAsync(); }
-    catch (error) { this.store.state.workspaces = this.store.workspaces.filter((w) => w !== workspace); throw error; }
+  /** Git owns the checkout inventory; listing never registers or persists anything. */
+  async discover(project: Project, signal?: AbortSignal): Promise<Workspace[]> {
+    const main = this.store.mainWorkspace(project);
+    const root = await repositoryRoot(project.path, signal);
+    if (!root) return [main];
+    const listed = await listedWorktrees(root, signal);
+    const result: Workspace[] = [main];
+    const bindings = this.store.boundWorkspaces;
+    const subdir = relative(root, directory(project.path));
+    for (const [checkoutPath, details] of listed) {
+      if (checkoutPath === root) continue;
+      const path = join(checkoutPath, subdir);
+      try {
+        // Prunable Git entries and checkouts without this project's subdirectory are not destinations.
+        if (directory(path) !== path) continue;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ENOTDIR") continue;
+        throw error;
+      }
+      const binding = bindings.find((w) => w.projectId === project.id && w.path === path);
+      result.push({ ...binding, id: binding?.id ?? path, projectId: project.id, projectPath: project.path,
+        path, checkoutPath, kind: "worktree", managed: binding?.managed ?? false, status: binding?.status ?? "ready", branch: details.branch });
+    }
+    return result;
+  }
+
+  async resolve(project: Project, value: string, signal?: AbortSignal): Promise<Workspace> {
+    const discovered = await this.discover(project, signal);
+    const byId = discovered.find((w) => w.id === value);
+    if (byId) return byId;
+    let path: string;
+    try { path = directory(value); }
+    catch { throw new Error("Choose a Git worktree belonging to this project from workspace_list."); }
+    const workspace = discovered.find((w) => w.path === path || w.checkoutPath === path);
+    if (!workspace) throw new Error("Choose a Git worktree belonging to this project from workspace_list.");
     return workspace;
   }
 }

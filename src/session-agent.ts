@@ -191,7 +191,7 @@ export class SessionAgent {
   }
   describe(session: Session) {
     return { sessionId: session.id, title: session.title, status: displayStatus(session), preview: sessionPreview(session).slice(0, 250),
-      model: this.host.configuration(session).model, workspaceId: session.workspaceId, parentId: session.delegation?.parentId,
+      model: this.host.configuration(session).model, workspaceId: session.workspace?.id, parentId: session.delegation?.parentId,
       waitingFor: session.waitingFor ?? [] };
   }
   private result(session: Session) { const result = lastReply(session); return { ...this.describe(session), result: result.slice(0, 8000), resultTruncated: result.length > 8000 }; }

@@ -96,7 +96,7 @@ export interface Project {
 }
 
 export type WorkspaceSelection = { kind: "new"; baseRef: string } | { kind: "main" }
-  | { kind: "existing"; workspaceId: string };
+  | { kind: "existing"; path: string };
 
 export interface Workspace {
   id: string;
@@ -205,6 +205,8 @@ export interface Session {
   queuedInputs?: { id: number; text: string; mode?: ReplyBehavior; imageCount?: number; source?: PendingInput["source"] }[];
   agent?: AgentSettings;
   projectId: string;
+  workspace?: Workspace;
+  /** Legacy index binding, read only during migration from format 2. */
   workspaceId?: string;
   /** Presentation caches; the durable zz.workspace document is authoritative. */
   workspaceSwitch?: { id: string; phase: "approval" | "preparing" | "ready" | "bound"; workspaceId: string; path: string };
@@ -245,9 +247,12 @@ export function markStopped(session: Session, now = Date.now()): void {
 }
 
 export interface State {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   projects: Project[];
+  /** Stable identities survive removal of a project from the dashboard. */
+  projectIds?: Record<string, string>;
   sessions: Session[];
+  /** Legacy inventory, removed when migrating to format 3. */
   workspaces?: Workspace[];
   selectedProjectId?: string;
   defaults?: AgentSettings;

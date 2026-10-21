@@ -35,13 +35,14 @@ const empty = Type.Object({}, { additionalProperties: false });
 export const workspaceEnterParameters = Type.Object({
   create: Type.Optional(Type.Object({ baseRef: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })),
     branch: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })) }, { additionalProperties: false })),
+  path: Type.Optional(Type.String({ minLength: 1 })),
   workspaceId: Type.Optional(Type.String({ minLength: 1 })),
 }, { additionalProperties: false });
 
-function enterArguments(value: unknown): { create?: { baseRef?: string; branch?: string }; workspaceId?: string } {
+function enterArguments(value: unknown): { create?: { baseRef?: string; branch?: string }; workspaceId?: string; path?: string } {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Workspace entry requires an object.");
-  const args = value as { create?: { baseRef?: string; branch?: string }; workspaceId?: string };
-  if ((args.create !== undefined) === (args.workspaceId !== undefined)) throw new Error("Specify exactly one of create or workspaceId.");
+  const args = value as { create?: { baseRef?: string; branch?: string }; workspaceId?: string; path?: string };
+  if ([args.create, args.path, args.workspaceId].filter((value) => value !== undefined).length !== 1) throw new Error("Specify exactly one of create, path, or workspaceId.");
   return args;
 }
 
@@ -65,20 +66,24 @@ export class WorkspaceAgent {
 
   readonly extension = defineExtension({
     name: "zz-workspaces",
-    sections: [section("zz_workspace_policy", () => "Use workspace_list to inspect this session's current checkout and registered alternatives. workspace_enter creates and enters a worktree from main, or enters an existing workspace; workspace_exit returns to main and keeps all checkouts. These are real session handoffs, unlike shell cd. Call workspace_enter or workspace_exit ALONE in a tool round, as its final action: zz ends the turn and automatically continues after switching. Existing edits stay in their original directory. Already-isolated sessions cannot create another new worktree; use an existing one or return to main. External entry requires the user's explicit zz approval; never work around a denial with shell commands. Do not retry a denied handoff until the user requests it. No implicit copies, stashes, merges, or deletions.", { tag: false })],
+    sections: [section("zz_workspace_policy", () => "Use workspace_list to inspect this session's current checkout and Git worktrees. workspace_enter creates and enters a worktree from main, or enters an existing workspace; workspace_exit returns to main and keeps all checkouts. These are real session handoffs, unlike shell cd. Call workspace_enter or workspace_exit ALONE in a tool round, as its final action: zz ends the turn and automatically continues after switching. Existing edits stay in their original directory. Already-isolated sessions cannot create another new worktree; use an existing one or return to main. External entry requires the user's explicit zz approval; never work around a denial with shell commands. Do not retry a denied handoff until the user requests it. No implicit copies, stashes, merges, or deletions.", { tag: false })],
     tools: [
-      defineTool({ name: "workspace_list", description: "List this project's registered workspaces, current binding, branches, local changes, availability, and session sharing. Does not switch or create anything.",
+      defineTool({ name: "workspace_list", description: "List this project's Git worktrees, current binding, branches, local changes, availability, and session sharing. Does not switch or create anything.",
         parameters: Type.Object({ cursor: Type.Optional(Type.Integer({ minimum: 0 })), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })) }, { additionalProperties: false }),
         replay: "safe", callers: ["model"], execute: async (args, api, context) => {
           const session = this.requireSession(api.conversationId);
           const state = await api.snapshot(WorkspaceDoc, api.conversationId, context);
           this.sync(session, state);
-          const registered = this.store.workspaces.filter((w) => w.projectId === session.projectId)
-            .sort((a, b) => Number(b.id === session.workspaceId) - Number(a.id === session.workspaceId));
+          const discovered = await this.workspaces.discover(this.project(session), context.abortSignal);
+          // Keep missing session bindings visible, but never treat old registrations as destinations.
+          const bindings = this.store.boundWorkspaces.filter((w) => w.projectId === session.projectId
+            && !discovered.some((d) => d.path === w.path));
+          const listed = [...discovered, ...bindings]
+            .sort((a, b) => Number(b.path === session.workspace?.path) - Number(a.path === session.workspace?.path));
           const start = args.cursor ?? 0;
-          const page = registered.slice(start, start + (args.limit ?? 25));
+          const page = listed.slice(start, start + (args.limit ?? 25));
           const describe = async (workspace: Workspace) => ({
-            workspaceId: workspace.id, current: workspace.id === session.workspaceId, path: workspace.path, kind: workspace.kind,
+            workspaceId: workspace.id, current: workspace.path === session.workspace?.path, path: workspace.path, kind: workspace.kind,
             managed: workspace.managed, status: workspace.status,
             sessions: this.store.state.sessions.filter((s) => this.store.sessionPath(s) === workspace.path).length,
             ...await this.workspaces.describe(workspace, context.abortSignal),
@@ -86,9 +91,9 @@ export class WorkspaceAgent {
           const workspaces = [];
           for (let i = 0; i < page.length; i += 4) workspaces.push(...await Promise.all(page.slice(i, i + 4).map(describe)));
           const next = start + page.length;
-          return output(JSON.stringify({ currentWorkspaceId: session.workspaceId, workspaces, total: registered.length, nextCursor: next < registered.length ? next : null }));
+          return output(JSON.stringify({ currentWorkspaceId: session.workspace?.id, workspaces, total: listed.length, nextCursor: next < listed.length ? next : null }));
         } }),
-      defineTool({ name: "workspace_enter", description: "Create and enter a new Git worktree from the main workspace, or enter a registered workspace by workspaceId. create.baseRef defaults to HEAD; create.branch is optional. Existing edits are not transferred. Call ALONE in a tool round. External checkouts wait for explicit user approval in zz. Ends this turn and automatically continues in the same conversation after a durable handoff. Does not merge or delete anything.",
+      defineTool({ name: "workspace_enter", description: "Create and enter a new Git worktree from the main workspace, or enter a Git worktree by path (or workspaceId from workspace_list). create.baseRef defaults to HEAD; create.branch is optional. Existing edits are not transferred. Call ALONE in a tool round. External checkouts wait for explicit user approval in zz. Ends this turn and automatically continues in the same conversation after a durable handoff. Does not merge or delete anything.",
         parameters: workspaceEnterParameters, prepareArguments: (args) => enterArguments(args), replay: "safe", callers: ["model"],
         execute: async (args, api, context) => this.request(enterArguments(args), false, api, context) }),
       defineTool({ name: "workspace_exit", description: "Return this session to its project's main workspace, keeping its current worktree, branch, edits, and conversation. Call ALONE in a tool round. Ends this turn and automatically continues after switching. If already in main, reports a no-op.",
@@ -116,13 +121,11 @@ export class WorkspaceAgent {
 
   sync(session: Session, state: Readonly<WorkspaceAgentState> | null | undefined): void {
     if (state?.current) {
-      const current = this.store.workspaces.find((w) => w.id === state.current!.id);
-      if (!current) this.store.workspaces.push(structuredClone(state.current));
-      else Object.assign(current, state.current);
-      session.workspaceId = state.current.id;
+      const binding = this.store.boundWorkspaces.find((w) => w.id === state.current!.id && w.projectId === session.projectId);
+      if (binding) { Object.assign(binding, state.current); session.workspace = binding; }
+      else session.workspace = structuredClone(state.current);
     }
     const pending = state?.pending;
-    if (pending && !this.store.workspaces.some((w) => w.id === pending.target.id)) this.store.workspaces.push(structuredClone(pending.target));
     session.workspaceSwitch = pending ? { id: pending.id, phase: pending.phase, workspaceId: pending.target.id, path: pending.target.path } : undefined;
     session.workspaceUndoBoundary = !!state?.switches;
     this.decorate(session);
@@ -140,7 +143,7 @@ export class WorkspaceAgent {
     await this.store.saveAsync(); this.host.changed(session);
   }
 
-  private async request(args: { create?: { baseRef?: string; branch?: string }; workspaceId?: string }, exit: boolean,
+  private async request(args: { create?: { baseRef?: string; branch?: string }; workspaceId?: string; path?: string }, exit: boolean,
     api: ToolExecutionApi, context: Context) {
     const session = this.requireSession(api.conversationId);
     const live = await api.snapshot(LiveDoc, api.conversationId, context);
@@ -170,11 +173,9 @@ export class WorkspaceAgent {
         target = this.store.assignWorkspace(candidate, project, { kind: "new", baseRef: args.create.baseRef ?? "HEAD" });
         if (args.create.branch) target.branch = args.create.branch;
       } else {
-        const existing = this.store.workspaces.find((w) => w.id === args.workspaceId && w.projectId === project.id);
-        if (!existing) throw new Error("Choose a registered workspace from workspace_list belonging to this project.");
-        target = existing;
+        target = await this.workspaces.resolve(project, args.path ?? args.workspaceId!, context.abortSignal);
       }
-      if (source.id === target.id) return output(JSON.stringify({ status: "unchanged", workspaceId: source.id, path: source.path }));
+      if (source.path === target.path) return output(JSON.stringify({ status: "unchanged", workspaceId: source.id, path: source.path }));
       this.host.assertAvailable(session, [source.path, target.path]);
       request = { id, run, source: encode(source), target: encode(target),
         phase: !exit && target.kind === "worktree" && !target.managed ? "approval" : "preparing",
@@ -195,10 +196,17 @@ export class WorkspaceAgent {
       request = state?.pending;
       if (!request || request.id !== id) throw new Error("Workspace entry was denied or cancelled.");
       if (request.phase === "bound") return output(JSON.stringify({ status: "handoff-recorded", workspaceId: request.target.id }), true);
-      const target = this.store.workspaces.find((w) => w.id === request!.target.id)!;
+      const target: Workspace = structuredClone(request.target);
       this.host.assertAvailable(session, [request.source.path, target.path]);
-      const candidate = { ...session, workspaceId: target.id };
-      await this.workspaces.ensure(candidate, project, () => this.host.changed(session), context.abortSignal, false);
+      const candidate = { ...session, workspace: target };
+      await this.workspaces.ensure(candidate, project, () => this.host.changed(session), context.abortSignal, false, async (workspace) => {
+        // Provisioning must remain replayable without a global workspace inventory.
+        await api.commit(async (tx) => {
+          const doc = await tx.doc(WorkspaceDoc, api.conversationId);
+          if (doc.pending?.id !== id) throw new Error("Workspace handoff was cancelled.");
+          doc.pending.target = encode(workspace);
+        }, context);
+      });
       await this.workspaces.validateExisting(project, target, context.abortSignal);
       this.host.assertAvailable(session, [request.source.path, target.path]);
       await api.commit(async (tx) => {

@@ -293,8 +293,8 @@ export class Dashboard extends VStack implements Focusable {
       else if (this.controller.mode === "session") this.controller.fail("Use /workspace to inspect this session. Change defaults from the dashboard, or ask the agent to enter or exit a workspace.");
       else if (command === "/workspace main") this.controller.selectWorkspace({ kind: "main" });
       else if (/^\/workspace new(?:\s|$)/.test(command)) this.controller.selectWorkspace({ kind: "new", baseRef: command.slice("/workspace new".length).trim() || "HEAD" });
-      else if (/^\/workspace add\s+/.test(command)) void this.controller.importWorkspace(command.slice("/workspace add".length).trim());
-      else this.controller.fail("Usage: /workspace, /workspace approve|deny, /workspace main, /workspace new [base-ref], /workspace add PATH");
+      else if (/^\/workspace use\s+/.test(command)) void this.controller.useWorkspace(command.slice("/workspace use".length).trim());
+      else this.controller.fail("Usage: /workspace, /workspace approve|deny, /workspace main, /workspace new [base-ref], /workspace use PATH");
       return true;
     }
     if (command === "/projects") { this.controller.toggleProjects(); return true; }
@@ -387,9 +387,9 @@ export class Dashboard extends VStack implements Focusable {
 
   sync(): void {
     const c = this.controller;
-    const visibleWorkspaceIds = new Set(c.store.state.sessions.filter((s) => c.store.state.projects.some((p) => p.id === s.projectId)).map((s) => s.workspaceId));
+    const visibleWorkspaceIds = new Set(c.store.state.sessions.filter((s) => c.store.state.projects.some((p) => p.id === s.projectId)).map((s) => s.workspace?.id));
     this.branches.sync(c.mode === "session" ? c.opened ? [c.store.sessionPath(c.opened)] : []
-      : [...c.store.state.projects.map((project) => project.path), ...c.store.workspaces.filter((w) => w.status === "ready" && visibleWorkspaceIds.has(w.id)).map((w) => w.path)]);
+      : [...c.store.state.projects.map((project) => project.path), ...c.store.boundWorkspaces.filter((w) => w.status === "ready" && visibleWorkspaceIds.has(w.id)).map((w) => w.path)]);
     const quotaSettings = c.dialog?.kind === "peek" ? c.engine.configuration(c.session(c.dialog.sessionId)) : c.configuration;
     c.auth?.codexQuota?.select(c.mode === "projects" ? undefined : quotaSettings.model?.provider);
     this.taskDisplay.sync(c.store.state.sessions);

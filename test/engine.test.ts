@@ -2331,7 +2331,7 @@ test("Git tasks get distinct workspaces, workspace instructions and persistent c
     assert.equal((await conversation!.agent(BACKGROUND_CONTEXT)).cwd, wa.path);
     const firstWorkspace = wa.path;
     await engine.run(a, f.project, toolPrompt(writeCall(f.store.file, "not state"), writeCall(join(wa.checkoutPath!, ".git"), "not git metadata")), () => {});
-    assert.equal(JSON.parse(readFileSync(f.store.file, "utf8")).version, 2);
+    assert.equal(JSON.parse(readFileSync(f.store.file, "utf8")).version, 3);
     assert.match(readFileSync(join(wa.checkoutPath!, ".git"), "utf8"), /^gitdir:/);
     assert.ok(a.messages.filter((m) => m.tool?.status === "error").length >= 2);
     await engine.close();
@@ -2346,7 +2346,7 @@ test("Git tasks get distinct workspaces, workspace instructions and persistent c
     assert.equal(loaded.conversationId, conversationId); assert.equal(restored.sessionPath(loaded), firstWorkspace);
     assert.match(loaded.messages.at(-1)!.text, /first workspace/);
     assert.match(requestPrompt, /CHECKOUT_INSTRUCTIONS/); assert.ok(requestPrompt.includes(firstWorkspace));
-    assert.equal(restored.workspaces.filter((w) => w.managed).length, 2); assert.deepEqual(errors, []);
+    assert.equal(restored.boundWorkspaces.filter((w) => w.managed).length, 2); assert.deepEqual(errors, []);
   } finally { await engine.close(); f.cleanup(); }
 });
 
@@ -2366,7 +2366,7 @@ test("undo coordinates shared checkouts but not independent workspaces", async (
     delete b.pendingInput;
     await engine.run(a, f.project, toolPrompt(writeCall("marker.txt", "changed again")), () => {});
     const shared = session(f.project, "review same checkout");
-    f.store.assignWorkspace(shared, f.project, { kind: "existing", workspaceId: a.workspaceId! });
+    f.store.assignWorkspace(shared, f.project, { kind: "existing", path: a.workspace!.path });
     shared.pendingInput = { requestId: "shared-work", prompt: "later" }; f.store.state.sessions.push(shared);
     await assert.rejects(undoLatest(engine, a), /workspace's sessions/);
     delete shared.pendingInput;
@@ -2381,13 +2381,13 @@ test("workspace preparation failures never start a provider and retry keeps the 
     const task = session(f.project, "retry setup"); f.store.state.sessions.push(task);
     await engine.run(task, f.project, "read marker", () => {});
     assert.equal(requests, 0); assert.equal(task.status, "failed"); assert.equal(task.conversationId, undefined);
-    const workspaceId = task.workspaceId; const workspace = f.store.workspace(task)!;
+    const workspaceId = task.workspace?.id; const workspace = f.store.workspace(task)!;
     assert.equal(workspace.status, "failed"); workspace.baseRef = "main"; f.store.save();
     await engine.close(); const restored = new Store(f.store.root);
     engine = await openEngine(restored, { provider: "test", modelId: "mock" }, () => {}, models({ started: () => requests++ }));
     await engine.restore(() => {}); const loaded = restored.state.sessions[0]!;
     await engine.run(loaded, restored.state.projects[0]!, "read marker", () => {});
-    assert.equal(loaded.workspaceId, workspaceId); assert.equal(loaded.status, "completed"); assert.ok(requests > 0);
+    assert.equal(loaded.workspace?.id, workspaceId); assert.equal(loaded.status, "completed"); assert.ok(requests > 0);
   } finally { await engine.close(); f.cleanup(); }
 });
 
@@ -2446,29 +2446,29 @@ test("workspace agent rejects mixed tool rounds, repeated creation from a worktr
   try {
     await engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { create: { baseRef: "main" } }), writeCall("marker.txt", "ordinary write")), () => {});
     assert.match(s.messages.find((m) => m.tool?.name === "workspace_enter")?.tool?.output ?? "", /alone in a tool round/);
-    const original = s.workspaceId;
+    const original = s.workspace?.id;
     await engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { create: {} })), () => {});
     assert.match(s.messages.findLast((m) => m.tool?.name === "workspace_enter")?.tool?.output ?? "", /already has a worktree/);
-    assert.equal(s.workspaceId, original);
+    assert.equal(s.workspace?.id, original);
     await engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { workspaceId: "foreign" })), () => {});
     assert.match(s.messages.findLast((m) => m.tool?.name === "workspace_enter")?.tool?.output ?? "", /belonging to this project/);
-    assert.equal(s.workspaceId, original); assert.deepEqual(errors, []);
+    assert.equal(s.workspace?.id, original); assert.deepEqual(errors, []);
   } finally { await engine.close(); f.cleanup(); }
 });
 
 test("workspace agent waits for explicit external approval and resumes its tool after approval", async () => {
   const f = gitWorkspaceFixture(); const errors: unknown[] = [];
   const external = join(f.root, "external"); f.git("worktree", "add", "-b", "external", external);
-  const target = await new Workspaces(f.store).import(f.project, external);
+  const target = await new Workspaces(f.store).resolve(f.project, external);
   const s = session(f.project, "external entry"); f.store.state.sessions.push(s);
   const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
   try {
-    const running = engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { workspaceId: target.id })), () => {});
+    const running = engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { path: external })), () => {});
     await until(() => s.workspaceSwitch?.phase === "approval");
-    assert.equal(s.status, "needs-input"); assert.notEqual(s.workspaceId, target.id);
+    assert.equal(s.status, "needs-input"); assert.notEqual(s.workspace?.id, target.id);
     await engine.approveWorkspace(s, s.workspaceSwitch!.id, true, () => {});
     await running; await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
-    assert.equal(s.workspaceId, target.id); assert.equal(s.status, "completed"); assert.equal(s.workspaceSwitch, undefined);
+    assert.equal(s.workspace?.id, target.id); assert.equal(s.status, "completed"); assert.equal(s.workspaceSwitch, undefined);
     assert.deepEqual(errors, []);
   } finally { await engine.close(); f.cleanup(); }
 });
@@ -2478,27 +2478,27 @@ test("workspace agent external approval survives restart, denial keeps the old b
   for (const approve of [false, true]) {
     const f = gitWorkspaceFixture(); const errors: unknown[] = [];
     const external = join(f.root, "external"); f.git("worktree", "add", "-b", "external", external);
-    const target = await new Workspaces(f.store).import(f.project, external);
+    const target = await new Workspaces(f.store).resolve(f.project, external);
     const s = session(f.project, "approval recovery"); f.store.state.sessions.push(s);
     let engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
     try {
       const running = engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { workspaceId: target.id })), () => {});
       await until(() => s.workspaceSwitch?.phase === "approval");
-      const source = s.workspaceId; const requestId = s.workspaceSwitch!.id; const conversationId = s.conversationId;
+      const source = s.workspace?.id; const requestId = s.workspaceSwitch!.id; const conversationId = s.conversationId;
       await engine.close(); await running;
       const restored = new Store(f.store.root);
       engine = await openEngine(restored, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
       await engine.restore(() => {}); const loaded = restored.state.sessions[0]!;
       await until(() => loaded.workspaceSwitch?.phase === "approval");
       assert.equal(loaded.workspaceSwitch!.id, requestId); assert.equal(loaded.conversationId, conversationId);
-      assert.equal(loaded.workspaceId, source);
+      assert.equal(loaded.workspace?.id, source);
       if (approve) {
         await engine.cancel(loaded.id);
-        assert.equal(loaded.stopped, true); assert.equal(loaded.workspaceId, source); assert.equal(loaded.workspaceSwitch, undefined);
+        assert.equal(loaded.stopped, true); assert.equal(loaded.workspace?.id, source); assert.equal(loaded.workspaceSwitch, undefined);
       } else {
         await engine.approveWorkspace(loaded, requestId, false, () => {});
         await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
-        assert.equal(loaded.workspaceId, source); assert.equal(loaded.workspaceSwitch, undefined);
+        assert.equal(loaded.workspace?.id, source); assert.equal(loaded.workspaceSwitch, undefined);
         await assert.rejects(engine.approveWorkspace(loaded, requestId, true, () => {}), /no longer pending/);
         assert.equal(readFileSync(join(external, "marker.txt"), "utf8"), "committed main");
       }
@@ -2537,7 +2537,7 @@ test("workspace agent recovers binding and continuation crash gaps without dupli
       };
       const running = engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { create: { baseRef: "main" } })), () => {});
       await until(() => reached);
-      const targetId = s.workspaceId; const targetPath = f.store.sessionPath(s);
+      const targetId = s.workspace?.id; const targetPath = f.store.sessionPath(s);
       assert.notEqual(targetPath, f.path);
       await engine.close(); await running;
       writeFileSync(f.store.file, oldIndex);
@@ -2545,13 +2545,13 @@ test("workspace agent recovers binding and continuation crash gaps without dupli
       engine = await openEngine(restored, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
       await engine.restore(() => {}); await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
       const loaded = restored.state.sessions[0]!;
-      assert.equal(loaded.conversationId, conversationId); assert.equal(loaded.workspaceId, targetId);
+      assert.equal(loaded.conversationId, conversationId); assert.equal(loaded.workspace?.id, targetId);
       assert.equal(restored.sessionPath(loaded), targetPath); assert.equal(loaded.status, "completed");
       const conversation = (await engine.harness.conversation(conversationId as ConversationId, BACKGROUND_CONTEXT))!;
       const entries = (await conversation.entries({}, 200, undefined, BACKGROUND_CONTEXT)).items;
       assert.equal(entries.filter((e) => e.kind === "zz.workspace_continue").length, 1);
       assert.equal(entries.filter((e) => e.kind === "zz.workspace_switched").length, 1);
-      assert.equal(restored.workspaces.filter((w) => w.managed).length, 1);
+      assert.equal(restored.boundWorkspaces.filter((w) => w.managed).length, 1);
       const doc = await engine.harness.snapshot(WorkspaceDoc, conversationId as ConversationId, BACKGROUND_CONTEXT);
       assert.equal(doc?.pending, undefined); assert.equal(doc?.switches, 1); assert.deepEqual(errors, []);
     } finally { await engine.close(); f.cleanup(); }
@@ -2562,7 +2562,7 @@ test("workspace agent preserves queued reply order and runs queued tools in the 
   const f = gitWorkspaceFixture(); const errors: unknown[] = [];
   f.project.workspaceDefault = { kind: "main" };
   const external = join(f.root, "external"); f.git("worktree", "add", "-b", "external", external);
-  const target = await new Workspaces(f.store).import(f.project, external);
+  const target = await new Workspaces(f.store).resolve(f.project, external);
   const s = session(f.project, "queued handoff"); f.store.state.sessions.push(s);
   const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
   try {
@@ -2587,30 +2587,36 @@ test("workspace agent list reports actual dirty state and sharing, and schemas r
   const s = session(f.project, "workspace inventory"); f.store.state.sessions.push(s);
   const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, () => {}, undoModels());
   try {
+    const external = join(f.root, "unregistered"); f.git("worktree", "add", "-b", "automatic-discovery", external);
     writeFileSync(join(f.path, "marker.txt"), "dirty main");
     const other = session(f.project, "sharing main"); f.store.assignWorkspace(other, f.project, { kind: "main" }); f.store.state.sessions.push(other);
     await engine.run(s, f.project, toolPrompt(taskCall("workspace_list", {})), () => {});
-    const inventory = JSON.parse(s.messages.find((m) => m.tool?.name === "workspace_list")!.tool!.output) as { currentWorkspaceId: string; workspaces: { workspaceId: string; hasLocalChanges: boolean; sessions: number; branch: string }[] };
-    assert.equal(inventory.currentWorkspaceId, s.workspaceId);
-    const current = inventory.workspaces.find((w) => w.workspaceId === s.workspaceId)!;
+    const inventory = JSON.parse(s.messages.find((m) => m.tool?.name === "workspace_list")!.tool!.output) as { currentWorkspaceId: string; workspaces: { workspaceId: string; hasLocalChanges: boolean; sessions: number; branch: string; path: string; available: boolean }[] };
+    assert.equal(inventory.currentWorkspaceId, s.workspace?.id);
+    const current = inventory.workspaces.find((w) => w.workspaceId === s.workspace?.id)!;
     assert.equal(current.hasLocalChanges, true); assert.equal(current.sessions, 2); assert.equal(current.branch, "main");
-    const original = s.workspaceId;
-    const invalidArgs: Parameters<typeof taskCall>[1][] = [{}, { create: {}, workspaceId: original! }, { create: { baseRef: "missing" } }, { workspaceId: original!, remove: true }];
+    assert.equal(inventory.workspaces.find((w) => w.path === external)!.sessions, 0);
+    f.git("worktree", "remove", external);
+    await engine.run(s, f.project, toolPrompt(taskCall("workspace_list", {})), () => {});
+    const refreshed = JSON.parse(s.messages.findLast((m) => m.tool?.name === "workspace_list")!.tool!.output) as typeof inventory;
+    assert.equal(refreshed.workspaces.some((w) => w.path === external), false);
+    const original = s.workspace?.id;
+    const invalidArgs: Parameters<typeof taskCall>[1][] = [{}, { create: {}, workspaceId: original! }, { path: f.path, workspaceId: original! }, { path: f.path, create: {} }, { create: { baseRef: "missing" } }, { workspaceId: original!, remove: true }];
     for (const args of invalidArgs) {
       await engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", args)), () => {});
       assert.equal(s.messages.findLast((m) => m.tool?.name === "workspace_enter")?.tool?.status, "error");
-      assert.equal(s.workspaceId, original);
+      assert.equal(s.workspace?.id, original);
     }
     await engine.run(s, f.project, toolPrompt(taskCall("workspace_exit", {})), () => {});
     assert.match(s.messages.findLast((m) => m.tool?.name === "workspace_exit")?.tool?.output ?? "", /unchanged/);
-    assert.equal(f.store.workspaces.filter((w) => w.managed).length, 0);
+    assert.equal(f.store.boundWorkspaces.filter((w) => w.managed).length, 0);
   } finally { await engine.close(); f.cleanup(); }
 });
 
 test("workspace agent entry blocks overlapping shell and undo, and cancellation withdraws queued replies", async () => {
   const f = gitWorkspaceFixture(); f.project.workspaceDefault = { kind: "main" };
   const external = join(f.root, "external"); f.git("worktree", "add", "-b", "external", external);
-  const target = await new Workspaces(f.store).import(f.project, external);
+  const target = await new Workspaces(f.store).resolve(f.project, external);
   const s = session(f.project, "guard handoff"); f.store.state.sessions.push(s);
   const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, () => {}, undoModels());
   try {
@@ -2619,7 +2625,7 @@ test("workspace agent entry blocks overlapping shell and undo, and cancellation 
     await engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { create: {} })), () => {});
     assert.match(s.messages.findLast((m) => m.tool?.name === "workspace_enter")?.tool?.output ?? "", /direct shell/);
     s.shellResponses[0]!.status = "done";
-    const other = session(f.project, "target user"); f.store.assignWorkspace(other, f.project, { kind: "existing", workspaceId: target.id }); f.store.state.sessions.push(other);
+    const other = session(f.project, "target user"); f.store.assignWorkspace(other, f.project, { kind: "existing", path: target.path }); f.store.state.sessions.push(other);
     await engine.run(other, f.project, "establish target", () => {});
     const running = engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { workspaceId: target.id })), () => {});
     await until(() => s.workspaceSwitch?.phase === "approval");
@@ -2659,7 +2665,7 @@ test("workspace agent undo stays after the boundary even when returning to a pre
 test("workspace agent approval works through the terminal UI and updates shell, discovery, and undo context", async () => {
   const f = gitWorkspaceFixture(); f.project.workspaceDefault = { kind: "main" };
   const external = join(f.root, "external"); f.git("worktree", "add", "-b", "external", external);
-  const target = await new Workspaces(f.store).import(f.project, external);
+  const target = await new Workspaces(f.store).resolve(f.project, external);
   const s = session(f.project, "UI handoff"); f.store.state.sessions.push(s);
   const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, () => {}, undoModels());
   const controller = new Controller(f.store, engine); const terminal = new FakeTerminal();
@@ -2672,7 +2678,7 @@ test("workspace agent approval works through the terminal UI and updates shell, 
     app.composer.setValue("keep this draft"); controller.showWorkspace(); tui.renderNow();
     assert.match(tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Approve external checkout/);
     terminal.onInput("\r"); await running; await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
-    assert.equal(s.workspaceId, target.id); assert.equal(controller.openedSessionId, s.id);
+    assert.equal(s.workspace?.id, target.id); assert.equal(controller.openedSessionId, s.id);
     assert.equal(controller.executionProject(s)?.path, external); assert.equal(app.composer.getValue(), "keep this draft");
     assert.equal(controller.runShell("pwd"), true); await controller.shellRun!.done; await tick();
     assert.equal(s.shellResponses?.at(-1)?.cwd, external); assert.equal(s.shellResponses?.at(-1)?.text.trim(), external);
@@ -2686,18 +2692,18 @@ test("workspace agent approval works through the terminal UI and updates shell, 
 test("workspace agent failed preparation keeps the binding and does not execute queued replies in the old checkout", async () => {
   const f = gitWorkspaceFixture(); const errors: unknown[] = []; f.project.workspaceDefault = { kind: "main" };
   const external = join(f.root, "external"); f.git("worktree", "add", "-b", "external", external);
-  const target = await new Workspaces(f.store).import(f.project, external);
+  const target = await new Workspaces(f.store).resolve(f.project, external);
   const s = session(f.project, "failed handoff"); f.store.state.sessions.push(s);
   const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
   try {
     const running = engine.run(s, f.project, toolPrompt(taskCall("workspace_enter", { workspaceId: target.id })), () => {});
-    await until(() => s.workspaceSwitch?.phase === "approval"); const original = s.workspaceId;
+    await until(() => s.workspaceSwitch?.phase === "approval"); const original = s.workspace?.id;
     const queued = engine.run(s, f.project, toolPrompt(writeCall("marker.txt", "must never run")), () => {});
     await until(() => !!s.queuedInputs?.length);
     renameSync(external, `${external}.moved`);
     await engine.approveWorkspace(s, s.workspaceSwitch!.id, true, () => {});
     await Promise.all([running, queued]); await engine.harness.waitForIdle(BACKGROUND_CONTEXT);
-    assert.equal(s.workspaceId, original); assert.equal(s.status, "failed"); assert.equal(s.workspaceSwitch, undefined);
+    assert.equal(s.workspace?.id, original); assert.equal(s.status, "failed"); assert.equal(s.workspaceSwitch, undefined);
     assert.equal(readFileSync(join(f.path, "marker.txt"), "utf8"), "committed main");
     assert.equal(readFileSync(join(`${external}.moved`, "marker.txt"), "utf8"), "committed main");
     assert.equal(s.queuedInputs, undefined); assert.match(s.preview, /handoff did not complete/); assert.deepEqual(errors, []);
@@ -2715,7 +2721,7 @@ test("workspace agent revalidates the prepared destination before committing a b
     let moved = false;
     const changed = () => {
       if (!moved && s.workspaceSwitch?.phase === "ready") {
-        moved = true; const path = f.store.workspaces.find((w) => w.id === s.workspaceSwitch!.workspaceId)!.path;
+        moved = true; const path = s.workspaceSwitch!.path;
         renameSync(path, `${path}.moved`);
       }
     };
@@ -2760,7 +2766,7 @@ test("session delegation uses an isolated normal session, explicit context, mode
     const child = f.store.state.sessions.find((s) => s.id !== parent.id)!;
     await orchestrationIdle(engine);
     assert.equal(child.delegation?.parentId, parent.id); assert.equal(child.agent?.model?.modelId, "reasoner");
-    assert.notEqual(child.workspaceId, parent.workspaceId);
+    assert.notEqual(child.workspace?.id, parent.workspace?.id);
     assert.equal(readFileSync(join(f.store.sessionPath(child), "marker.txt"), "utf8"), "worker implementation");
     assert.equal(readFileSync(join(f.path, "marker.txt"), "utf8"), "uncommitted parent edit");
     assert.ok(contexts.filter((c) => c.messages.some((m) => m.role === "user" && typeof m.content === "string" && m.content.startsWith("Agent-authored delegation")))
@@ -2789,7 +2795,10 @@ test("session messaging discovers, reads and resumes peers without changing thei
     assert.equal(peer.messages.filter((m) => m.source?.kind === "message").length, 1);
     assert.equal(peer.messages.findLast((m) => m.role === "user")?.text, "API question: @missing.png $not-a-skill");
     assert.ok(peer.messages.some((m) => m.text === "existing history"));
-    assert.ok(f.s.messages.some((m) => m.tool?.name === "session_list" && m.tool.output.includes(peer.id)));
+    const listed = JSON.parse(f.s.messages.find((m) => m.tool?.name === "session_list")!.tool!.output) as {
+      sessions: { sessionId: string; workspaceId: string }[];
+    };
+    assert.equal(listed.sessions.find((s) => s.sessionId === peer.id)!.workspaceId, peer.workspace!.id);
     assert.ok(f.s.messages.some((m) => m.tool?.name === "session_read" && m.tool.output.includes("existing history")));
     assert.deepEqual(f.errors, []);
   } finally { await f.engine.close(); f.cleanup(); }
@@ -2823,6 +2832,7 @@ test("worker questions notify their coordinator, and stopped coordinators stop w
       task: toolPrompt(taskCall("ask_question", { question: "Which currency?" })) })), () => {});
     await orchestrationIdle(f.engine);
     const worker = f.store.state.sessions.find((s) => s.delegation?.parentId === f.s.id)!;
+    assert.equal(worker.workspace, f.s.workspace);
     assert.equal(worker.status, "needs-input");
     assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 1);
     assert.match(f.s.messages.find((m) => m.source?.kind === "notification")!.text, /Which currency/);
@@ -3310,5 +3320,32 @@ test("accepted input is checkpointed before run returns and closing before admis
     await until(() => restored.state.sessions[0]?.status === "completed");
     assert.equal(lastReply(restored.state.sessions[0]!), "Recovered answer");
     assert.equal(restored.state.sessions[0]?.messages.filter(message => message.role === "user").length, 1);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("Git-discovered worktrees remain editable after their last zz session is deleted", async () => {
+  const f = gitWorkspaceFixture(); const errors: unknown[] = [];
+  const engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), undoModels());
+  try {
+    const original = session(f.project, "create checkout"); f.store.state.sessions.push(original);
+    await engine.run(original, f.project, "establish", () => {});
+    const checkout = original.workspace!.checkoutPath!;
+    await engine.cancel(original.id);
+    f.store.state.sessions = []; f.store.save();
+    assert.equal(f.store.boundWorkspaces.length, 0);
+    const discovered = (await new Workspaces(f.store).discover(f.project)).find((w) => w.checkoutPath === checkout)!;
+    assert.ok(discovered); assert.equal(discovered.managed, false);
+    f.project.workspaceDefault = { kind: "existing", path: discovered.path };
+    const resumed = session(f.project, "reuse checkout"); f.store.state.sessions.push(resumed);
+    await engine.run(resumed, f.project, toolPrompt(writeCall("marker.txt", "reused without registration")), () => {});
+    assert.equal(resumed.status, "completed");
+    assert.equal(resumed.workspace!.checkoutPath, checkout);
+    assert.equal(readFileSync(join(checkout, "marker.txt"), "utf8"), "reused without registration");
+    await undoLatest(engine, resumed);
+    assert.equal(readFileSync(join(checkout, "marker.txt"), "utf8"), "committed main");
+    await engine.run(resumed, f.project, toolPrompt(writeCall(join(checkout, ".git"), "not Git metadata")), () => {});
+    assert.equal(resumed.messages.findLast((m) => m.tool?.name === "write")!.tool!.status, "error");
+    assert.match(readFileSync(join(checkout, ".git"), "utf8"), /^gitdir:/);
+    assert.deepEqual(errors, []);
   } finally { await engine.close(); f.cleanup(); }
 });

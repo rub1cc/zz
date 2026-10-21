@@ -37,7 +37,7 @@ export type Dialog =
   | { kind: "skills"; sessionId?: string; skills: SkillOption[] }
   | { kind: "usage" | "tasks"; sessionId: string }
   | { kind: "undo"; sessionId: string; checkpoints: UndoCheckpoint[] }
-  | { kind: "workspace"; projectId: string; sessionId?: string; requestId?: string }
+  | { kind: "workspace"; projectId: string; sessionId?: string; requestId?: string; workspaces?: Workspace[]; loading?: boolean; error?: string }
   | { kind: "help" };
 
 export class Controller {
@@ -120,7 +120,7 @@ export class Controller {
     if (!project) return;
     const selected = project.workspaceDefault;
     const path = session ? this.store.sessionPath(session) : selected?.kind === "existing"
-      ? this.store.workspaces.find((w) => w.id === selected.workspaceId && w.projectId === project.id)?.path ?? project.path : project.path;
+      ? selected.path : project.path;
     return { ...project, path };
   }
 
@@ -134,8 +134,7 @@ export class Controller {
     const selection = this.project?.workspaceDefault;
     if (!selection || selection.kind === "new") return `New worktree / base ${selection?.baseRef ?? "HEAD"} (main directory outside Git)`;
     if (selection.kind === "main") return "Main checkout";
-    const workspace = this.store.workspaces.find((w) => w.id === selection.workspaceId);
-    return workspace?.branch ?? workspace?.path ?? "Missing workspace";
+    return selection.path;
   }
 
   showWorkspace(): void {
@@ -143,7 +142,27 @@ export class Controller {
     if (!project) { this.fail("Select a project first."); return; }
     this.dialog = { kind: "workspace", projectId: project.id, sessionId: this.mode === "session" ? this.openedSessionId : undefined,
       requestId: this.mode === "session" ? this.opened?.workspaceSwitch?.id : undefined };
-    this.notice = ""; this.changed();
+    const dialog = this.dialog;
+    this.notice = "";
+    if (!dialog.sessionId) {
+      dialog.loading = true;
+      void new Workspaces(this.store).discover(project).then((workspaces) => {
+        if (this.dialog !== dialog || this.closing) return;
+        dialog.workspaces = workspaces;
+      }).catch((error: unknown) => {
+        if (this.dialog === dialog && !this.closing) dialog.error = error instanceof Error ? error.message : String(error);
+      }).finally(() => {
+        if (this.dialog === dialog && !this.closing) { dialog.loading = false; this.changed(); }
+      });
+    } else {
+      const workspace = this.session(dialog.sessionId)?.workspace;
+      if (workspace) void new Workspaces(this.store).describe(workspace).then((details) => {
+        if (this.dialog !== dialog || this.closing) return;
+        if (!details.available) dialog.error = details.error;
+        this.changed();
+      }).catch((error: unknown) => { if (this.dialog === dialog && !this.closing) this.fail(error); });
+    }
+    this.changed();
   }
 
   async approveWorkspace(approved: boolean, sessionId?: string, expectedRequestId?: string): Promise<void> {
@@ -164,8 +183,9 @@ export class Controller {
   selectWorkspace(selection: WorkspaceSelection): boolean {
     const project = this.project;
     if (this.closing || !project) return false;
-    if (selection.kind === "existing" && !this.store.workspaces.some((w) => w.id === selection.workspaceId && w.projectId === project.id && w.status === "ready")) {
-      this.fail("Choose a ready workspace belonging to this project."); return false;
+    if (selection.kind === "existing") {
+      try { selection = { kind: "existing", path: directory(selection.path) }; }
+      catch (error) { this.fail(error); return false; }
     }
     if (selection.kind === "new" && (!selection.baseRef.trim() || selection.baseRef.startsWith("-") || /[\r\n\0]/.test(selection.baseRef))) {
       this.fail("Choose a valid base ref, such as HEAD or main."); return false;
@@ -178,12 +198,12 @@ export class Controller {
     this.changed(); return true;
   }
 
-  async importWorkspace(path: string): Promise<Workspace | undefined> {
+  async useWorkspace(path: string): Promise<Workspace | undefined> {
     const project = this.project;
     if (!project || this.closing) return;
     try {
-      const workspace = await new Workspaces(this.store).import(project, path);
-      if (!this.closing && this.project?.id === project.id) this.selectWorkspace({ kind: "existing", workspaceId: workspace.id });
+      const workspace = await new Workspaces(this.store).resolve(project, path);
+      if (!this.closing && this.project?.id === project.id) this.selectWorkspace({ kind: "existing", path: workspace.path });
       return workspace;
     } catch (error) { if (!this.closing) this.fail(error); }
   }
@@ -608,7 +628,7 @@ export class Controller {
   private undoReady(session: Session): boolean {
     if (this.closing || this.undoing.has(this.store.workspaceKey(session))) return false;
     if (this.store.state.sessions.some((s) => s.workspaceSwitch && (this.store.sessionPath(s) === this.store.sessionPath(session)
-      || this.store.workspaces.find((w) => w.id === s.workspaceSwitch!.workspaceId)?.path === this.store.sessionPath(session)))) {
+      || s.workspaceSwitch.path === this.store.sessionPath(session)))) {
       this.fail("Wait for the workspace handoff to finish before /undo."); return false;
     }
     const busy = this.store.state.sessions.some((other) => this.store.workspaceKey(other) === this.store.workspaceKey(session)

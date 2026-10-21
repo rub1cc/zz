@@ -19,7 +19,7 @@ function repository(root: string): string {
   mkdirSync(join(path, "pkg")); writeFileSync(join(path, "pkg", "source.txt"), "source\n");
   git(path, "add", "."); git(path, "commit", "-qm", "Initial"); return path;
 }
-function session(project: Project, id: string): Session {
+function session(project: { id: string; path?: string }, id: string): Session {
   return { id, projectId: project.id, title: id, status: "working", preview: "", createdAt: 1, updatedAt: 1, messages: [] };
 }
 
@@ -34,7 +34,7 @@ test("legacy projects migrate to stable identities and main workspaces, includin
     const store = new Store(data);
     const project = store.state.projects[0]!;
     assert.notEqual(project.id, project.path);
-    assert.equal(store.state.version, 2);
+    assert.equal(store.state.version, 3);
     assert.equal(JSON.parse(readFileSync(join(data, "state.v1.backup.json"), "utf8")).projects[0].id, legacy.id);
     assert.equal(store.state.selectedProjectId, project.id);
     assert.equal(store.sessionPath(store.state.sessions[0]!), f.root);
@@ -66,22 +66,24 @@ test("new workspaces isolate tracked files, preserve dirty main files, and repla
   } finally { f.cleanup(); }
 });
 
-test("subdirectory projects retain their relative cwd and can import a shared worktree", async () => {
+test("subdirectory projects retain their relative cwd and discover shared worktrees through Git", async () => {
   const f = temporary();
   try {
     const root = repository(f.root); const store = new Store(join(f.root, "data"));
-    const project = store.addProject(join(root, "pkg")); const task = session(project, "subdir");
+    const project = store.addProject(join(root, "pkg")); const task = session(project, "subdir"); store.state.sessions.push(task);
     const workspace = store.assignWorkspace(task, project);
     const manager = new Workspaces(store); await manager.ensure(task, project, () => {});
     assert.equal(readFileSync(join(workspace.path, "source.txt"), "utf8"), "source\n");
     assert.equal(workspace.path, join(workspace.checkoutPath!, "pkg"));
-    assert.equal((await manager.import(project, workspace.checkoutPath!)).id, workspace.id);
+    assert.equal((await manager.resolve(project, workspace.checkoutPath!)).id, workspace.id);
     const external = join(f.root, "external"); git(root, "worktree", "add", "-b", "external", external);
-    const imported = await manager.import(project, external);
+    const imported = await manager.resolve(project, external);
     assert.equal(imported.path, join(external, "pkg")); assert.equal(imported.managed, false);
-    const other = session(project, "review"); store.assignWorkspace(other, project, { kind: "existing", workspaceId: imported.id });
+    const other = session(project, "review"); store.assignWorkspace(other, project, { kind: "existing", path: imported.path });
     assert.equal(store.workspaceKey(other), imported.path);
-    await assert.rejects(manager.import(project, f.root), /belonging/);
+    await assert.rejects(manager.resolve(project, f.root), /belonging/);
+    rmSync(join(external, "pkg"), { recursive: true });
+    assert.equal((await manager.discover(project)).some((w) => w.checkoutPath === external), false);
   } finally { f.cleanup(); }
 });
 
@@ -89,7 +91,7 @@ test("failed worktree preparation is retained, retryable, and never falls back t
   const f = temporary();
   try {
     const path = repository(f.root); const store = new Store(join(f.root, "data")); const project = store.addProject(path);
-    const task = session(project, "bad base"); const workspace = store.assignWorkspace(task, project, { kind: "new", baseRef: "missing" });
+    const task = session(project, "bad base"); store.state.sessions.push(task); const workspace = store.assignWorkspace(task, project, { kind: "new", baseRef: "missing" });
     const manager = new Workspaces(store);
     await assert.rejects(manager.ensure(task, project, () => {}), /Workspace preparation failed/);
     assert.equal(workspace.status, "failed"); assert.equal(store.workspace(task), workspace);
@@ -109,7 +111,7 @@ test("non-Git tasks use the main directory and explicit main selection creates n
     store.assignWorkspace(task, project);
     const workspace = await new Workspaces(store).ensure(task, project, () => {});
     assert.equal(workspace.kind, "main"); assert.equal(store.sessionPath(task), f.root);
-    assert.equal(store.workspaces.length, 1); assert.equal(existsSync(join(store.root, "worktrees")), false);
+    assert.equal(store.boundWorkspaces.length, 1); assert.equal(existsSync(join(store.root, "worktrees")), false);
     const path = repository(f.root); const gitProject = store.addProject(path);
     const direct = session(gitProject, "main task"); store.assignWorkspace(direct, gitProject, { kind: "main" });
     assert.equal((await new Workspaces(store).ensure(direct, gitProject, () => {})).path, path);
@@ -168,7 +170,7 @@ test("a failed Git launch cannot turn into a main-directory launch if its reposi
     assert.equal(workspace.repositoryRoot, path);
     renameSync(join(path, ".git"), join(path, "saved-git"));
     await assert.rejects(manager.ensure(task, project, () => {}), /refusing to switch/);
-    assert.equal(task.workspaceId, workspace.id); assert.notEqual(store.sessionPath(task), path);
+    assert.equal(task.workspace?.id, workspace.id); assert.notEqual(store.sessionPath(task), path);
   } finally { f.cleanup(); }
 });
 
@@ -187,17 +189,22 @@ test("interrupted initialization locks are not mistaken for completed worktrees"
 });
 
 
-test("invalid workspace records and cross-project defaults are refused without rewriting the index", () => {
+test("invalid session workspace bindings and defaults are refused without rewriting the index", () => {
   const f = temporary();
   try {
-    const store = new Store(join(f.root, "data")); const project = store.addProject(f.root); store.save();
+    const store = new Store(join(f.root, "data")); const project = store.addProject(f.root);
+    const task = session(project, "bound"); store.state.sessions.push(task);
+    store.assignWorkspace(task, project, { kind: "main" }); store.save();
     const initial = readFileSync(store.file, "utf8");
     const malformed = [
-      (state: typeof store.state) => { state.workspaces![0]!.status = "broken" as "ready"; },
-      (state: typeof store.state) => { state.projects[0]!.workspaceDefault = { kind: "existing", workspaceId: "missing" }; },
-      (state: typeof store.state) => { state.workspaces![0]!.path = "relative/path"; },
-      (state: typeof store.state) => { state.workspaces!.push({ ...state.workspaces![0]! }); },
-      (state: typeof store.state) => { state.sessions.push({ ...session(project, "bad"), workspaceId: "missing" }); },
+      (state: typeof store.state) => { state.sessions[0]!.workspace!.status = "broken" as "ready"; },
+      (state: typeof store.state) => { state.projects[0]!.workspaceDefault = { kind: "existing", path: "relative/path" }; },
+      (state: typeof store.state) => { state.sessions[0]!.workspace!.path = "relative/path"; },
+      (state: typeof store.state) => { state.sessions[0]!.workspace!.projectId = "foreign-project"; },
+      (state: typeof store.state) => { state.sessions[0]!.workspaceId = "legacy-binding"; },
+      (state: typeof store.state) => { state.sessions.push({ ...state.sessions[0]!, id: "conflict",
+        workspace: { ...state.sessions[0]!.workspace!, path: join(f.root, "another-directory") } }); },
+      (state: typeof store.state) => { state.workspaces = []; },
     ];
     for (const corrupt of malformed) {
       const state = JSON.parse(initial) as typeof store.state; corrupt(state);
@@ -205,5 +212,126 @@ test("invalid workspace records and cross-project defaults are refused without r
       assert.throws(() => new Store(store.root), /Invalid zz state/);
       assert.equal(readFileSync(store.file, "utf8"), contents);
     }
+  } finally { f.cleanup(); }
+});
+
+test("Git discovers external, detached, and unreferenced worktrees without persisting an inventory", async () => {
+  const f = temporary();
+  try {
+    const root = repository(f.root); const store = new Store(join(f.root, "data")); const project = store.addProject(root);
+    const manager = new Workspaces(store); const before = readFileSync(store.file, "utf8");
+    const external = join(f.root, "external with spaces\nand newline");
+    git(root, "worktree", "add", "-b", "review", external);
+    const detached = join(f.root, "detached"); git(root, "worktree", "add", "--detach", detached);
+    let listed = await manager.discover(project);
+    assert.deepEqual(listed.map((w) => w.path).sort(), [root, external, detached].sort());
+    assert.equal(listed.find((w) => w.path === external)!.branch, "review");
+    assert.equal(listed.find((w) => w.path === detached)!.branch, undefined);
+    assert.equal((await manager.resolve(project, external)).path, external);
+    assert.equal(readFileSync(store.file, "utf8"), before);
+    assert.equal(store.boundWorkspaces.length, 0);
+    assert.equal(store.state.workspaces, undefined);
+    git(external, "branch", "-m", "renamed-review");
+    assert.equal((await manager.discover(project)).find((w) => w.path === external)!.branch, "renamed-review");
+    git(root, "worktree", "remove", detached);
+    rmSync(external, { recursive: true });
+    listed = await manager.discover(project); assert.deepEqual(listed.map((w) => w.path), [root]);
+    git(root, "worktree", "prune");
+    assert.deepEqual((await manager.discover(project)).map((w) => w.path), [root]);
+    assert.equal(readFileSync(store.file, "utf8"), before);
+  } finally { f.cleanup(); }
+});
+
+test("format 2 migrates bindings and defaults, drops orphan registrations, and retains missing checkout identities", async () => {
+  const f = temporary();
+  try {
+    const root = repository(f.root); const data = join(f.root, "data"); mkdirSync(data);
+    const project = { id: "project", path: root, workspaceDefault: { kind: "existing", workspaceId: "default" } };
+    const missing = { id: "bound", projectId: project.id, projectPath: root, path: join(f.root, "missing"),
+      checkoutPath: join(f.root, "missing"), branch: "in-progress", baseRef: "main", baseCommit: git(root, "rev-parse", "HEAD"),
+      kind: "worktree", managed: true, status: "ready" };
+    const interrupted = { ...missing, id: "interrupted", path: join(f.root, "interrupted"),
+      checkoutPath: join(f.root, "interrupted"), status: "failed", error: "interrupted creation" };
+    const original = JSON.stringify({ version: 2, projects: [project], sessions: [
+      { ...session(project, "bound session"), workspaceId: missing.id },
+      { ...session(project, "shared session"), workspaceId: missing.id },
+      { ...session(project, "interrupted session"), workspaceId: interrupted.id },
+    ], workspaces: [missing, interrupted, { ...missing, id: "orphan", path: join(f.root, "orphan") },
+      { ...missing, id: "default", path: join(f.root, "saved-default") }] });
+    writeFileSync(join(data, "state.json"), original);
+    const store = new Store(data);
+    assert.equal(store.state.version, 3); assert.equal(store.state.workspaces, undefined);
+    assert.equal(readFileSync(join(data, "state.v2.backup.json"), "utf8"), original);
+    assert.deepEqual(store.state.projects[0]!.workspaceDefault, { kind: "existing", path: join(f.root, "saved-default") });
+    const task = store.state.sessions[0]!;
+    assert.deepEqual(task.workspace, missing); assert.equal(task.workspaceId, undefined);
+    assert.equal(task.workspace, store.state.sessions[1]!.workspace);
+    assert.equal(store.boundWorkspaces.length, 2);
+    assert.deepEqual(store.state.sessions[2]!.workspace, interrupted);
+    assert.equal(store.sessionPath(task), missing.path);
+    await assert.rejects(new Workspaces(store).ensure(task, store.state.projects[0]!, () => {}), /ENOENT/);
+    assert.equal(store.sessionPath(task), missing.path);
+    assert.equal(readFileSync(join(root, "file.txt"), "utf8"), "base\n");
+    assert.equal(new Store(data).state.sessions[0]!.workspace!.id, missing.id);
+  } finally { f.cleanup(); }
+});
+
+test("Git worktree moves discover the new path without moving an existing session binding", async () => {
+  const f = temporary();
+  try {
+    const root = repository(f.root); const store = new Store(join(f.root, "data")); const project = store.addProject(root);
+    const external = join(f.root, "old"); const moved = join(f.root, "moved");
+    git(root, "worktree", "add", "-b", "movable", external);
+    const task = session(project, "stays bound"); store.state.sessions.push(task);
+    store.assignWorkspace(task, project, { kind: "existing", path: external }); store.save();
+    git(root, "worktree", "move", external, moved);
+    const manager = new Workspaces(store);
+    assert.deepEqual((await manager.discover(project)).map((w) => w.path).sort(), [root, moved].sort());
+    assert.equal(store.sessionPath(task), external);
+    assert.equal((await manager.describe(task.workspace!)).available, false);
+    await assert.rejects(manager.ensure(task, project, () => {}), /ENOENT/);
+    assert.equal(store.sessionPath(new Store(store.root).state.sessions[0]!), external);
+  } finally { f.cleanup(); }
+});
+
+test("creation metadata can checkpoint to a handoff journal without a workspace inventory", async () => {
+  const f = temporary();
+  try {
+    const root = repository(f.root); const store = new Store(join(f.root, "data")); const project = store.addProject(root);
+    const candidate = session(project, "handoff target");
+    const target = store.assignWorkspace(candidate, project);
+    const snapshots: NonNullable<Session["workspace"]>[] = [];
+    await new Workspaces(store).ensure(candidate, project, () => {}, undefined, false, async (workspace) => {
+      snapshots.push(structuredClone(workspace));
+      if (workspace.baseCommit && workspace.status === "pending") assert.equal(existsSync(workspace.checkoutPath!), false);
+    });
+    assert.ok(snapshots.some((w) => w.baseCommit && w.status === "pending"));
+    assert.equal(snapshots.at(-1)!.status, "ready");
+    assert.equal(snapshots.at(-1)!.baseCommit, git(target.path, "rev-parse", "HEAD"));
+    assert.equal(new Store(store.root).boundWorkspaces.length, 0);
+    assert.equal((await new Workspaces(store).discover(project)).some((w) => w.path === target.path), true);
+  } finally { f.cleanup(); }
+});
+
+test("project-scoped bindings stay distinct when another project's main directory is the same worktree", async () => {
+  const f = temporary();
+  try {
+    const root = repository(f.root); const store = new Store(join(f.root, "data")); const project = store.addProject(root);
+    const external = join(f.root, "external"); git(root, "worktree", "add", "-b", "shared", external);
+    const otherProject = store.addProject(external);
+    const first = session(project, "external binding"); const second = session(otherProject, "main binding");
+    store.state.sessions.push(first, second);
+    store.assignWorkspace(first, project, { kind: "existing", path: external });
+    store.assignWorkspace(second, otherProject, { kind: "main" }); store.save();
+    const restored = new Store(store.root);
+    assert.equal(restored.boundWorkspaces.length, 2);
+    assert.equal(restored.state.sessions[0]!.workspace!.kind, "worktree");
+    assert.equal(restored.state.sessions[1]!.workspace!.kind, "main");
+    assert.equal(restored.state.sessions[0]!.workspace!.projectId, project.id);
+    assert.equal(restored.state.sessions[1]!.workspace!.projectId, otherProject.id);
+    const manager = new Workspaces(restored);
+    const [a, b] = await Promise.all(restored.state.sessions.map((task) => manager.ensure(task,
+      restored.state.projects.find((p) => p.id === task.projectId)!, () => {})));
+    assert.equal(a!.projectId, project.id); assert.equal(b!.projectId, otherProject.id);
   } finally { f.cleanup(); }
 });

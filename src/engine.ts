@@ -352,7 +352,7 @@ export class DurableEngine implements Engine {
     });
     const registry = createRegistry();
     registry.install(createCodingTools({ images: await getImageProcessor() }));
-    const undoHistory = new UndoHistory(store.root, () => store.workspaces.filter((w) => w.managed && w.status === "ready" && w.checkoutPath).map((w) => w.checkoutPath!));
+    const undoHistory = new UndoHistory(store.root, () => store.boundWorkspaces.filter((w) => w.status === "ready" && w.checkoutPath).map((w) => w.checkoutPath!));
     registry.install(undoHistory.extension);
     registry.install(createTaskExtension(() => taskClock.now()));
     registry.install(createLegacyTaskExtension(() => taskClock.now()));
@@ -402,7 +402,7 @@ export class DurableEngine implements Engine {
 
   private switchingWorkspace(path: string): boolean {
     return this.store.state.sessions.some((s) => s.workspaceSwitch && (this.store.sessionPath(s) === path
-      || this.store.workspaces.find((w) => w.id === s.workspaceSwitch!.workspaceId)?.path === path));
+      || s.workspaceSwitch.path === path));
   }
 
   async approveWorkspace(session: Session, requestId: string, approved: boolean, changed: (persist?: boolean) => void): Promise<void> {
@@ -621,7 +621,7 @@ export class DurableEngine implements Engine {
     if (this.closing) throw new Error("zz is closing.");
     this.notifyChanged = changed;
     this.sessionAgent.enabled = true;
-    if (!session.workspaceId) this.store.assignWorkspace(session, project);
+    if (!session.workspace) this.store.assignWorkspace(session, project);
     if (this.undoWorkspaces.has(this.store.workspaceKey(session))) throw new Error("This workspace is being restored. Wait for /undo to finish.");
     if (this.pendingUndo(this.store.workspaceKey(session))) throw new Error("An interrupted /undo in this workspace must finish before sending another prompt. Retry /undo.");
     if (this.stopping.has(session.id)) throw new Error("This session is still stopping. Try again when it is idle.");
@@ -676,7 +676,7 @@ export class DurableEngine implements Engine {
         titleRenamed: true, status: "working", preview: "Starting delegated work...", createdAt: now, updatedAt: now, messages: [], agent,
         ...(command.delegated ? { delegation: { parentId: parent.id, taskId: id, runId: now } } : {}) };
       startWork(target, now);
-      if (command.isolation === "shared") target.workspaceId = parent.workspaceId ?? this.store.assignWorkspace(parent, project, { kind: "main" }).id;
+      if (command.isolation === "shared") target.workspace = parent.workspace ?? this.store.assignWorkspace(parent, project, { kind: "main" });
       else this.store.assignWorkspace(target, project, { kind: "new", baseRef: base! });
       this.store.state.sessions.push(target); await this.store.saveAsync(); this.notifyChanged();
     }
@@ -708,7 +708,7 @@ export class DurableEngine implements Engine {
     if (target.conversationId === undefined) throw new Error(target.preview || "Session could not start.");
     const conversation = this.handles.get(target.id);
     if (!conversation) throw new Error("The target conversation is unavailable.");
-    return { sessionId: target.id, title: target.title, status: target.status, workspaceId: target.workspaceId,
+    return { sessionId: target.id, title: target.title, status: target.status, workspaceId: target.workspace?.id,
       ...(command.kind === "create" ? { delegated: !!command.delegated } : { delivery: command.mode === "steer" ? "steer" : "queue" }) };
   }
 

@@ -31,7 +31,7 @@ A change of a session's working workspace that preserves its conversation. Files
 The point where a session changes workspace, beyond which earlier work cannot be undone from the new workspace.
 
 **Managed Worktree**:
-A separate Git checkout created by zz, rather than an existing checkout registered by the user.
+A separate Git checkout created by zz, rather than a checkout created outside zz.
 
 **Direct Question**:
 A request from the agent for an ordinary conversational reply.

@@ -261,12 +261,11 @@ beside session titles. Open `/workspace` before sending a task to choose:
 
 - **New worktree**: a separate checkout for each new session.
 - **Main checkout**: work directly in the project directory.
-- **Existing workspace**: share a checkout with another conversation.
-- **Register existing worktree**: add a Git worktree belonging to this repository.
+- **Existing worktree**: choose a checkout discovered automatically by Git, whether or not zz created it.
 
 The choice is saved for that project and applies only to new sessions. Shortcuts
 on the dashboard are `/workspace main`, `/workspace new [base-ref]`, and
-`/workspace add PATH`. Base refs can be local branches, tags, commits, or existing
+`/workspace use PATH`. Base refs can be local branches, tags, commits, or existing
 remote-tracking refs; zz does not fetch automatically. Inside a session,
 `/workspace` shows its directory, ownership, and sharing, and can make that
 workspace the default for new sessions without moving the current conversation.
@@ -290,8 +289,12 @@ it is not silently recreated, since local work might be missing.
 Multiple sessions may share a workspace; their file changes are shared too.
 `/undo` waits for work in that directory, not every session in the project.
 Deleting sessions or removing projects never removes worktrees or branches.
-Unreferenced workspaces remain selectable in `/workspace`. Review and merge work
-with Git; automatic merge, worktree removal, and cleanup policies are not included.
+Available worktrees come directly from `git worktree list`; there is no zz
+registration inventory. Worktrees without sessions remain selectable while they
+exist. Use `git worktree remove PATH` to remove a checkout and `git worktree prune`
+to clean up Git metadata for deleted directories. Missing, unused checkouts do not
+linger in zz's picker. Missing session bindings remain attached to their original
+paths. Review and merge work with Git; automatic merge and removal are not included.
 Worktrees separate files and branches, but are not security sandboxes.
 
 ### Agent Workspace Handoffs
@@ -300,22 +303,24 @@ Ask the agent to "create a worktree for this fix and continue there", "use the
 existing review workspace", or "return to the main checkout". The conversation,
 title, model, and checklist stay with the same session. The agent has three tools:
 
-- `workspace_list`: inspect the current binding and registered alternatives,
+- `workspace_list`: inspect the current binding and Git-discovered worktrees,
   including branch, availability, local changes, and session sharing. Results are
   paginated with `cursor` and `limit` (25 by default, at most 50).
 - `workspace_enter`: pass `create: { baseRef: "main" }` to create and enter a
-  worktree, optionally naming `branch`, or pass `workspaceId` from the list to
-  enter an existing one. The default creation base is committed local `HEAD`.
+  worktree, optionally naming `branch`, or pass `path` (or `workspaceId` from the
+  list) to enter an existing one. The default creation base is committed local `HEAD`.
 - `workspace_exit`: return to the project's main directory, keeping the checkout,
   branch, and edits you left behind. Already being in main is a no-op.
 
 Creation is only allowed from the main workspace. A session already in a worktree
 can enter an existing workspace or return to main, but cannot create another new
 one directly. Use another session for independent work. Existing worktrees must
-belong to this project and be registered first with `/workspace add PATH`.
+belong to this project's Git repository; no registration step is needed.
 
-Entry into a zz-managed workspace is automatic. Entry into an external worktree
-waits for explicit approval, without another model request. Open `/workspace` in
+Entry into a checkout with retained zz-managed session metadata is automatic.
+Other existing checkouts, including those whose last zz session was deleted, are
+treated as external. Entry into an external worktree waits for explicit approval,
+without another model request. Open `/workspace` in
 that session and choose Approve or Deny, or use `/workspace approve` or
 `/workspace deny`. The destination and instruction-loading scope are shown before
 you decide. Ordinary chat replies do not count as approval. A denial keeps the
@@ -1048,9 +1053,9 @@ Existing data is not moved automatically: with zz stopped, move the previous
 data directory (`~/.local/share/zz` or `$XDG_DATA_HOME/zz`) to `~/.zz`, or keep
 using it with an explicit override. Move the whole directory, not just `state.json`.
 
-- `state.json`: projects, workspaces, selection, session index, and cached display history.
+- `state.json`: projects, stable project identities, defaults, session workspace bindings, and cached display history.
 - `worktrees/`: retained managed Git checkouts, grouped by project and workspace ID.
-- `state.v1.backup.json`: original state index saved before the workspace-format migration.
+- `state.v1.backup.json` / `state.v2.backup.json`: original indexes saved before their respective migrations.
 - `sessions.sqlite`: durable conversations, model context, tools, and checkpoints.
 - `undo/`: persistent file backups for `/undo` (may contain sensitive source contents).
 - A heartbeat lock permits only one dashboard per data directory. After a crash,
@@ -1085,10 +1090,14 @@ conversation paths are absolute: moving the data directory does not relocate
 existing checkouts or repair their Git links. Choose a data location before
 creating worktrees and retain existing paths when changing it.
 
-The first workspace-aware startup migrates the index to format 2, assigns stable
-project IDs, and attaches old sessions to their original directories. The original
-index is retained as `state.v1.backup.json`; old zz versions refuse the new format.
-Removing and re-adding the same directory still reconnects its retained sessions.
+Startup migrates older indexes to format 3. Workspace metadata lives on sessions,
+not in a separate checkout inventory. Existing bindings and interrupted creation
+metadata are preserved, existing-worktree defaults become paths, and unused zz
+registrations are discarded without touching files or branches. Format 1 indexes
+also receive stable project IDs and original-directory bindings. Backups are kept
+as `state.v1.backup.json` and/or `state.v2.backup.json`; old zz versions refuse the
+new format. Removing and re-adding the same directory still reconnects its retained
+sessions, including sessions whose project is currently hidden.
 
 ## Releases
 
