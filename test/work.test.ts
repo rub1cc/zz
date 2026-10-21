@@ -11,7 +11,7 @@ function session(): Session {
     work: { startedAt: new Date(2026, 0, 1, 15, 21, 57).getTime() } };
 }
 
-test("work status shimmers while running and records a stable local completion time", (t) => {
+test("work status shimmers while running and only long successful runs have receipts", (t) => {
   const s = session();
   const end = new Date(2026, 0, 1, 15, 22).getTime();
   t.mock.method(Date, "now", () => end);
@@ -20,7 +20,10 @@ test("work status shimmers while running and records a stable local completion t
   assert.match(stripTerminalSequences(workLabel(s)!), /^[✽✻✢∙] Working \(\d+s\)$/);
   s.status = "completed";
   finishWork(s, end);
-  assert.equal(stripTerminalSequences(workLabel(s)!), "✻ Worked for 3s · done 3:22 PM");
+  assert.equal(workLabel(s), undefined);
+  s.work!.finishedAt = s.work!.startedAt + 10000;
+  assert.equal(stripTerminalSequences(workLabel(s)!), "✽ Worked for 10s");
+  s.work!.finishedAt = end;
   finishWork(s, end + 10_000);
   assert.equal(s.work?.finishedAt, end);
 });
@@ -58,17 +61,17 @@ test("session Working indicator loops the shared icons and respects reduced moti
   }
 });
 
-test("working elapsed time rolls through minutes, hours and days and omits zero units", (t) => {
+test("working elapsed time rolls through minutes, hours and days and retains intermediate zero units", (t) => {
   const s = session();
   s.work = { startedAt: 0 };
   let now = 0;
   t.mock.method(Date, "now", () => now);
   const cases: [number, string][] = [
     [-1000, "0s"], [0, "0s"], [999, "0s"], [1000, "1s"], [59999, "59s"],
-    [60000, "1m"], [62000, "1m2s"], [3599999, "59m59s"],
-    [3600000, "1h"], [3601000, "1h1s"], [3662000, "1h1m2s"],
-    [86399999, "23h59m59s"], [86400000, "1d"], [87615000, "1d20m15s"],
-    [90061000, "1d1h1m1s"], [172800000, "2d"],
+    [60000, "1m 0s"], [62000, "1m 2s"], [3599999, "59m 59s"],
+    [3600000, "1h 0m 0s"], [3601000, "1h 0m 1s"], [3662000, "1h 1m 2s"],
+    [86399999, "23h 59m 59s"], [86400000, "1d 0h 0m 0s"], [87615000, "1d 0h 20m 15s"],
+    [90061000, "1d 1h 1m 1s"], [172800000, "2d 0h 0m 0s"],
   ];
   for (const [elapsed, expected] of cases) {
     now = elapsed;
@@ -110,7 +113,7 @@ test("failed, waiting, paused, and legacy sessions are not falsely labelled done
   for (const [status, label] of [["failed", "failed"], ["needs-input", "awaiting input"]] as const) {
     s.status = status;
     finishWork(s, s.work!.startedAt + 3000);
-    assert.ok(stripTerminalSequences(workLabel(s)!).includes(`· ${label} `));
+    assert.equal(workLabel(s), undefined, label);
   }
   delete s.work;
   s.status = "completed";
@@ -136,4 +139,22 @@ test("shimmer preserves its text and width, changes frames, and supports reduced
   delete process.env.ZZ_REDUCED_MOTION;
   process.env.NO_COLOR = "1";
   assert.equal(shimmer("✻ Working", 500), shimmer("✻ Working", 1000));
+});
+
+test("status shimmer follows reported terminal foreground/background without changing text", async (t) => {
+  const { setStatusColors } = await import("../src/format.js");
+  const motion = process.env.ZZ_REDUCED_MOTION, noColor = process.env.NO_COLOR;
+  delete process.env.ZZ_REDUCED_MOTION; delete process.env.NO_COLOR;
+  t.after(() => {
+    if (motion === undefined) delete process.env.ZZ_REDUCED_MOTION; else process.env.ZZ_REDUCED_MOTION = motion;
+    if (noColor === undefined) delete process.env.NO_COLOR; else process.env.NO_COLOR = noColor;
+    setStatusColors({});
+  });
+  const label = "✽ Working";
+  setStatusColors({ background: { r: 255, g: 255, b: 255 }, foreground: { r: 20, g: 30, b: 40 } });
+  const light = shimmer(label, 500);
+  setStatusColors({ background: { r: 20, g: 20, b: 20 }, foreground: { r: 240, g: 240, b: 240 } });
+  const dark = shimmer(label, 500);
+  assert.notEqual(light, dark);
+  assert.equal(stripTerminalSequences(light), label); assert.equal(stripTerminalSequences(dark), label);
 });

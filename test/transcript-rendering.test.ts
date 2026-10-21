@@ -44,61 +44,43 @@ test("the complete sample conversation renders as prompt, thinking, tools, edits
     const before = structuredClone(f.session.messages);
     assert.equal(f.render(), [
       "\u276f Fix greet() for empty names and add a test.", "",
-      "\u25cf I'll check the function and add a test.", "", "\u25cf Read(src/greet.ts)", "  \u23bf Read 3 lines", "",
-      "\u25cf Update(src/greet.ts)", "  \u23bf Added 1 line, removed 1 line", "     1 export function greet(name) {",
+      "\u25cf I'll check the function and add a test.", "", "  Read 1 file", "",
+      "\u2022 Update(src/greet.ts)", "  \u23bf Added 1 line, removed 1 line", "     1 export function greet(name) {",
       "    -2   return name;", '    +2   return name || "World";', "     3 }", "",
-      "\u25cf Write(src/greet.test.ts)", "  \u23bf Wrote 3 lines", '      1 test("empty name", () => {',
+      "\u2022 Write(src/greet.test.ts)", "  \u23bf Wrote 3 lines", '      1 test("empty name", () => {',
       '      2   expect(greet("")).toBe("World");', "      3 });", "",
-      "\u25cf Bash(npm test -- --run)", "  \u23bf 1 test passed", "",
+      "  Ran 1 shell command", "",
       '\u25cf Updated greet() to fall back to "World".', "", "  Tests: 1 passed.", "",
     ].join("\n"));
     assert.deepEqual(f.session.messages, before, "Rendering is presentation only");
   } finally { await f.close(); }
 });
 
-test("all code changes survive collapse, clicks, routine grouping and session switches", async () => {
+test("diffs default to full, local clicks collapse only that diff and global controls override", async () => {
   const f = setup();
   try {
-    const diff = [
-      ...Array.from({ length: 12 }, (_, i) => ` ${i + 1} unchanged${i + 1}`),
-      "-13 removedFirst", "+13 addedFirst", "...", "-99 removedLast", "+99 addedLast",
-    ].join("\n");
+    const diff = Array.from({ length: 40 }, (_, i) => `+${i + 1} added${i + 1}`).join("\n");
     const content = Array.from({ length: 30 }, (_, i) => `written${i + 1}`).join("\n");
     f.session.messages = [
-      ...["read1", "read2"].map((id) => toolMessage({ id, name: "read", arguments: { path: id }, status: "done", output: "read" })),
       toolMessage({ id: "edit", name: "edit", arguments: { path: "changed.ts" }, status: "done", output: "Updated", details: { result: { diff } } }),
       toolMessage({ id: "write", name: "write", arguments: { path: "written.ts", content }, status: "done", output: "Written" }),
     ];
     const before = structuredClone(f.session.messages);
-    const assertCodeVisible = () => {
-      const text = f.render();
-      for (const source of [...diff.split("\n"), ...content.split("\n")]) assert.ok(text.includes(source), source);
-      assert.doesNotMatch(text, /more \(\/expand\)/);
-    };
-    assertCodeVisible();
-    assert.match(f.render(), /Read 2 files/);
-    for (const expanded of [true, false, true, false]) {
-      f.transcript.toggleAll(expanded);
-      assertCodeVisible();
-    }
-    const y = f.transcript.positions.get("write")! + 2;
-    const event = { type: "click", button: "left", x: 4, y, screenX: 4, screenY: y, width: 100, height: 32, shift: false, ctrl: false, alt: false } as const;
-    for (let i = 0; i < 2; i++) {
-      assert.equal(f.transcript.handleMouse(event)?.handled, true);
-      assertCodeVisible();
-    }
-    for (const width of [1, 4, 12, 24, 80]) {
-      const lines = f.transcript.render(width);
-      assert.ok(lines.every((line) => visibleWidth(line) <= width));
-      const unwrapped = lines.map(stripTerminalSequences).join("").replace(/\s/g, "");
-      assert.ok(unwrapped.includes("addedLast"));
-      assert.ok(unwrapped.includes("written30"));
-    }
-    f.session.messages = structuredClone(before);
-    assertCodeVisible();
+    assert.match(f.render(), /added40/);
+    assert.doesNotMatch(f.render(), /written30/);
+    f.transcript.move(1); f.transcript.toggle();
+    assert.doesNotMatch(f.render(), /added40/);
+    assert.match(f.render(), /more rows/);
+    f.render(24); f.render(120);
+    assert.doesNotMatch(f.render(), /added40/);
+    f.transcript.toggle(); assert.match(f.render(), /added40/);
+    f.transcript.toggleAll(true); assert.match(f.render(), /added40[^]*written30/);
+    f.transcript.toggleAll(false); assert.doesNotMatch(f.render(), /added40|written30/);
+    for (const width of [1, 4, 12, 24, 80]) assert.ok(f.transcript.render(width).every(line => visibleWidth(line) <= width));
     const other = { ...structuredClone(f.session), id: "other-code" };
     f.store.state.sessions.push(other); f.controller.openedSessionId = other.id;
-    assertCodeVisible();
+    assert.match(f.render(), /added40/);
+    assert.doesNotMatch(f.render(), /written30/);
     assert.deepEqual(f.session.messages, before);
   } finally { await f.close(); }
 });
@@ -109,8 +91,8 @@ test("streaming projection updates one tool card and preserves expansion across 
   const project = (entries: unknown[], live: unknown) => applyView(f.session, { entries, docs: { "pi.live": live } } as unknown as ConversationView);
   try {
     project([call], { run: { taskId: 1 } });
-    assert.match(f.render(), /Bash\(npm test\)[^]*Pending/);
-    f.transcript.move(1); f.transcript.toggle();
+    assert.match(f.render(), /Waiting to run npm test/);
+    f.transcript.move(1); f.transcript.toggle(); f.render(); f.transcript.move(1); f.transcript.toggle();
     project([call], { run: { taskId: 1 }, tools: [{ callId: "run", name: "bash", status: "running", output: "PASS first" }] });
     assert.match(f.render(), /Running[^]*Arguments[^]*PASS first/);
     project([call, { id: 2, model: [{ role: "toolResult", toolCallId: "run", toolName: "bash", timestamp: 3, isError: false, content: [{ type: "text", text: "PASS first\nPASS second" }] }] }], {});
@@ -121,24 +103,26 @@ test("streaming projection updates one tool card and preserves expansion across 
   } finally { await f.close(); }
 });
 
-test("collapsed shell cards replace running status with successful output previews as calls settle", async () => {
+test("live shell previews expose streaming tails and retain them through settlement", async () => {
   const f = setup();
   try {
     const tool: ToolActivity = { id: "run", name: "bash", arguments: { command: "npm test" },
       status: "running", output: "FIRST_RESULT\nsecond\nthird\nFULL_TAIL" };
+    f.session.status = "working";
     f.session.messages = [toolMessage(tool)];
-    assert.match(f.render(), /Running/);
-    assert.doesNotMatch(f.render(), /FIRST_RESULT|FULL_TAIL/);
+    assert.match(f.render(), /Running npm test[^]*second[^]*third[^]*FULL_TAIL/);
+    assert.doesNotMatch(f.render(), /FIRST_RESULT/);
     tool.status = "done"; tool.durationMs = 6900;
-    assert.match(f.render(), /Bash\(npm test\) \(6\.9s\)[^]*FIRST_RESULT[^]*third[^]*more \(\/expand\)/);
-    assert.doesNotMatch(f.render(), /Running|Ran 1 shell command|FULL_TAIL/);
+    assert.match(f.render(), /Running npm test[^]*FULL_TAIL/);
+    assert.doesNotMatch(f.render(), /Ran 1 shell command/);
     f.transcript.toggleAll(true);
     assert.match(f.render(), /Arguments[^]*FULL_TAIL/);
     f.transcript.toggleAll(false);
-    assert.doesNotMatch(f.render(), /FULL_TAIL/);
+    assert.match(f.render(), /FULL_TAIL/);
     tool.status = "interrupted";
     assert.match(f.render(), /Interrupted; completion not confirmed/);
-    assert.doesNotMatch(f.render(), /FIRST_RESULT|FULL_TAIL/);
+    assert.doesNotMatch(f.render(), /FIRST_RESULT/);
+    assert.match(f.render(), /FULL_TAIL/);
   } finally { await f.close(); }
 });
 
@@ -231,9 +215,12 @@ test("preview clicks toggle full tool details and expansion resets on session ch
   try {
     f.session.messages = [toolMessage({ id: "call", name: "bash", arguments: { command: "npm test" }, status: "done", output: "result" })];
     f.render();
-    const y = f.transcript.positions.get("call")! + 1;
+    let y = f.transcript.positions.get("group:call")!;
     const event = { type: "click", button: "left", x: 4, y, screenX: 4, screenY: y, width: 100, height: 32, shift: false, ctrl: false, alt: false } as const;
     assert.equal(f.transcript.handleMouse(event)?.handled, true);
+    assert.doesNotMatch(f.render(), /Arguments/);
+    y = f.transcript.positions.get("call")!;
+    assert.equal(f.transcript.handleMouse({ ...event, y })?.handled, true);
     assert.match(f.render(), /Arguments/);
     const other = { ...structuredClone(f.session), id: "other" };
     f.store.state.sessions.push(other); f.controller.openedSessionId = other.id;
@@ -286,11 +273,14 @@ test("scroll-only TUI frames reuse formatted history and preserve tool click tar
     assert.equal(clear.mock.callCount(), 0, "Scrolling must not rebuild history or its hit map");
     assert.deepEqual([...app.body.transcript.positions], positions);
     app.chatScroll.scrollToEnd(); tui.renderNow();
-    const y = app.body.transcript.positions.get("last-tool")! + 1;
+    const y = app.body.transcript.positions.get("group:last-tool")!;
     app.body.transcript.handleMouse({ type: "click", button: "left", x: 4, y, screenX: 4, screenY: y, width: 120, height: 32, shift: false, ctrl: false, alt: false });
     tui.renderNow();
+    const memberY = app.body.transcript.positions.get("last-tool")!;
+    app.body.transcript.handleMouse({ type: "click", button: "left", x: 4, y: memberY, screenX: 4, screenY: memberY, width: 120, height: 32, shift: false, ctrl: false, alt: false });
+    tui.renderNow();
     assert.match(tui.getScreenLines().map(stripTerminalSequences).join("\n"), /Arguments[^]*PASS/);
-    assert.equal(clear.mock.callCount(), 1);
+    assert.equal(clear.mock.callCount(), 2);
   } finally { tui.stop(); await f.close(); }
 });
 
@@ -343,7 +333,7 @@ test("cached history does not freeze work animation, queues or session status", 
     assert.deepEqual(next.slice(0, 2), initial.slice(0, 2));
     assert.ok(next.includes(workLabel(f.session)!));
     now = 87615000;
-    assert.match(f.render(), /Working \(1d20m15s\)/);
+    assert.match(f.render(), /Working \(1d 0h 20m 15s\)/);
     f.session.preview = "Retrying: rate limit";
     assert.match(f.render(), /Retrying: rate limit/);
     f.session.queuedInputs = [{ id: 1, text: "Next task", mode: "steer" }];
@@ -448,4 +438,69 @@ test("incremental output and hit maps match full renders when groups grow, split
     f.session.messages.splice(0, 2); check();
     f.session.messages = []; check();
   } finally { await f.close(); }
+});
+
+test("completion receipts are view-local, success-only, thresholded and cleared by later activity", async () => {
+  const f = setup();
+  try {
+    f.session.messages = [{ role: "assistant", text: "Reply", timestamp: 1 }];
+    f.session.work = { startedAt: 0 };
+    f.session.status = "working";
+    f.render();
+    f.session.work.finishedAt = 10000; f.session.status = "completed";
+    assert.match(f.render(), /Worked for 10s/);
+    const replay = new Transcript(f.controller, () => {});
+    assert.doesNotMatch(replay.render(100).map(stripTerminalSequences).join("\n"), /Worked for/);
+    f.session.messages.push({ role: "assistant", text: "Later notice", timestamp: 2 });
+    assert.doesNotMatch(f.render(), /Worked for/);
+    f.session.status = "working"; f.session.work = { startedAt: 20000 }; f.render();
+    f.session.status = "completed"; f.session.work.finishedAt = 29999;
+    assert.doesNotMatch(f.render(), /Worked for/);
+    for (const status of ["failed", "paused", "needs-input"] as const) {
+      f.session.status = "working"; f.session.work = { startedAt: 40000 }; f.render();
+      f.session.status = status; f.session.work.finishedAt = 60000;
+      assert.doesNotMatch(f.render(), /Worked for/);
+    }
+  } finally { await f.close(); }
+});
+
+test("sticky prompts track the scrolled turn, hide at the original and jump on click", async () => {
+  const f = setup(); const terminal = new FakeTerminal(); const tui = new TuiAltScreen(terminal);
+  let app: Dashboard | undefined;
+  try {
+    f.session.messages = [
+      { role: "user", text: "FIRST PROMPT\ncontinued", timestamp: 1 },
+      { role: "assistant", text: Array.from({ length: 30 }, (_, i) => `First reply row ${i}`).join("\n"), timestamp: 2 },
+      { role: "user", text: "SECOND PROMPT", timestamp: 3 },
+      { role: "assistant", text: Array.from({ length: 30 }, (_, i) => `Second reply row ${i}`).join("\n"), timestamp: 4 },
+    ];
+    app = new Dashboard(f.controller, tui, () => {});
+    tui.setLayoutRoot(app); tui.setFocus(app); tui.start(); app.sync(); tui.renderNow();
+    assert.deepEqual(app.stickyPrompt.render(80), []);
+    app.chatScroll.scrollTo(5); tui.renderNow(); tui.renderNow();
+    assert.match(app.stickyPrompt.render(80).map(stripTerminalSequences).join("\n"), /FIRST PROMPT continued/);
+    assert.ok(app.stickyPrompt.render(8).every(line => visibleWidth(line) <= 8));
+    const second = [...app.body.transcript.prompts].find(([, text]) => text === "SECOND PROMPT")![0];
+    app.chatScroll.scrollTo(second + 2); tui.renderNow(); tui.renderNow();
+    assert.match(app.stickyPrompt.render(80).map(stripTerminalSequences).join("\n"), /SECOND PROMPT/);
+    const stickyRow = tui.getScreenLines().findIndex(line => stripTerminalSequences(line).includes("SECOND PROMPT"));
+    assert.ok(stickyRow >= 0);
+    terminal.onInput(`\x1b[<0;2;${stickyRow + 1}M`);
+    terminal.onInput(`\x1b[<0;2;${stickyRow + 1}m`);
+    assert.equal(app.chatScroll.scrollTop, second);
+    tui.renderNow(); tui.renderNow();
+    assert.deepEqual(app.stickyPrompt.render(80), []);
+    app.chatScroll.scrollToEnd(); tui.renderNow(); tui.renderNow();
+    assert.deepEqual(app.stickyPrompt.render(80), []);
+    app.chatScroll.scrollTo(5); tui.renderNow(); tui.renderNow();
+    for (const [width, height] of [[24, 18], [80, 32], [12, 8], [120, 32]]) {
+      terminal.columns = width!; terminal.rows = height!; terminal.onResize(); tui.renderNow(); tui.renderNow();
+      assert.ok(tui.getScreenLines().every(line => visibleWidth(line) <= width!));
+      if (height! < 10) assert.deepEqual(app.stickyPrompt.render(width!), []);
+    }
+    const other = { ...structuredClone(f.session), id: "sticky-other", messages: [{ role: "assistant" as const, text: "Other session", timestamp: 1 }] };
+    f.store.state.sessions.push(other); f.controller.openedSessionId = other.id; app.sync(); tui.renderNow(); tui.renderNow();
+    assert.deepEqual(app.stickyPrompt.render(80), []);
+    assert.doesNotMatch(tui.getScreenLines().map(stripTerminalSequences).join("\n"), /FIRST PROMPT|SECOND PROMPT/);
+  } finally { tui.stop(); app?.dispose(); await f.close(); }
 });
