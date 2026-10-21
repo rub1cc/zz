@@ -349,16 +349,34 @@ export class Transcript implements Component {
     const compacting = compactionLabel(session);
     if (compacting) lines.push(...wrapTextWithAnsi(accent(oneLine(compacting)), Math.max(1, width)), "");
     if (session.compactionFailure) lines.push(...wrapTextWithAnsi(warning(oneLine(`Compaction failed (${session.compactionFailure.reason}): ${session.compactionFailure.error}`)), Math.max(1, width)), "");
-    if (session.queuedInputs?.length) {
-      const modes = new Set(session.queuedInputs.map((input) => input.mode ?? "followUp"));
-      const label = modes.size > 1 ? "Queued messages" : modes.has("steer") ? "Queued steering" : "Queued follow-ups";
-      lines.push(accent(`${label} (${session.queuedInputs.length})`));
-      for (const [index, input] of session.queuedInputs.entries()) {
-        const mode = modes.size > 1 ? `[${input.mode === "steer" ? "steer" : "follow-up"}] ` : "";
+    const queued = session.queuedInputs ?? [];
+    for (const agent of [false, true]) {
+      const inputs = queued.filter(input => !!input.source === agent);
+      if (!inputs.length) continue;
+      const modes = new Set(inputs.map((input) => input.mode ?? "followUp"));
+      const label = agent ? "Queued agent messages" : modes.size > 1 ? "Queued messages" : modes.has("steer") ? "Queued steering" : "Queued follow-ups";
+      lines.push(...wrapTextWithAnsi(accent(`${label} (${inputs.length})`), Math.max(1, width)));
+      for (const [index, input] of inputs.entries()) {
+        if (input.source) lines.push(...wrapTextWithAnsi(dim(`From ${oneLine(input.source.title)} (agent ${input.source.kind})`), Math.max(1, width)));
+        const mode = agent || modes.size > 1 ? `[${input.mode === "steer" ? "steer" : "follow-up"}] ` : "";
         for (const [lineIndex, source] of plain(`${input.text}${input.imageCount ? ` [${input.imageCount} image${input.imageCount === 1 ? "" : "s"}]` : ""}`).split("\n").entries()) {
           const prefix = lineIndex === 0 ? `${index + 1}. ${mode}` : "   ";
           lines.push(...wrapTextWithAnsi(`${prefix}${source}`, Math.max(1, width)).map((line) => dim(line)));
         }
+      }
+      lines.push("");
+    }
+    const updates = session.workerUpdates ?? [];
+    if (updates.length) {
+      lines.push(...wrapTextWithAnsi(accent(`Worker updates (${updates.length})`), Math.max(1, width)));
+      if (updates.length > 10) lines.push(...wrapTextWithAnsi(dim(`Showing latest 10 of ${updates.length} cached updates; older reports remain in durable history.`), Math.max(1, width)));
+      for (const update of updates.slice(-10)) {
+        const title = Array.from(oneLine(update.title));
+        const heading = `${title.length > 60 ? title.slice(0, 57).join("") + "..." : title.join("")} - ${update.kind} (${update.delivery})`;
+        const content = Array.from(`${heading}: ${oneLine(update.message).trim()}`);
+        const hint = "... [truncated; session_read for details]";
+        const preview = content.length > 240 ? content.slice(0, 240 - hint.length).join("") + hint : content.join("");
+        lines.push(...wrapTextWithAnsi(update.kind === "blocker" ? warning(preview) : dim(preview), Math.max(1, width)));
       }
       lines.push("");
     }

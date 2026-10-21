@@ -153,9 +153,34 @@ export interface SessionStats {
   contextWindow?: number;
 }
 
+export type WorkerResult = {
+  sessionId: string;
+  title: string;
+  status: string;
+  result: string;
+  resultTruncated: boolean;
+};
+
+export type WorkerUpdate = {
+  id: string;
+  taskId: string;
+  runId: number;
+  sessionId: string;
+  title: string;
+  kind: "progress" | "blocker" | "result";
+  message: string;
+  timestamp: number;
+  delivery: "recorded" | "pending" | "delivered" | "acknowledged" | "disposed";
+  result?: WorkerResult;
+  waitResults?: WorkerResult[];
+  observedSessionIds?: string[];
+};
+
 export interface Session {
+  /** Presentation cache only; zz.sessions owns the full worker update history. */
+  workerUpdates?: WorkerUpdate[];
   /** A worker is a normal session with a durable delegation owner. */
-  delegation?: { parentId: string; taskId: string };
+  delegation?: { parentId: string; taskId: string; runId?: number };
   /** Presentation cache of orchestration waits and unfinished child tasks. */
   waitingFor?: string[];
   orchestrationPending?: boolean;
@@ -177,7 +202,7 @@ export interface Session {
   /** Additional outstanding submissions, including inputs awaiting durable admission. */
   followUps?: PendingInput[];
   /** Presentation cache of native pi.inbox inputs, rebuilt from the durable view. */
-  queuedInputs?: { id: number; text: string; mode?: ReplyBehavior; imageCount?: number }[];
+  queuedInputs?: { id: number; text: string; mode?: ReplyBehavior; imageCount?: number; source?: PendingInput["source"] }[];
   agent?: AgentSettings;
   projectId: string;
   workspaceId?: string;

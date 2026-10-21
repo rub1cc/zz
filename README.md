@@ -809,6 +809,11 @@ The agent tools are:
 - `session_delegate`: start a worker with a self-contained task and optional title
   and `model: { provider, modelId }`. Model/thinking inherit unless overridden.
 - `session_create`: start an independent top-level session when requested by the user.
+- `session_update`: a worker reports on its own original delegated task to its parent
+  with `kind: "progress" | "blocker" | "result"` and `message`. Progress is passive;
+  a blocker queues a notification for safe delivery. An explicit result is a passive
+  draft, not completion: the runtime publishes the task result when the worker
+  actually finishes. This tool is worker-only, not a way to message arbitrary peers.
 - `session_send`: message an existing session without changing ownership. Default
   `queue` follows active work or resumes an idle session; explicit `steer` redirects
   at a tool-round boundary. Agent messages are labeled separately from human input.
@@ -826,13 +831,27 @@ file locks: concurrent edits can conflict. There are limits of twelve active wor
 per coordinator, four delegation levels, and 32 active sessions per project for
 agent-created work. Existing user-created sessions are not capped by these limits.
 
-Delegated results and questions return automatically. Nested work must finish before
-its parent's task result is delivered. Delivery is durable across restart and uses
-stable submission IDs to avoid duplicate sessions/messages on replay. Automatic
-notifications wait for the active turn to end and do not answer a pending human
-question or workspace approval: they wait until that interaction is resolved. Stopping a coordinator cancels its waits, pending
-notifications, and delegated workers. A stopped session requires a human reply to
-resume; another agent cannot silently restart it.
+Worker reports appear in a separate **Worker updates** transcript section with the
+worker title, report kind and delivery state. It shows the latest ten reports from
+the latest-50 presentation cache as single-line previews capped at 240 characters
+(wrapped on narrow terminals). Truncated previews point to `session_read` for details;
+cached and durable history are unchanged. Passive
+reports remain visible while idle and do not start a model request. Human queued
+follow-ups/steering stay separate from **Queued agent messages**; ordinary
+`session_send` messages still queue or steer exactly as before, rather than becoming
+passive reports.
+
+Delegated results and blockers return automatically. Nested work must finish before
+its parent's task result is delivered. Ready completions are batched for delivery;
+reading a worker's terminal result with `session_read`, or receiving its terminal
+result through `session_wait`, acknowledges that completion so it is not delivered
+again as a separate notification. Reporting a draft result does not acknowledge or
+publish completion. Delivery is durable across restart and uses stable submission
+IDs to avoid duplicate sessions/messages on replay. Automatic notifications wait
+for the active turn to end and do not answer a pending human question or workspace
+approval: they wait until that interaction is resolved. Stopping a coordinator
+cancels its waits, pending notifications, and delegated workers. A stopped session
+requires a human reply to resume; another agent cannot silently restart it.
 
 A worker conversation remains available after its original task finishes; subsequent
 messages are ordinary session collaboration, not a reopening of the published task.
