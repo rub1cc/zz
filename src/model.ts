@@ -76,6 +76,7 @@ export type SettingsSelection = "replyBehavior" | "model" | "thinking" | "showTh
   | "reserveTokens" | "keepRecentTokens" | "backgroundTokens";
 
 export interface PendingInput {
+  source?: { sessionId: string; title: string; kind: "message" | "delegation" | "notification" };
   images?: ImageAttachment[];
   requestId: string;
   prompt: string;
@@ -115,6 +116,7 @@ export interface Workspace {
 }
 
 export interface Message {
+  source?: PendingInput["source"];
   role: "user" | "assistant" | "tool" | "error" | "thinking";
   thinking?: { id: string; redacted?: boolean };
   images?: ImageAttachment[];
@@ -152,6 +154,11 @@ export interface SessionStats {
 }
 
 export interface Session {
+  /** A worker is a normal session with a durable delegation owner. */
+  delegation?: { parentId: string; taskId: string };
+  /** Presentation cache of orchestration waits and unfinished child tasks. */
+  waitingFor?: string[];
+  orchestrationPending?: boolean;
   /** Presentation cache of zz.tasks; durable conversation state is authoritative. */
   tasks?: ChecklistTask[];
   /** Local display history, never submitted to the model or replayed as commands. */
@@ -224,23 +231,39 @@ export interface State {
 
 export type Row =
   | { kind: "project"; project: Project }
-  | { kind: "session"; project: Project; session: Session };
+  | { kind: "session"; project: Project; session: Session; depth?: number };
 
-const order: Record<SessionStatus, number> = {
-  "needs-input": 0, working: 1, failed: 2, paused: 3, completed: 4,
+const order: Record<SessionStatus | "waiting", number> = {
+  "needs-input": 0, working: 1, waiting: 2, failed: 3, paused: 4, completed: 5,
 };
 
 export function rows(state: State, projectsOnly = false): Row[] {
   return state.projects.flatMap((project): Row[] => {
+    if (projectsOnly) return [{ kind: "project", project }];
     const manual = new Map(project.sessionOrder?.map((id, index) => [id, index]));
-    return [
-      { kind: "project", project },
-      ...(projectsOnly ? [] : state.sessions
-        .filter((session) => session.projectId === project.id)
-        .sort((a, b) => (manual.get(a.id) ?? -1) - (manual.get(b.id) ?? -1)
-          || order[displayStatus(a)] - order[displayStatus(b)] || b.createdAt - a.createdAt)
-        .map((session): Row => ({ kind: "session", project, session }))),
-    ];
+    const sessions = state.sessions.filter((session) => session.projectId === project.id)
+      .sort((a, b) => (manual.get(a.id) ?? -1) - (manual.get(b.id) ?? -1)
+        || order[displayStatus(a)] - order[displayStatus(b)] || b.createdAt - a.createdAt);
+    const ids = new Set(sessions.map((s) => s.id));
+    const children = new Map<string, Session[]>();
+    for (const session of sessions) {
+      const parent = session.delegation?.parentId;
+      if (parent && parent !== session.id && ids.has(parent)) {
+        const group = children.get(parent) ?? []; group.push(session); children.set(parent, group);
+      }
+    }
+    const seen = new Set<string>();
+    const nested: Row[] = [];
+    const append = (session: Session, depth: number): void => {
+      if (seen.has(session.id)) return;
+      seen.add(session.id);
+      nested.push({ kind: "session", project, session, ...(depth ? { depth } : {}) });
+      for (const child of children.get(session.id) ?? []) append(child, depth + 1);
+    };
+    for (const session of sessions) if (!session.delegation || !ids.has(session.delegation.parentId)) append(session, 0);
+    // Orphans and malformed cycles must never hide a conversation.
+    for (const session of sessions) append(session, 0);
+    return [{ kind: "project", project }, ...nested];
   });
 }
 
@@ -281,8 +304,9 @@ export function lastReply(session: Session): string {
   return reply?.text || (session.status === "working" ? "The agent is working. No reply yet." : "No agent reply yet.");
 }
 
-export function displayStatus(session: Session): SessionStatus {
+export function displayStatus(session: Session): SessionStatus | "waiting" {
   if (session.status === "working" || session.shellResponses?.some((shell) => shell.status === "running" || shell.status === "stopping")) return "working";
+  if (!session.stopped && session.status === "completed" && session.waitingFor?.length) return "waiting";
   const reply = lastReplyMessage(session);
   if (reply?.role !== "shell") return session.status;
   return reply.shell.status === "failed" ? "failed" : reply.shell.status === "cancelled" || reply.shell.status === "interrupted" ? "paused" : "completed";
@@ -293,6 +317,7 @@ export function activityTimestamp(session: Session): number {
 }
 
 export function sessionPreview(session: Session): string {
+  if (displayStatus(session) === "waiting") return `Waiting on ${session.waitingFor!.length} session${session.waitingFor!.length === 1 ? "" : "s"}`;
   if (session.status === "working" || session.compactions?.length) return session.preview;
   const reply = lastReplyMessage(session);
   return reply?.role === "shell" ? `!${reply.shell.command.trim()} / ${lastReply(session)}`.replace(/\s+/g, " ").slice(0, 250) : session.preview;

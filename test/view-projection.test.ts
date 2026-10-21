@@ -111,3 +111,20 @@ test("cached execution order survives result commits and never mutates prior sna
   assert.deepEqual(s.messages.map(item => item.tool?.executionOrder), [undefined, undefined], "new runs do not inherit cached execution metadata");
   assert.deepEqual(previous.map(item => item.tool?.executionOrder), [1, 2]);
 });
+
+test("cached projections preserve agent provenance without duplicating tool cards or rescanning live updates", () => {
+  const s = session(), project = createViewProjector(s);
+  const source = { sessionId: "peer", title: "Backend", kind: "message" as const };
+  let scans = 0;
+  const input = { id: 1, kind: "zz.agent_input", data: { prompt: "API details", source },
+    get model() { scans++; return [{ role: "user", content: "Agent-authored message envelope", timestamp: 1 }]; } };
+  const entries = [input, call];
+  project(view(entries, { run, tools: [{ callId: "read", name: "read", status: "running", output: "first" }] }));
+  assert.equal(s.messages[0]?.text, "API details"); assert.deepEqual(s.messages[0]?.source, source);
+  assert.equal(s.messages.filter((message) => message.tool).length, 1);
+  const scansBefore = scans, cachedInput = s.messages[0];
+  assert.equal(project(view(entries, { run, tools: [{ callId: "read", name: "read", status: "running", output: "second" }] })), false);
+  assert.equal(scans, scansBefore); assert.equal(s.messages[0], cachedInput);
+  assert.equal(s.messages.find((message) => message.tool)?.tool?.output, "second");
+  assert.equal(s.messages.filter((message) => message.tool).length, 1);
+});

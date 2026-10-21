@@ -70,10 +70,16 @@ class SessionList extends Dynamic {
     this.renameHeight = 0;
     const lines: string[] = [];
     const rows = c.currentRows;
+    const childCounts = new Map<string, number>();
+    for (const session of c.store.state.sessions) if (session.delegation) {
+      const id = session.delegation.parentId; childCounts.set(id, (childCounts.get(id) ?? 0) + 1);
+    }
     const titleOf = (session: Session) => {
       const workspace = c.store.workspace(session);
       const branch = workspace?.status === "ready" ? this.branches.value(workspace.path) : undefined;
-      return `${oneLine(session.title)}${workspace?.kind === "worktree" ? ` [${oneLine(branch ?? c.workspaceLabel(session))}]` : ""}`;
+      const children = childCounts.get(session.id) ?? 0;
+      const group = children ? ` [${c.collapsedSessions.has(session.id) ? "+" : ""}${children} worker${children === 1 ? "" : "s"}]` : "";
+      return `${oneLine(session.title)}${group}${workspace?.kind === "worktree" ? ` [${oneLine(branch ?? c.workspaceLabel(session))}]` : ""}`;
     };
     const titleWidths = new Map<string, number>();
     for (const row of rows) {
@@ -101,12 +107,13 @@ class SessionList extends Dynamic {
         }
       } else {
         const { session } = row;
+        const tree = row.depth ? `${"  ".repeat(Math.min(row.depth, 4))}|- ` : "";
         const status = displayStatus(session);
         const symbol = status === "working" ? accent(workingIcon()) : status === "needs-input" ? warning("?")
-          : status === "failed" ? warning("!") : status === "paused" ? dim("-") : green("∙");
+          : status === "failed" ? warning("!") : status === "paused" || status === "waiting" ? dim("-") : green("∙");
         if (this.rename?.sessionId === session.id) {
-          const prefix = width >= 6 ? `  ${symbol} ` : "";
-          const indent = width >= 6 ? "    " : "";
+          const prefix = width >= 6 ? `  ${tree}${symbol} ` : "";
+          const indent = width >= 6 ? `    ${" ".repeat(tree.length)}` : "";
           rowLines = [
             ...this.rename.input.render(Math.max(1, width - visibleWidth(prefix))).map((line) => `${prefix}${line}`),
             ...wrapTextWithAnsi(c.notice ? warning(oneLine(c.notice)) : dim("enter save / esc cancel"), Math.max(1, width - indent.length))
@@ -119,19 +126,19 @@ class SessionList extends Dynamic {
           const title = titleOf(session);
           const titleWidth = titleWidths.get(row.project.id)!;
           const label = status === "completed" ? "Done" : status === "needs-input" ? "Needs input"
-            : status === "working" ? "Working" : status === "failed" ? "Failed" : "Paused";
+            : status === "working" ? "Working" : status === "waiting" ? "Waiting" : status === "failed" ? "Failed" : "Paused";
           const state = status === "completed" ? green(label) : status === "working" ? label
-            : status === "paused" ? dim(label) : warning(label);
-          const previewWidth = Math.max(0, width - titleWidth - label.length - time.length - 13);
+            : status === "paused" || status === "waiting" ? dim(label) : warning(label);
+          const previewWidth = Math.max(0, width - titleWidth - label.length - time.length - tree.length - 13);
           if (previewWidth > 8 && (!confirmation || previewWidth >= confirmation.length)) {
             const preview = confirmation
               ? red(pad(confirmation, previewWidth))
               : dim(pad(fit(oneLine(sessionPreview(session)), previewWidth), previewWidth));
-            rowLines = [`  ${symbol} ${pad(title, titleWidth)}  ${state}${dim(" · ")}${preview}  ${dim(time)}`];
+            rowLines = [`  ${tree}${symbol} ${pad(title, titleWidth)}  ${state}${dim(" · ")}${preview}  ${dim(time)}`];
           } else {
-            const indent = width >= 6 ? "    " : "";
+            const indent = width >= 6 ? `    ${" ".repeat(tree.length)}` : "";
             rowLines = wrapTextWithAnsi(title, Math.max(1, width - indent.length))
-              .map((part, index) => `${index === 0 && indent ? `  ${symbol} ` : indent}${part}`);
+              .map((part, index) => `${index === 0 && indent ? `  ${tree}${symbol} ` : indent}${part}`);
             if (progress) rowLines.push(fit(`${indent}${dim(`${progress} tasks`)}`, width));
             if (confirmation) rowLines.push(...wrapTextWithAnsi(red(confirmation), Math.max(1, width - indent.length))
               .map((part) => `${indent}${part}`));
@@ -338,10 +345,12 @@ export class Dashboard extends VStack implements Focusable {
       const path = c.store.sessionPath(c.opened);
       const shared = c.store.state.sessions.filter((s) => c.store.sessionPath(s) === path).length;
       const branch = this.branches.value(path);
-      if (c.store.workspace(c.opened)?.kind === "worktree") return [bold(oneLine(c.opened.title)),
+      const parent = c.opened.delegation && c.session(c.opened.delegation.parentId);
+      const owner = parent ? ` / worker for ${oneLine(parent.title)}` : "";
+      if (c.store.workspace(c.opened)?.kind === "worktree") return [bold(oneLine(c.opened.title) + owner),
         dim(oneLine(`${branch ?? c.workspaceLabel(c.opened)} / ${displayStatus(c.opened)}${shared > 1 ? ` / shared by ${shared} sessions` : ""}`)),
         dim(oneLine(displayPath(path)))];
-      return [bold(oneLine(c.opened.title)), dim(oneLine(`${displayPath(path)}  ${branch ?? c.workspaceLabel(c.opened)}${shared > 1 ? ` / shared by ${shared} sessions` : ""}  ${displayStatus(c.opened)}`)), ""];
+      return [bold(oneLine(c.opened.title) + owner), dim(oneLine(`${displayPath(path)}  ${branch ?? c.workspaceLabel(c.opened)}${shared > 1 ? ` / shared by ${shared} sessions` : ""}  ${displayStatus(c.opened)}`)), ""];
     }
     const visible = c.store.state.sessions.filter((s) => c.store.state.projects.some((p) => p.id === s.projectId));
     const count = (status: string) => visible.filter((s) => displayStatus(s) === status).length;
@@ -353,7 +362,7 @@ export class Dashboard extends VStack implements Focusable {
     return [
       `${bold("ZZ")} ${dim(`v${version}`)}`,
       dim(oneLine(`New sessions: ${model} · ${thinking}${path}`)),
-      dim(`${count("needs-input")} awaiting input · ${count("working")} working · ${count("completed")} completed${extra ? ` · ${extra} interrupted or failed` : ""}`), "",
+      dim(`${count("needs-input")} awaiting input · ${count("working")} working${count("waiting") ? ` · ${count("waiting")} waiting` : ""} · ${count("completed")} completed${extra ? ` · ${extra} interrupted or failed` : ""}`), "",
     ];
   }
 
@@ -563,6 +572,7 @@ export class Dashboard extends VStack implements Focusable {
         return;
       }
       if (!this.composer.hasContent) {
+        if (matchesKey(data, "tab")) { c.toggleWorkers(); this.revealSelection(); return; }
         if (matchesKey(data, "space")) { c.peek(); return; }
         if (matchesKey(data, "enter")) {
           if (c.selected?.kind === "project") c.toggleProject();
@@ -660,6 +670,7 @@ class DialogView implements Component, Focusable {
       "down / ctrl+n   select next project or session",
       "enter           new task when composer has text", "enter           open session when composer is empty",
       "enter           collapse or expand selected project (empty composer)",
+      "tab             collapse or expand selected session workers (empty composer)",
       "enter           queue a busy-session reply (/settings chooses follow-up or steer)",
       "↑ / ↓           recall sent prompts in session / peek (empty draft or start of first line)",
       "↓               after newest recalled prompt, restore your unsent draft",

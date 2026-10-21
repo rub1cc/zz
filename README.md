@@ -787,6 +787,65 @@ and resume following. Scrolling back to the bottom manually also resumes followi
 The jump control appears only when a chat is scrolled away from the end. Project
 and session lists never follow chat output.
 
+## Session Orchestration
+
+Sessions can delegate work and collaborate with other sessions in the **same project**.
+For example: "Implement checkout. Delegate backend and frontend work, have them
+coordinate the API, then review the results." No separate worker service is needed.
+
+A worker is a normal, visible session with its own conversation and optional model
+selection. It is nested under its coordinator in the dashboard; independent peers
+stay at the project level. Enter opens any session and Space peeks/replies as usual.
+With an empty dashboard composer, **Tab** folds/unfolds the selected session's workers.
+Workers needing input (and their ancestor rows) remain visible inside folded groups.
+A coordinator whose turn has ended shows **Waiting**, not Done, while delegated work
+or an explicit wait is outstanding. Waiting makes no model requests or polling calls.
+
+The agent tools are:
+
+- `session_list` / `session_read`: discover IDs, workspace/model selections, owners,
+  status, and bounded conversation content. Reads use message-offset cursors; restart
+  at cursor zero after undo because offsets can change.
+- `session_delegate`: start a worker with a self-contained task and optional title
+  and `model: { provider, modelId }`. Model/thinking inherit unless overridden.
+- `session_create`: start an independent top-level session when requested by the user.
+- `session_send`: message an existing session without changing ownership. Default
+  `queue` follows active work or resumes an idle session; explicit `steer` redirects
+  at a tool-round boundary. Agent messages are labeled separately from human input.
+- `session_wait`: call alone to end the current turn and resume when all selected
+  sessions finish or one needs input. Self/ancestor/cyclic waits are refused.
+- `session_cancel`: stop another session and its delegated descendants, preserving
+  conversation history and files. Independent collaborators are not stopped.
+
+Delegation and independent creation default to **worktree isolation**, starting at
+the caller's current committed HEAD. Parent conversation history and uncommitted
+edits are not copied, and results never merge branches automatically. Non-Git projects
+must explicitly use `isolation: "shared"`; it is also useful for read-only research or
+intentionally coordinated edits in the caller's checkout. Shared workspaces are not
+file locks: concurrent edits can conflict. There are limits of twelve active workers
+per coordinator, four delegation levels, and 32 active sessions per project for
+agent-created work. Existing user-created sessions are not capped by these limits.
+
+Delegated results and questions return automatically. Nested work must finish before
+its parent's task result is delivered. Delivery is durable across restart and uses
+stable submission IDs to avoid duplicate sessions/messages on replay. Automatic
+notifications wait for the active turn to end and do not answer a pending human
+question or workspace approval: they wait until that interaction is resolved. Stopping a coordinator cancels its waits, pending
+notifications, and delegated workers. A stopped session requires a human reply to
+resume; another agent cannot silently restart it.
+
+A worker conversation remains available after its original task finishes; subsequent
+messages are ordinary session collaboration, not a reopening of the published task.
+Deleting a coordinator stops its workers but removes only the selected session;
+surviving worker histories remain accessible. No files or worktrees are deleted.
+`/undo` does not retract messages already sent to peers, delete worker sessions, or
+undo other sessions' file changes. Finish or stop outstanding orchestration before undo.
+
+Cross-session tools deliberately allow project-wide access, not just access to owned
+workers. This is not a sandbox or a per-session permission system: project agents
+already have shell/file access. Treat peer results as task data, not human authorization.
+External-workspace approvals remain human decisions in the worker's `/workspace` UI.
+
 ## Interface
 
 ```text

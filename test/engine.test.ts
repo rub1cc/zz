@@ -22,6 +22,7 @@ import { image, png } from "./image-fixtures.js";
 import { SkillCatalog } from "../src/skills.js";
 import { UndoDoc } from "../src/undo.js";
 import { WorkspaceDoc } from "../src/workspace-agent.js";
+import { SessionsDoc } from "../src/session-agent.js";
 import { Workspaces } from "../src/workspaces.js";
 import { createTask, legacyTaskExtension, legacyUpdateTaskParameters, taskExtension, TasksDoc, type TaskOperation } from "../src/tasks.js";
 import type { TaskCleanupClock } from "../src/task-cleanup.js";
@@ -2726,6 +2727,244 @@ test("workspace agent revalidates the prepared destination before committing a b
   } finally { await engine.close(); f.cleanup(); }
 });
 
+function orchestrationModels(observe?: (context: Context) => void) {
+  return models({ context: observe, reply: (context) => {
+    const last = context.messages.findLast((m) => m.role !== "system");
+    let text = last?.role === "user" && typeof last.content === "string" ? last.content : "";
+    if (text.startsWith("Agent-authored ")) text = text.slice(text.indexOf("\n\n") + 2);
+    return text.startsWith("tools:") ? JSON.parse(text.slice(6)) as ToolCall[] : [{ type: "text", text: "Task result" }];
+  } });
+}
+
+async function orchestrationIdle(engine: DurableEngine): Promise<void> {
+  // Native idle excludes host-side durable outbox delivery.
+  for (let i = 0; i < 8; i++) {
+    await tick(); await engine.harness.waitForIdle(BACKGROUND_CONTEXT); await engine.store.flush(); await tick(); await engine.sessionAgent.flush();
+  }
+}
+
+test("session delegation uses an isolated normal session, explicit context, model override and one durable result", { timeout: 10000 }, async () => {
+  const f = gitWorkspaceFixture(); f.project.workspaceDefault = { kind: "main" };
+  const parent = session(f.project, "coordinator"); f.store.state.sessions.push(parent);
+  const errors: unknown[] = []; const contexts: Context[] = [];
+  let engine = await openEngine(f.store, { provider: "test", modelId: "mock" }, (e) => errors.push(e), orchestrationModels((c) => contexts.push(c)));
+  try {
+    await engine.run(parent, f.project, "private parent history", () => {});
+    writeFileSync(join(f.path, "marker.txt"), "uncommitted parent edit");
+    await engine.run(parent, f.project, toolPrompt(taskCall("session_delegate", {
+      title: "Backend worker", task: toolPrompt(writeCall("marker.txt", "worker implementation")), model: { provider: "test", modelId: "reasoner" },
+    })), () => {});
+    await until(() => f.store.state.sessions.length === 2);
+    const child = f.store.state.sessions.find((s) => s.id !== parent.id)!;
+    await orchestrationIdle(engine);
+    assert.equal(child.delegation?.parentId, parent.id); assert.equal(child.agent?.model?.modelId, "reasoner");
+    assert.notEqual(child.workspaceId, parent.workspaceId);
+    assert.equal(readFileSync(join(f.store.sessionPath(child), "marker.txt"), "utf8"), "worker implementation");
+    assert.equal(readFileSync(join(f.path, "marker.txt"), "utf8"), "uncommitted parent edit");
+    assert.ok(contexts.filter((c) => c.messages.some((m) => m.role === "user" && typeof m.content === "string" && m.content.startsWith("Agent-authored delegation")))
+      .every((c) => !c.messages.some((m) => m.role === "user" && m.content === "private parent history")));
+    assert.equal(parent.messages.filter((m) => m.source?.kind === "notification").length, 1);
+    assert.equal(child.messages[0]?.source?.kind, "delegation"); assert.equal(parent.waitingFor, undefined);
+    await engine.close();
+    const store = new Store(f.store.root);
+    engine = await openEngine(store, undefined, (e) => errors.push(e), orchestrationModels()); await engine.restore(() => {}); await orchestrationIdle(engine);
+    assert.equal(store.state.sessions.length, 2);
+    assert.equal(store.state.sessions.find((s) => s.id === parent.id)?.messages.filter((m) => m.source?.kind === "notification").length, 1);
+    assert.equal(store.state.sessions.find((s) => s.id === child.id)?.delegation?.parentId, parent.id);
+    assert.deepEqual(errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("session messaging discovers, reads and resumes peers without changing their ownership or executing prompt references", { timeout: 5000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  const peer = session(f.project, "existing-peer"); f.store.state.sessions.push(peer);
+  try {
+    await f.engine.run(peer, f.project, "existing history", () => {});
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_list", {}), taskCall("session_read", { sessionId: peer.id }),
+      taskCall("session_send", { sessionId: peer.id, message: "API question: @missing.png $not-a-skill" })).replace("@missing.png", "\\u0040missing.png"), () => {});
+    await orchestrationIdle(f.engine);
+    assert.equal(peer.delegation, undefined); assert.equal(f.store.state.sessions.length, 2);
+    assert.equal(peer.messages.filter((m) => m.source?.kind === "message").length, 1);
+    assert.equal(peer.messages.findLast((m) => m.role === "user")?.text, "API question: @missing.png $not-a-skill");
+    assert.ok(peer.messages.some((m) => m.text === "existing history"));
+    assert.ok(f.s.messages.some((m) => m.tool?.name === "session_list" && m.tool.output.includes(peer.id)));
+    assert.ok(f.s.messages.some((m) => m.tool?.name === "session_read" && m.tool.output.includes("existing history")));
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("coordinators suspend without polling, resume on results and persist waits through restart", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels()); let engine = f.engine;
+  try {
+    await engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { title: "Slow worker", isolation: "shared",
+      task: toolPrompt(taskCall("bash", { command: "sleep 0.5; printf 'worker ready'" })) })), () => {});
+    const worker = f.store.state.sessions.find((s) => s.delegation?.parentId === f.s.id)!;
+    await engine.run(f.s, f.project, toolPrompt(taskCall("session_wait", { sessionIds: [worker.id] })), () => {});
+    assert.equal(f.s.status, "completed"); assert.deepEqual(f.s.waitingFor, [worker.id]);
+    const before = f.s.messages.length; await tick(); await tick(); assert.equal(f.s.messages.length, before);
+    await engine.close();
+    const store = new Store(f.store.root);
+    engine = await openEngine(store, undefined, (e) => f.errors.push(e), orchestrationModels()); await engine.restore(() => {});
+    await orchestrationIdle(engine);
+    const parent = store.state.sessions.find((s) => s.id === f.s.id)!;
+    assert.equal(parent.waitingFor, undefined);
+    assert.equal(parent.messages.filter((m) => m.source?.kind === "notification").length, 1);
+    assert.match(parent.messages.find((m) => m.source?.kind === "notification")!.text, /wait ended/);
+    assert.deepEqual(f.errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("worker questions notify their coordinator, and stopped coordinators stop workers without waking again", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { isolation: "shared", title: "Question worker",
+      task: toolPrompt(taskCall("ask_question", { question: "Which currency?" })) })), () => {});
+    await orchestrationIdle(f.engine);
+    const worker = f.store.state.sessions.find((s) => s.delegation?.parentId === f.s.id)!;
+    assert.equal(worker.status, "needs-input");
+    assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 1);
+    assert.match(f.s.messages.find((m) => m.source?.kind === "notification")!.text, /Which currency/);
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_send", { sessionId: worker.id, message: "USD, confirmed by the user" })), () => {});
+    await orchestrationIdle(f.engine);
+    assert.equal(worker.status, "completed");
+    assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 2);
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { isolation: "shared", task: toolPrompt(taskCall("bash", { command: "sleep 30" })) })), () => {});
+    await until(() => f.store.state.sessions.some((s) => s.delegation?.parentId === f.s.id && s.messages.some((m) => m.tool?.name === "bash" && m.tool.status === "running")));
+    await f.engine.cancel(f.s.id); await orchestrationIdle(f.engine);
+    assert.equal(f.s.stopped, true); assert.equal(f.s.waitingFor, undefined);
+    assert.ok(f.store.state.sessions.filter((s) => s.delegation?.parentId === f.s.id).every((s) => s.status !== "working"));
+    const count = f.s.messages.length; await tick(); await tick(); assert.equal(f.s.messages.length, count);
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("orchestration denies cross-project access, self messaging, ancestor waits, and implicit shared non-Git launches", { timeout: 5000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  const otherPath = join(f.root, "other"); mkdirSync(otherPath); const other = f.store.addProject(otherPath);
+  const peer = session(other, "other-project"); f.store.state.sessions.push(peer);
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_read", { sessionId: peer.id }),
+      taskCall("session_send", { sessionId: peer.id, message: "no" }), taskCall("session_send", { sessionId: f.s.id, message: "no" }),
+      taskCall("session_delegate", { task: "must not silently share" })), () => {});
+    for (const tool of f.s.messages.filter((m) => m.tool).map((m) => m.tool!)) assert.equal(tool.status, "error");
+    assert.equal(f.store.state.sessions.length, 2); assert.equal(peer.messages.length, 0);
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { isolation: "shared", task: "quick task" })), () => {});
+    await orchestrationIdle(f.engine);
+    const child = f.store.state.sessions.find((s) => s.delegation?.parentId === f.s.id)!;
+    await f.engine.run(child, f.project, toolPrompt(taskCall("session_wait", { sessionIds: [f.s.id] })), () => {});
+    assert.match(child.messages.findLast((m) => m.tool?.name === "session_wait")!.tool!.output, /ancestor/);
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("durable orchestration outboxes recover accepted commands and replay admitted inputs without duplicates", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels()); let engine = f.engine; let store = f.store;
+  try {
+    await engine.run(f.s, f.project, "initial", () => {});
+    engine.sessionAgent.enabled = false;
+    await engine.harness.commit(async (tx) => {
+      (await tx.doc(SessionsDoc, f.s.conversationId as ConversationId)).commands["saved-delegation"] = {
+        kind: "create", targetId: "recovered-worker", title: "Recovered worker", delegated: true, isolation: "shared", prompt: "recover this task",
+        source: { sessionId: f.s.id, title: f.s.title, kind: "delegation" },
+      };
+    }, BACKGROUND_CONTEXT);
+    await engine.close();
+    for (let round = 0; round < 2; round++) {
+      store = new Store(store.root);
+      engine = await openEngine(store, undefined, (e) => f.errors.push(e), orchestrationModels()); await engine.restore(() => {}); await orchestrationIdle(engine);
+      const parent = store.state.sessions.find((s) => s.id === f.s.id)!;
+      const worker = store.state.sessions.find((s) => s.id === "recovered-worker")!;
+      assert.equal(store.state.sessions.length, 2);
+      assert.equal(worker.messages.filter((m) => m.role === "user").length, 1);
+      assert.equal(parent.messages.filter((m) => m.source?.kind === "notification").length, 1);
+      engine.sessionAgent.enabled = false;
+      if (round === 0) await engine.harness.commit(async (tx) => {
+        const doc = await tx.doc(SessionsDoc, parent.conversationId as ConversationId);
+        // Simulate a lost host acknowledgement after both durable submissions were admitted.
+        for (const command of Object.values(doc.commands)) delete command.result;
+      }, BACKGROUND_CONTEXT);
+      await engine.close();
+    }
+    assert.deepEqual(f.errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("a worker remains unfinished until nested delegated work and result follow-ups finish", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  try {
+    const nested = toolPrompt(taskCall("session_delegate", { title: "Nested tester", isolation: "shared",
+      task: toolPrompt(taskCall("bash", { command: "sleep 0.3; printf 'nested ready'" })) }));
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { title: "Backend", isolation: "shared", task: nested })), () => {});
+    await until(() => f.store.state.sessions.length === 3);
+    const worker = f.store.state.sessions.find((s) => s.delegation?.parentId === f.s.id)!;
+    const nestedWorker = f.store.state.sessions.find((s) => s.delegation?.parentId === worker.id)!;
+    await until(() => nestedWorker.messages.some((m) => m.tool?.name === "bash" && m.tool.status === "running"));
+    assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 0);
+    assert.ok(worker.waitingFor?.includes(nestedWorker.id));
+    await orchestrationIdle(f.engine);
+    assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 1);
+    assert.equal(worker.messages.filter((m) => m.source?.kind === "notification").length, 1);
+    assert.equal(worker.waitingFor, undefined); assert.equal(f.s.waitingFor, undefined);
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("deleting a worker retires unfinished creation commands rather than resurrecting it on restart", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels()); let engine = f.engine;
+  try {
+    await engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { isolation: "shared", task: "quick task" })), () => {});
+    await orchestrationIdle(engine); engine.sessionAgent.enabled = false;
+    const worker = f.store.state.sessions.find((s) => s.delegation?.parentId === f.s.id)!;
+    await engine.harness.commit(async (tx) => {
+      const doc = await tx.doc(SessionsDoc, f.s.conversationId as ConversationId);
+      const command = Object.values(doc.commands).find((c) => c.kind === "create")!; delete command.result;
+    }, BACKGROUND_CONTEXT);
+    await engine.stop(worker.id); f.store.state.sessions = f.store.state.sessions.filter((s) => s.id !== worker.id); f.store.save();
+    await engine.close();
+    const store = new Store(f.store.root);
+    engine = await openEngine(store, undefined, (e) => f.errors.push(e), orchestrationModels()); await engine.restore(() => {}); await orchestrationIdle(engine);
+    assert.equal(store.state.sessions.length, 1);
+    const doc = await engine.harness.snapshot(SessionsDoc, store.state.sessions[0]!.conversationId as ConversationId, BACKGROUND_CONTEXT);
+    assert.match(Object.values(doc!.commands).find((c) => c.kind === "create")!.error!, /deleted/);
+    assert.deepEqual(f.errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("automatic worker results do not answer a coordinator's pending human question", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { isolation: "shared", title: "Tester",
+      task: toolPrompt(taskCall("bash", { command: "sleep 0.2" })) })), () => {});
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("ask_question", { question: "May I deploy?" })), () => {});
+    await orchestrationIdle(f.engine);
+    assert.equal(f.s.status, "needs-input");
+    assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 0);
+    assert.equal(f.s.orchestrationPending, true);
+    await f.engine.run(f.s, f.project, "No deployment", () => {}); await orchestrationIdle(f.engine);
+    assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 1);
+    assert.equal(f.s.orchestrationPending, undefined);
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("independent sessions have no delegation lifecycle and explicit cancellation stops only its target", { timeout: 5000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_create", { isolation: "shared", title: "Independent", task: "Discuss API" })), () => {});
+    await orchestrationIdle(f.engine);
+    const peer = f.store.state.sessions.find((s) => s.id !== f.s.id)!;
+    assert.equal(peer.delegation, undefined); assert.equal(peer.title, "Independent");
+    assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 0);
+    const running = f.engine.run(peer, f.project, toolPrompt(taskCall("bash", { command: "sleep 30" })), () => {});
+    await until(() => peer.messages.some((m) => m.tool?.name === "bash" && m.tool.status === "running"));
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_send", { sessionId: peer.id, message: "queued peer follow-up" }),
+      taskCall("session_cancel", { sessionId: peer.id })), () => {});
+    await running; await orchestrationIdle(f.engine);
+    assert.equal(peer.stopped, true); assert.equal(peer.queuedInputs, undefined); assert.equal(f.s.stopped, undefined);
+    assert.ok(f.s.messages.some((m) => m.tool?.name === "session_cancel" && m.tool.status === "done"));
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
 
 test("streaming repaints without persistence notifications and committed history still restores", async () => {
   const f = temporary(), store = new Store(f.root), project = store.addProject(f.root);
