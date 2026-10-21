@@ -27,7 +27,7 @@ test("only tool names are bold, never commands, paths, skill names or compaction
     [{ name: "powershell", arguments: { command: "Get-ChildItem" } }, "PowerShell", "(Get-ChildItem)"],
     ...[["read", "Read"], ["edit", "Update"], ["write", "Write"], ["custom", "custom"]].map(([name, label]) =>
       [{ name, arguments: { path: "src/file.ts" } }, label!, "(src/file.ts)"] as [Partial<ToolActivity>, string, string]),
-    [{ name: "read", arguments: { path: "/skills/testing/SKILL.md" } }, "Skill", " testing"],
+    [{ name: "read", arguments: { path: "/skills/testing/SKILL.md" } }, "Read", "(/skills/testing/SKILL.md)"],
     [{ name: "load_skill", arguments: { name: "testing" } }, "Skill", " testing"],
     [{ name: "compact", arguments: { reason: "manual" } }, "Context compacted", " (manual)"],
     [{ name: "ask_question", arguments: {} }, "Ask question", ""],
@@ -54,7 +54,7 @@ test("read, write and update use actual SDK results and display truthful line co
     const result = await createEditTool().execute(args, api, BACKGROUND_CONTEXT);
     const value = tool({ name: "edit", arguments: args, output: "Successfully replaced 1 block(s)", details: { result: result.details } });
     assert.equal(render(value), [
-      "\u25cf Update(greet.ts)", "  \u23bf Added 1 line, removed 1 line", "     1 function greet() {",
+      "\u2022 Update(greet.ts)", "  \u23bf Added 1 line, removed 1 line", "     1 function greet() {",
       '    -2   return "Hello";', '    +2   return "Hello, World!";', "     3 }",
     ].join("\n"));
     const colored = renderToolResponse(value, 100, false, false).join("\n");
@@ -66,17 +66,17 @@ test("read, write and update use actual SDK results and display truthful line co
     }
     const read = await createReadTool().execute({ path: args.path }, api, BACKGROUND_CONTEXT);
     const output = read.output?.map((block) => block.type === "text" ? block.text : "").join("\n") ?? "";
-    assert.match(render(tool({ name: "read", arguments: { path: args.path }, output })), /Read 3 lines/);
+    assert.equal(render(tool({ name: "read", arguments: { path: args.path }, output })), "\u2022 Read(greet.ts)");
     assert.doesNotMatch(render(tool({ name: "read", output })), /return/);
     assert.match(render(tool({ name: "read", output }), true), /Hello, World!/);
     const writeArgs = { path: "new.ts", content: "first\nsecond\n" };
     await createWriteTool().execute(writeArgs, api, BACKGROUND_CONTEXT);
-    assert.equal(render(tool({ name: "write", arguments: writeArgs })), "\u25cf Write(new.ts)\n  \u23bf Wrote 2 lines\n      1 first\n      2 second");
+    assert.equal(render(tool({ name: "write", arguments: writeArgs })), "\u2022 Write(new.ts)\n  \u23bf Wrote 2 lines\n      1 first\n      2 second");
   } finally { temp.cleanup(); }
 });
 
 test("each tool lifecycle state is explicit and failed mutations never get a success preview", () => {
-  for (const [status, label] of [["pending", "Pending..."], ["running", "Running..."], ["error", "Error"], ["interrupted", "Interrupted; completion not confirmed."]] as const) {
+  for (const [status, label] of [["pending", "waiting..."], ["running", "running..."], ["error", "Failed"], ["interrupted", "Interrupted; completion not confirmed."]] as const) {
     for (const name of ["write", "edit", "read", "bash", "custom_tool"]) {
       const value = tool({ name, status, output: status === "error" ? "Permission denied" : "", arguments: { path: "file", content: "UNCOMMITTED_CONTENT", edits: [] },
         details: { result: { diff: "-1 old\n+1 UNCOMMITTED_CONTENT" } } });
@@ -87,7 +87,7 @@ test("each tool lifecycle state is explicit and failed mutations never get a suc
   }
 });
 
-test("shell script bodies stay hidden, with output previewed only after success", () => {
+test("shell script bodies stay hidden while executing output stays previewable", () => {
   const script = "cat > docs/inventory.md <<'EOF'\n" + "SCRIPT_BODY_MUST_STAY_HIDDEN ".repeat(2000) + "\nEOF";
   for (const name of ["bash", "powershell"]) {
     const value = tool({ name, arguments: { command: script }, output: "RESULT_READY\nmore output" });
@@ -95,12 +95,12 @@ test("shell script bodies stay hidden, with output previewed only after success"
       value.status = status;
       for (const width of [24, 100, 300]) {
         const lines = renderToolResponse(value, width, false, false);
-        assert.ok(lines.length <= 3, "A huge script must not grow the compact card");
+        assert.ok(lines.length <= 4, "A huge script must not grow the compact card");
         assert.ok(lines.every((line) => visibleWidth(line) <= width));
         const text = lines.map(stripTerminalSequences).join("\n");
-        assert.match(text, /(?:Bash|PowerShell)\(cat >/);
+        assert.match(text, width < 40 ? /(?:Bash|PowerShell)/ : /(?:Bash|PowerShell)\(cat >/);
         assert.doesNotMatch(text, /SCRIPT_BODY|EOF\)/);
-        assert.equal(text.includes("RESULT_READY"), status === "done");
+        assert.equal(text.includes("RESULT_READY"), status !== "pending");
       }
       assert.match(render(value, true), /Arguments[^]*SCRIPT_BODY_MUST_STAY_HIDDEN[^]*Output[^]*RESULT_READY/);
     }
@@ -108,7 +108,7 @@ test("shell script bodies stay hidden, with output previewed only after success"
     assert.match(render(value).split("\n")[0]!, /\(1\.2s\)$/);
     assert.doesNotMatch(render(value), /Ran 1 shell command/);
     value.output = "";
-    assert.equal(renderToolResponse(value, 100, false, false).length, 1);
+    assert.equal(renderToolResponse(value, 100, false, false).length, 2);
     assert.match(render(value, true), /No text output/);
   }
 });
@@ -118,7 +118,7 @@ test("successful shell cards show three literal output rows and expand to the fu
     const value = tool({ name, arguments: { command: "run-script\nHIDDEN_SCRIPT_BODY" },
       output: "one\ntwo\nthree\nfour\nfive", durationMs: 6900 });
     assert.equal(render(value), [
-      `\u25cf ${label}(run-script) (6.9s)`, "  \u23bf one", "    two", "    three", "  \u23bf ... more (/expand)",
+      `\u2022 ${label}(run-script) (6.9s)`, "  \u23bf ... +2 earlier lines (/expand)", "    three", "    four", "    five",
     ].join("\n"));
     const expanded = render(value, true);
     assert.match(expanded, /Arguments[^]*HIDDEN_SCRIPT_BODY[^]*Output[^]*one[^]*five/);
@@ -126,19 +126,19 @@ test("successful shell cards show three literal output rows and expand to the fu
     assert.doesNotMatch(expanded, /more \(\/expand\)|Ran 1 shell command/);
     value.output = "one\ntwo\nthree\n";
     assert.equal(renderToolResponse(value, 100, false, false).length, 4);
-    assert.doesNotMatch(render(value), /more \(\/expand\)/);
+    assert.doesNotMatch(render(value), /\+\d+ earlier lines? \(\/expand\)/);
     value.output = "BEGIN " + "word ".repeat(200) + "END";
     for (const width of [1, 2, 4, 12, 24, 80]) {
       const lines = renderToolResponse(value, width, false, false);
       assert.ok(lines.length <= 5, "Preview limits apply to wrapped terminal rows");
       assert.ok(lines.every((line) => visibleWidth(line) <= width));
     }
-    assert.match(render(value, false, 24), /more \(\/expand\)/);
-    assert.doesNotMatch(render(value, false, 24), /END/);
+    assert.match(render(value, false, 24), /\+\d+ earlier/);
+    assert.match(render(value, false, 24), /END/);
     assert.match(render(value, true, 24), /END/);
     for (const output of ["", "\n", " \t\r\n", "\x1b[32m\x1b[0m"]) {
       value.output = output;
-      assert.equal(renderToolResponse(value, 100, false, false).length, 1, "Empty results need no result row");
+      assert.equal(renderToolResponse(value, 100, false, false).length, 2, "Empty results explicitly say No output");
     }
   }
 });
@@ -157,11 +157,11 @@ test("normal shell output and summaries are dim while warnings and errors remain
     }
     for (const status of ["pending", "running"] as const) {
       const lines = renderToolResponse({ ...value, status }, 100, false, false);
-      assert.ok(lines.some((line) => line.includes(`\x1b[2m${status === "pending" ? "Pending" : "Running"}... (/expand)\x1b[22m`)));
+      assert.ok(lines.some((line) => line.includes(`\x1b[2m · ${status === "pending" ? "waiting" : "running"}...\x1b[22m`)));
     }
     const failed = renderToolResponse({ ...value, status: "error", output: "ERROR_OUTPUT", details: undefined }, 100, false, false);
-    assert.ok(failed.some((line) => line.includes("\x1b[33mERROR_OUTPUT\x1b[39m")));
-    assert.ok(failed.some((line) => line.includes("\x1b[33mError (/expand)\x1b[39m")));
+    assert.ok(failed.some((line) => line.includes("\x1b[31mERROR_OUTPUT\x1b[39m")));
+    assert.ok(failed.some((line) => line.includes("\x1b[31m · Failed\x1b[39m")));
   }
 });
 
@@ -169,8 +169,8 @@ test("successful shell previews keep harness diagnostics visible outside their o
   const value = tool({ output: "one\ntwo\nthree\nfour\n<harness>\n[warn] Output truncated\n</harness>",
     details: { diagnostics: [{ severity: "warn", message: "Output truncated" }, { severity: "info", message: "Full output: /tmp/log.txt" }] } });
   const text = render(value);
-  assert.match(text, /one[^]*two[^]*three[^]*more \(\/expand\)[^]*Output truncated[^]*Full output: \/tmp\/log\.txt/);
-  assert.doesNotMatch(text, /four|<harness>|Ran 1 shell command/);
+  assert.match(text, /earlier line[^]*two[^]*three[^]*four[^]*Output truncated[^]*Full output: \/tmp\/log\.txt/);
+  assert.doesNotMatch(text, /\bone\b|<harness>|Ran 1 shell command/);
   assert.equal(text.match(/Output truncated/g)?.length, 1);
   assert.match(render(value, true), /four/);
 });
@@ -236,7 +236,7 @@ test("Pi diff rendering preserves exact SDK rows even when word matching normali
     }
   }
   assert.equal(render(tool({ name: "edit", arguments: {}, details: { result: { diff: "" } } })),
-    "\u25cf Update\n  \u23bf Updated file");
+    "\u2022 Update\n  \u23bf Updated file");
 });
 
 test("Pi word highlights survive narrow wrapping without leaking styles, with a no-color fallback", () => {
@@ -282,7 +282,7 @@ test("Pi word highlights survive narrow wrapping without leaking styles, with a 
   }
 });
 
-test("complete writes and every diff hunk stay visible regardless of expansion", () => {
+test("writes use bounded previews while edit diffs default to full and can collapse", () => {
   const content = Array.from({ length: 30 }, (_, i) => `const line${i + 1} = ${i + 1};`).join("\n");
   const diff = [
     ...Array.from({ length: 10 }, (_, i) => ` ${i + 1} context${i + 1}`),
@@ -292,10 +292,11 @@ test("complete writes and every diff hunk stay visible regardless of expansion",
   for (const expanded of [false, true]) {
     const written = render(tool({ name: "write", arguments: { path: "long.ts", content } }), expanded);
     assert.match(written, /1 const line1 = 1;/);
-    assert.match(written, /30 const line30 = 30;/);
+    if (expanded) assert.match(written, /30 const line30 = 30;/);
+    else assert.doesNotMatch(written, /30 const line30 = 30;/);
     const edited = render(tool({ name: "edit", details: { result: { diff } } }), expanded);
     for (const source of diff.split("\n")) assert.ok(edited.includes(source), source);
-    assert.doesNotMatch(written + edited, /more \(\/expand\)/);
+    assert.doesNotMatch(edited, /more \(\/expand\)/);
     assert.equal(written.includes("Arguments"), expanded);
   }
 });
@@ -307,10 +308,10 @@ test("long code lines wrap in full and diff continuation rows retain addition/re
     for (const name of ["write", "edit"]) {
       const value = tool({ name, arguments: { content }, details: { result: { diff } } });
       const lines = renderToolResponse(value, 24, expanded, false);
-      assert.ok(lines.length > 60);
+      assert.ok(lines.length > 60 || name === "write" && !expanded);
       assert.ok(lines.every((line) => visibleWidth(line) <= 24));
-      assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /more \(\/expand\)/);
-      assert.match(lines.map(stripTerminalSequences).join("\n"), /END/);
+      assert.doesNotMatch(lines.map(stripTerminalSequences).join("\n"), /\+\d+ earlier lines? \(\/expand\)/);
+      if (name !== "write" || expanded) assert.match(lines.map(stripTerminalSequences).join("\n"), /END/);
       if (name === "edit") {
         const removal = lines.findIndex((line) => stripTerminalSequences(line).includes("-1 BEGIN"));
         const addition = lines.findIndex((line) => stripTerminalSequences(line).includes("+1 BEGIN"));
@@ -355,7 +356,7 @@ test("diagnostics are shown outside collapsed content, once, including truncatio
   assert.doesNotMatch(render(value), /<harness>/);
   value.name = "bash"; value.status = "error";
   value.details = { diagnostics: [{ severity: "error", message: "Command exited with code 7" }, { severity: "info", message: "Full output: /tmp/log.txt" }] };
-  assert.match(render(value), /Error[^]*Command exited with code 7[^]*Full output: \/tmp\/log.txt/);
+  assert.match(render(value), /Failed[^]*Command exited with code 7[^]*Full output: \/tmp\/log.txt/);
 });
 
 test("skills, compaction and question tools keep their payloads compact", () => {
@@ -369,7 +370,7 @@ test("skills, compaction and question tools keep their payloads compact", () => 
     assert.doesNotMatch(render(value), /HIDDEN_PAYLOAD/);
     assert.match(render(value, true), /HIDDEN_PAYLOAD/);
   }
-  assert.equal(activityLabel(tool({ name: "read", arguments: { path: "C:\\skills\\testing\\SKILL.md" } })), "Skill testing");
+  assert.equal(activityLabel(tool({ name: "read", arguments: { path: "C:\\skills\\testing\\SKILL.md" } })), "Read(C:/skills/testing/SKILL.md)");
 });
 
 test("image and unknown tool results have safe, expandable fallbacks", () => {
@@ -379,7 +380,7 @@ test("image and unknown tool results have safe, expandable fallbacks", () => {
     assert.match(render(tool({ name })), /Done \(no text output\)/);
   }
   assert.match(render(tool({ name: "write", arguments: { content: "" } })), /Wrote 0 lines/);
-  assert.match(render(tool({ name: "read" })), /Read 0 lines/);
+  assert.equal(render(tool({ name: "read", arguments: {} })), "\u2022 Read");
 });
 
 test("all tool variants fit tiny widths, sanitize controls, and retain literal source", () => {

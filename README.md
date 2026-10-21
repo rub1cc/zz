@@ -167,11 +167,10 @@ files. Coding-agent extensions and MCP remain disabled.
   agent's `read` tool now uses the image processor for resizing/conversion.
   Text-only models report an error instead of silently discarding attachments.
 - Provider thinking appears in **Thinking** blocks, including during streaming;
-  empty non-redacted blocks are omitted. Thinking between grouped routine tool
-  calls stays inside the group and appears in its original position on expansion.
-  Standalone blocks still support click/keyboard expansion; grouped reasoning uses
-  the group's controls. `/expand` and `/collapse` also apply. **Show reasoning** in
-  `/settings` shows/hides all thinking blocks without affecting tool grouping and
+  empty non-redacted blocks are omitted. Visible thinking separates activity
+  groups; hiding it lets adjacent routine calls group across reasoning.
+  Standalone blocks support click/keyboard expansion. `/expand` and `/collapse`
+  also apply. **Show reasoning** in `/settings` shows/hides thinking and
   saves that global display preference. It does **not** change
   the model's thinking level; `/thinking` opens the level picker.
   Redacted thinking gets a placeholder; opaque signatures are never displayed or
@@ -613,123 +612,110 @@ only the three tools. A compatibility handler retains old `task_create` executio
 and single-task `task_update` arguments for interrupted calls, with old replay
 receipts preserved. No separate create or delete tool is advertised.
 
-Task tool cards remain in activity history, with raw data hidden until expansion;
-errors remain visible. Checklist entries record agent-reported progress, not
+Successful task-tool rows are hidden from the interactive transcript, including
+global expansion, without splitting activity groups. Failures, warning diagnostics
+and image artifacts remain visible; saved records remain unchanged. `/tasks` and
+the live checklist remain the task controls. Checklist entries record agent-reported progress, not
 independent proof of test success, and may contain sensitive project information.
 
 ## Compact Activity
 
-The conversation uses `❯` for user prompts, `●` for assistant replies and tool
-headings, and `⎿` for results. Only tool names are bold; commands, file paths and
-other heading details use normal weight. Sent user prompts use literal text on a full-width
-light-grey background with dark text, including wrapped and blank lines. Assistant
-replies keep the terminal background and Markdown formatting, including code
-fences, lists and tables. Tool calls
-and results stay paired in one compact block, updating in place while running.
+The conversation uses `❯` for literal user prompts, `●` for assistant Markdown,
+small `•` dots for tool headings, and `⎿` output gutters. Only tool names are bold.
+User prompts keep their full-width light-grey background; assistant/tool output
+keeps the terminal background.
+
+During a run, routine reads and shell calls share a replace-in-place preview:
 
 ```text
-❯ Fix greet() for empty names and add a test.
+❯ Fix authentication and run its tests.
 
-● I'll check the function and add a test.
+● I'll inspect authentication first.
 
-● Read(src/greet.ts)
-  ⎿ Read 3 lines
+  Reading auth.ts
+  ⎿ /project/src/auth.ts
 
-● Update(src/greet.ts)
-  ⎿ Added 1 line, removed 1 line
-     1 export function greet(name: string) {
-    -2   return name;
-    +2   return name.trim() || "World";
-     3 }
-
-● Write(src/greet.test.ts)
-  ⎿ Wrote 3 lines
-      1 test("empty names", () => {
-      2   expect(greet("")).toBe("World");
-      3 });
-
-● Bash(npm test -- --run)
-  ⎿ 1 test passed
-
-● Fixed empty names and added a regression test. Tests: 1 passed.
+✽ Working (3s)
 ```
 
-Edit diffs come from the SDK result, not guessed changes, and use Pi's public
-`renderDiff()` with its default system theme: green additions, red removals, and
-inverse highlighting of changed words in single-line replacement pairs when color
-is enabled. Colors and word highlights survive wrapped continuation rows. If Pi's
-word matcher changes whitespace, that row falls back to Pi's line-only rendering
-to preserve the exact SDK text. Changed diff rows get a faint green/red background,
-blended into the terminal's background and extended through wrapped rows and
-trailing space. Context rows and the transcript indent stay unpainted. The terminal
-background is queried at startup; unsupported terminals and `NO_COLOR` keep the
-existing unfilled rendering. Dark 256-color terminals use a quiet neutral fill
-instead of a stronger saturated tint. This does not add syntax coloring.
-Successful writes show all numbered content; every edit diff hunk stays visible
-without expansion. Collapsing
-a tool hides only its extra details, never its code changes. Older edits without
-SDK diff metadata show their applied replacement fragments when retained, with
-no invented file context or line numbers. Standalone Bash/PowerShell headings show
-the command in parentheses, truncated to one terminal row. Multiline commands show
-only their first line, with the SDK-supplied duration beside the heading when
-available. Successful standalone calls show up to three wrapped rows of actual
-stdout/stderr in dim text, matching normal status summaries, with a `/expand` hint
-when more remains. Expanded non-error shell output is dim too; errors and warnings
-keep their highlighting. Empty successful results
-have no result row. Running calls keep their explicit status and hide streaming
-output until expansion; errors and diagnostics remain visible. Expansion reveals
-the full command and retained output. Grouped calls keep their count-only heading.
-Errors, interruptions, pending/running states, truncation and continuation
-messages remain explicit. Failed/interrupted mutations never get a success preview.
-`read` calls for `SKILL.md` are labeled `Skill <directory name>`; that reports a
-skill-file read, not a guarantee that every instruction was followed.
-The [response inventory](docs/tui-rendering.md) documents every currently supported
-message, tool, question, shell and session-state scenario and its test coverage.
-
-Routine reads and shell calls fold into one expandable line, including calls
-separated only by provider thinking:
+When the shell starts, that same slot becomes:
 
 ```text
-● Read 1 file, ran 1 shell command (/expand)
-● Read 2 files, running 1 shell command (/expand)
+  Running npm test
+  ⎿ PASS auth.test.ts
+    PASS session.test.ts
+    All tests passed
 ```
 
-Intervening thinking stays hidden inside compact groups. Expanding a group shows
-its tools and non-empty reasoning in their original order, honoring **Show reasoning**.
-A group remains one keyboard/mouse target. Reasoning before or after its tool span
-stays standalone. Groups do not cross assistant/user messages, edits, writes, skills,
-questions, compaction, images, warnings, errors or interruptions. File counts
-use distinct path strings; shell counts are tool invocations, not the individual
-commands inside a script. Grouping is not a read-only/safety classification.
-Errors leave the group and remain visible. Tool headings stay on one row;
-compact diagnostics prioritize errors/warnings and show at most two short lines.
-User-entered `!command` output remains visible as local shell history.
-See [research and differences from Claude Code](docs/tui-rendering.md#claude-code-research)
-for the official sources behind this display policy.
+The latest useful preview stays through completion and while the next call's
+arguments stream. Before execution, complete queued calls say Waiting to read/run;
+incomplete routine arguments have no placeholder. Parallel calls select the most
+recently observed start, not whichever older operation finishes last. When prose
+resumes, the preview becomes a muted, dot-free receipt:
 
-Inside a session:
-- Click a tool heading, preview, or group to expand/collapse its arguments, output, and details.
-- Tab or Ctrl+N/P selects a tool or group; Space or Enter toggles it with an
-  empty composer. Right expands; Space/Enter collapses again. Left or Ctrl+H with an empty
-  composer returns to the dashboard without cancelling work. Text in the composer still
-  behaves as ordinary text and Enter sends it.
-- `/expand` and `/collapse` show/hide all tool details. Page Up/Down scrolls long
-  output. Expanding a group reveals all its member calls and intervening reasoning
-  when enabled. Expansion survives
-  streaming updates and resets when switching sessions.
+```text
+  Read 2 files, ran 1 shell command
 
-Activity is presentation only: compact previews do not change retained output or model context.
+● Authentication is fixed. All tests pass.
+```
 
-The transcript ends with a shimmering working/thinking, retry, or stopping indicator,
-e.g. `✻ Working (12s)`. The suffix shows elapsed time, not token counts, using
-compact days/hours/minutes/seconds such as `1m2s`, `2h3m4s`, or `1d20m15s`.
-Zero-valued units are omitted; a just-started run shows `0s`.
-Timing persists across restarts and resets with each idle-session reply; queued
-follow-ups share the current work period.
-On completion, it shows e.g. `✻ Worked for 3s · done 3:22 PM`, using your local time.
-Failures and input requests are labelled accordingly. Set `ZZ_REDUCED_MOTION=1`
-to disable shimmer animation (`NO_COLOR` also disables it); elapsed seconds still
-refresh once per second while working.
+Single calls use the same lifecycle. Historical replay shows counts, never
+invented live activity. A live run ending without prose keeps its last preview.
+File counts deduplicate lexical paths relative to the workspace, including `@`,
+`~`, `file://`, `.` and `..` aliases, without filesystem reads or resolving symlinks.
+Repeated reads show their invocation count separately. Shell calls count tool
+invocations, never inferred reads, safety, or commands within a script.
+
+- Click a group to reveal individual tool headings, then expand just the result
+  you want. Closing a group preserves individual expansion state.
+- Tab or Ctrl+N/P selects groups, visible members and thinking. Space/Enter
+  toggles the selection when the composer is empty; Right expands it.
+- `/expand` opens groups and all member details; `/collapse` closes them. These
+  also override local diff expansion. State survives redraw/resize, not session switches.
+- Visible thinking, prose, mutations, explicit skill loads, questions, compaction,
+  interruptions and unknown actions separate groups. Hidden thinking, empty text
+  and successful task-tool rows do not. A `SKILL.md` read is a normal read.
+- Failed inspections remain grouped with a leading failure count and bounded
+  diagnostic. Warnings, truncation and continuation diagnostics remain standalone.
+  Image reads can group; expanded results display the native image/fallback.
+  Non-read image artifacts remain standalone.
+- While scrolled up, a one-line contextual user prompt appears above the transcript.
+  Click it to jump to the original prompt. It hides when that original first row
+  is visible, at the bottom, and on tiny terminals.
+
+Standalone tool labels distinguish preparing, waiting, running and Failed.
+Shell headings show only the first command line and SDK-supplied duration when
+available. Output previews show the last three wrapped shell rows (including
+streaming output) and the first three generic rows. Omission hints count hidden
+visual rows. Empty shell output explicitly says No output. Full commands, retained
+output and metadata stay available on expansion. Local `!command` history is unchanged.
+
+Read headings show compact paths and requested ranges; expanded reads use language
+highlighting when recognized. Writes show a three-row numbered, highlighted preview.
+Edit diffs default to all retained rows; clicking the header/body toggles a 24-row
+preview. Diff state survives redraw and resize, and global controls override it.
+Diffs use the SDK's actual result and Pi's public `renderDiff()`; changed rows have
+subtle terminal-background-aware fills and retain word highlights through wrapping.
+Legacy edits show retained replacement fragments without invented line numbers.
+Failed/interrupted mutations never show proposed content as applied.
+
+Activity is presentation only: execution, scheduling, undo, model context and
+saved tool results are unchanged. All content is bounded by the SDK's retained
+output; a spill path does not load the file automatically. Web/browser/Agent/codemode
+integrations are not added by this renderer change.
+
+The transcript ends with a shimmering working/thinking, retry or stopping row,
+e.g. `✽ Working (1m 2s)`. The clock includes days/hours/minutes/seconds with
+intermediate zero units. Stored work statistics retain their existing lifecycle;
+queued follow-ups share the current work period. Successful runs lasting at least
+ten seconds leave a muted `✽ Worked for 12s` receipt in the observing view. Short,
+failed, cancelled or input-waiting runs leave no receipt. Receipts disappear on
+later transcript activity or session changes and are not reconstructed on replay.
+Failures and waiting states retain their explicit error/answer/continue notices.
+Shimmer follows reported terminal colors. `ZZ_REDUCED_MOTION=1` or `NO_COLOR`
+disables animation; elapsed time still refreshes once per second.
+
+See the [response inventory](docs/tui-rendering.md) for behavior and test coverage.
 
 ## Composer Discovery
 
@@ -1058,6 +1044,12 @@ reopening resumes it, deduplicating previously submitted input. Work does not ru
 while zz is closed. An interrupted model request may be retried and billed again.
 Forced shutdown relies on the last committed durable checkpoint; pending inputs
 were saved before execution. It does not undo effects of tools already executed.
+
+Live-only agent updates repaint without requesting JSON snapshots. Background saves
+serialize and write in one worker, coalesce pending updates, and flush on shutdown;
+accepted inputs and synchronous UI changes retain their recovery checkpoints.
+See [multi-agent performance](docs/performance.md) for the reproducible benchmark,
+before/after results, and memory trade-offs.
 
 **Agents can read/write files and execute shell commands with your permissions.**
 A workspace is not a sandbox. Concurrent sessions sharing a checkout can edit the

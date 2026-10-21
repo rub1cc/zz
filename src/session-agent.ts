@@ -44,7 +44,7 @@ interface SessionHost {
   configuration(session: Session): AgentSettings;
   canNotify(session: Session): boolean;
   dispatch(parent: Session, id: string, command: SessionCommand): Promise<unknown>;
-  changed(): void;
+  changed(): Promise<void>;
   report(error: unknown): void;
 }
 
@@ -126,7 +126,7 @@ export class SessionAgent {
             if (terminate) doc.wait = { id: key, sessionIds: args.sessionIds };
           }, context);
           if (terminate) parent.waitingFor = args.sessionIds;
-          this.host.changed(); this.schedule();
+          await this.host.changed(); this.schedule();
           return output(result, terminate);
         } }),
       defineTool({ name: "session_cancel", description: "Stop another session and its delegated descendants in this project. Keeps conversations and files. Does not stop independent collaborators. Cannot stop yourself or an ancestor.",
@@ -191,7 +191,7 @@ export class SessionAgent {
     const result = await this.execute(parent, id);
     if (command.kind === "create" && command.delegated) {
       parent.waitingFor = [...new Set([...(parent.waitingFor ?? []), command.targetId])];
-      this.host.changed();
+      await this.host.changed();
     }
     this.schedule();
     return { output: [{ type: "text" as const, text: result }] };
@@ -257,12 +257,12 @@ export class SessionAgent {
       }
       state = (await this.harness.snapshot(SessionsDoc, cid, ctx))!;
       const pendingCommands = Object.values(state.commands).some((c) => c.result === undefined && c.error === undefined);
-      if (!!parent.orchestrationPending !== pendingCommands) { parent.orchestrationPending = pendingCommands || undefined; this.host.changed(); }
+      if (!!parent.orchestrationPending !== pendingCommands) { parent.orchestrationPending = pendingCommands || undefined; this.dirty = true; await this.host.changed(); }
       const children = Object.values(state.commands).filter((c) => c.kind === "create" && c.delegated && c.result !== undefined && !c.error);
       const unfinished = children.filter((c) => !state!.delivered[`result:${c.targetId}`]);
       const waitingFor = state.wait?.sessionIds ?? unfinished.map((c) => c.targetId);
       if (JSON.stringify(parent.waitingFor ?? []) !== JSON.stringify(waitingFor)) {
-        parent.waitingFor = waitingFor.length ? waitingFor : undefined; this.host.changed();
+        parent.waitingFor = waitingFor.length ? waitingFor : undefined; this.dirty = true; await this.host.changed();
       }
       const targets = state.wait?.sessionIds.map((id) => this.store.state.sessions.find((s) => s.id === id));
       const question = (targets ?? unfinished.map((c) => this.store.state.sessions.find((s) => s.id === c.targetId)))
@@ -302,7 +302,7 @@ export class SessionAgent {
     }, ctx);
     if (parent.stopped) return;
     await this.execute(parent, id);
-    this.host.changed(); this.dirty = true;
+    await this.host.changed(); this.dirty = true;
   }
 
   async cancel(session: Session): Promise<void> {
@@ -333,5 +333,7 @@ export class SessionAgent {
     }
     this.schedule();
   }
-  async close(): Promise<void> { this.enabled = false; await this.reconciling; await Promise.allSettled(this.running.values()); }
+  /** Drain scheduled host effects; provider turns are still owned by the harness. */
+  async flush(): Promise<void> { while (this.reconciling) await this.reconciling; }
+  async close(): Promise<void> { this.enabled = false; await this.flush(); await Promise.allSettled(this.running.values()); }
 }

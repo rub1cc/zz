@@ -7,6 +7,7 @@ import { Controller } from "./controller.js";
 import { activityTimestamp, displayStatus, sessionPreview, transcriptMessages, lastReplyMessage, age, lastReply, rowId, type ImageAttachment, type ReplyBehavior, type Session, type Row } from "./model.js";
 import { displayPath } from "./store.js";
 import { accent, bold, dim, fit, green, markdown, oneLine, pad, red, warning, workingIcon } from "./format.js";
+import { StickyPrompt } from "./sticky-prompt.js";
 import { Transcript } from "./transcript.js";
 import { AdaptiveWheelScroll } from "./scroll.js";
 import { SettingsDialog } from "./settings-dialog.js";
@@ -194,10 +195,19 @@ class SessionListScroll extends ScrollView {
   }
 }
 
+class ContextScroll extends ScrollView {
+  onLayout?: () => void;
+  override updateLayout(contentHeight: number, viewportHeight: number, requestRender: () => void): void {
+    super.updateLayout(contentHeight, viewportHeight, requestRender);
+    this.onLayout?.();
+  }
+}
+
 export class Dashboard extends VStack implements Focusable {
   readonly composer: Composer;
   readonly body: SessionList;
   readonly chatScroll: ScrollView;
+  readonly stickyPrompt: StickyPrompt;
   readonly listScroll: ScrollView;
   private readonly bodyHost = new VStack();
   private readonly wheelScroll = new AdaptiveWheelScroll();
@@ -236,7 +246,11 @@ export class Dashboard extends VStack implements Focusable {
     this.composer = new Composer(tui, "describe a task for a new session", (error) => controller.fail(error));
     this.body = new SessionList(controller, this.branches);
     this.listScroll = new SessionListScroll(this.body);
-    this.chatScroll = new ScrollView(this.body, { primary: true, follow: "end", scrollbar: "auto" });
+    const chatScroll = new ContextScroll(this.body, { primary: true, follow: "end", scrollbar: "auto" });
+    this.chatScroll = chatScroll;
+    this.stickyPrompt = new StickyPrompt(this.body.transcript, chatScroll,
+      () => controller.mode === "session" && this.body.transcript.belongsTo(controller.openedSessionId) && tui.terminal.rows >= 10, () => tui.requestRender());
+    chatScroll.onLayout = () => this.stickyPrompt.refresh();
     this.bodyHost.addChild(this.listScroll, { basis: 0, grow: 1, minSize: 1 });
     this.addChild(new Dynamic((width) => this.header(width)), { basis: "auto", shrink: 0 });
     this.addChild(this.bodyHost, { basis: 0, grow: 1, minSize: 1 });
@@ -390,6 +404,7 @@ export class Dashboard extends VStack implements Focusable {
       project ? { list: () => c.engine.listSkills(project) } : undefined);
     if (c.mode !== this.previousMode) {
       this.bodyHost.clear();
+      if (c.mode === "session") this.bodyHost.addChild(this.stickyPrompt, { basis: "auto", shrink: 0 });
       this.bodyHost.addChild(this.scroll, { basis: 0, grow: 1, minSize: 1 });
       if (c.mode === "session") this.scroll.scrollToEnd();
       else if (this.previousMode === "session") this.composer.handleInput("\x05");

@@ -1,4 +1,4 @@
-import { Markdown, stripTerminalSequences, truncateToWidth, visibleWidth, type MarkdownTheme } from "@earendil-works/pi-tui";
+import { colorToRgb, mixColors, rgbColor, type TerminalColors, Markdown, stripTerminalSequences, truncateToWidth, visibleWidth, type MarkdownTheme } from "@earendil-works/pi-tui";
 
 export const dim = (s: string) => `\x1b[2m${s}\x1b[22m`;
 export const bold = (s: string) => `\x1b[1m${s}\x1b[22m`;
@@ -32,13 +32,28 @@ export function workingIcon(now = Date.now()): string {
   return workingFrames[motionEnabled() ? Math.floor(now / 160) % workingFrames.length : 0]!;
 }
 
+let statusColors: TerminalColors = {};
+export function setStatusColors(colors: TerminalColors): boolean {
+  if (JSON.stringify(statusColors) === JSON.stringify(colors)) return false;
+  statusColors = structuredClone(colors);
+  return true;
+}
+
 // Terminal equivalent of a linear, two-second highlight sweep over muted text.
 export function shimmer(text: string, now = Date.now()): string {
   if (!motionEnabled()) return dim(text);
   const chars = [...text];
   const center = (now % 2000) / 2000 * (chars.length + 6) - 3;
   return chars.map((char, index) => {
-    const brightness = Math.round(124 + 116 * Math.max(0, 1 - Math.abs(index - center) / 3));
+    const strength = Math.max(0, 1 - Math.abs(index - center) / 3);
+    if (statusColors.background) {
+      const bg = statusColors.background;
+      const fg = statusColors.foreground ?? (bg.r + bg.g + bg.b > 384 ? { r: 20, g: 20, b: 20 } : { r: 240, g: 240, b: 240 });
+      const muted = mixColors(rgbColor(bg.r, bg.g, bg.b), rgbColor(fg.r, fg.g, fg.b), 0.6, "srgb");
+      const { r, g, b } = colorToRgb(mixColors(muted, rgbColor(fg.r, fg.g, fg.b), strength, "srgb"));
+      return `\x1b[38;2;${r};${g};${b}m${char}`;
+    }
+    const brightness = Math.round(124 + 116 * strength);
     return `\x1b[38;2;${brightness};${brightness};${brightness}m${char}`;
   }).join("") + "\x1b[39m";
 }

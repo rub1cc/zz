@@ -3,12 +3,22 @@ import { Markdown, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouse
 import { renderShellResponse } from "./shell-response.js";
 import { ImageDisplay } from "./image-display.js";
 import type { Controller } from "./controller.js";
-import { accent, dim, fit, formatElapsed, markdownTheme, oneLine, pad, plain, shimmer, warning, workingIcon } from "./format.js";
+import { accent, dim, fit, markdownTheme, oneLine, pad, plain, shimmer, warning, workingIcon } from "./format.js";
 import { transcriptMessages, lastReplyMessage, compactionLabel, displayStatus, sessionPreview, type Message, type Session, type TranscriptMessage } from "./model.js";
 import { answeredQuestions, formQuestion, isQuestionTool, type AnsweredQuestion, type Questionnaire } from "./questions.js";
-import { indentLines, renderToolResponse } from "./tool-response.js";
-import { renderToolGroup, toolGroups } from "./tool-groups.js";
+import { hiddenTask, indentLines, renderToolResponse } from "./tool-response.js";
+import { ActivityPreview, activityPreviewLines, invisibleActivity, renderToolGroup, toolGroups } from "./tool-groups.js";
 export { activityLabel } from "./tool-response.js";
+
+export function formatWorkingDuration(seconds: number): string {
+  let remaining = Math.max(0, Math.floor(seconds));
+  const parts: string[] = [];
+  for (const [unit, size] of [["d", 86400], ["h", 3600], ["m", 60], ["s", 1]] as const) {
+    const value = Math.floor(remaining / size); remaining %= size;
+    if (value || parts.length || unit === "s") parts.push(`${value}${unit}`);
+  }
+  return parts.join(" ");
+}
 
 export function workLabel(session: Session): string | undefined {
   if (displayStatus(session) === "waiting") return dim(sessionPreview(session));
@@ -16,16 +26,14 @@ export function workLabel(session: Session): string | undefined {
     const state = session.stopped ? "Stopping..." : session.preview.startsWith("Retrying:") ? oneLine(session.preview)
       : session.preview === "Thinking..." || session.messages.at(-1)?.role === "thinking" ? "Thinking..." : "Working";
     const now = Date.now();
-    const elapsed = session.work ? formatElapsed((now - session.work.startedAt) / 1000) : "?s";
+    const elapsed = session.work ? formatWorkingDuration((now - session.work.startedAt) / 1000) : "?s";
     return `${shimmer(`${workingIcon(now)} ${state}`, now)}${dim(` (${elapsed})`)}`;
   }
   const work = session.work;
-  if (!work || work.finishedAt === undefined || session.status === "paused") return;
-  const seconds = Math.max(0, Math.round((work.finishedAt - work.startedAt) / 1000));
-  const duration = seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-  const time = new Date(work.finishedAt).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
-  const result = session.status === "failed" ? "failed" : session.status === "needs-input" ? "awaiting input" : "done";
-  return dim(`✻ Worked for ${duration} · ${result} ${time}`);
+  if (!work || work.finishedAt === undefined || session.status !== "completed") return;
+  const seconds = Math.max(0, Math.floor((work.finishedAt - work.startedAt) / 1000));
+  if (seconds < 10) return;
+  return dim(`✽ Worked for ${formatWorkingDuration(seconds)}`);
 }
 
 export function renderAnsweredQuestions(answers: AnsweredQuestion[], width: number): string[] {
@@ -71,6 +79,7 @@ interface HistoryCache {
   messages: TranscriptMessage[];
   showThinking: boolean;
   selected?: string;
+  previews: Map<number, string>;
   lines: string[];
   checkpoints: HistoryCheckpoint[];
 }
@@ -80,6 +89,15 @@ export class Transcript implements Component {
   private cache: { text: string; role: Message["role"]; renderer: Markdown }[] = [];
   private historyCache?: HistoryCache;
   private expanded = new Set<string>();
+  private openGroups = new Set<string>();
+  private preview = new ActivityPreview();
+  private parents = new Map<string, string>();
+  private codeViews = new Map<string, boolean>();
+  private mutations = new Set<string>();
+  private observedRun?: number;
+  private receiptAnchor?: string;
+  private previousStatus?: Session["status"];
+  readonly prompts = new Map<number, string>();
   private groupMembers = new Map<string, string[]>();
   private collapsedThinking = new Set<string>();
   private readonly images: ImageDisplay;
@@ -87,6 +105,9 @@ export class Transcript implements Component {
   private hits = new Map<number, string>();
   readonly positions = new Map<string, number>();
   selected?: string;
+  lineCount = 0;
+
+  belongsTo(sessionId: string | undefined): boolean { return this.sessionId === sessionId; }
 
   constructor(readonly controller: Controller, readonly changed: () => void) {
     this.images = new ImageDisplay(() => { this.historyCache = undefined; changed(); });
@@ -108,10 +129,12 @@ export class Transcript implements Component {
     this.selected = id;
     if (id.startsWith("thinking:")) {
       if (expand ?? this.collapsedThinking.has(id)) this.collapsedThinking.delete(id); else this.collapsedThinking.add(id);
+    } else if (this.mutations.has(id)) {
+      this.codeViews.set(id, expand ?? !(this.codeViews.get(id) ?? true));
+    } else if (this.groupMembers.has(id)) {
+      if (expand ?? !this.openGroups.has(id)) this.openGroups.add(id); else this.openGroups.delete(id);
     } else {
-      const members = this.groupMembers.get(id) ?? [id];
-      const open = expand ?? !members.some((member) => this.expanded.has(member));
-      for (const member of members) { if (open) this.expanded.add(member); else this.expanded.delete(member); }
+      if (expand ?? !this.expanded.has(id)) this.expanded.add(id); else this.expanded.delete(id);
     }
     this.changed();
   }
@@ -119,10 +142,17 @@ export class Transcript implements Component {
   toggleAll(expand: boolean): void {
     this.historyCache = undefined;
     if (expand) this.collapsedThinking.clear();
+    for (const id of this.mutations) this.codeViews.set(id, expand);
+    for (const [id, members] of this.groupMembers) {
+      if (expand) this.openGroups.add(id); else this.openGroups.delete(id);
+      for (const member of members) {
+        if (expand) this.expanded.add(member); else this.expanded.delete(member);
+      }
+    }
     for (const id of this.ids) {
       if (id.startsWith("thinking:")) { if (expand) this.collapsedThinking.delete(id); else this.collapsedThinking.add(id); }
-      else for (const member of this.groupMembers.get(id) ?? [id]) {
-        if (expand) this.expanded.add(member); else this.expanded.delete(member);
+      else if (!this.groupMembers.has(id)) {
+        if (expand) this.expanded.add(id); else this.expanded.delete(id);
       }
     }
     this.changed();
@@ -132,42 +162,70 @@ export class Transcript implements Component {
     const session = this.controller.opened;
     if (!session) return [];
     if (this.sessionId !== session.id) {
-      this.sessionId = session.id; this.cache = []; this.expanded.clear(); this.collapsedThinking.clear(); this.images.clear(); this.selected = undefined;
+      this.sessionId = session.id; this.cache = []; this.openGroups.clear(); this.codeViews.clear();
+      this.observedRun = undefined; this.receiptAnchor = undefined; this.previousStatus = undefined;
+      this.preview = new ActivityPreview(); this.expanded.clear(); this.collapsedThinking.clear(); this.images.clear(); this.selected = undefined;
       this.historyCache = undefined;
     }
     const messages = transcriptMessages(session);
     const showThinking = this.controller.store.settings.showThinking !== false;
+    const anchor = `${messages.length}:${JSON.stringify(messages.at(-1))}`;
+    if (session.status === "working") { this.observedRun = session.work?.startedAt; this.receiptAnchor = undefined; }
+    else if (this.previousStatus === "working" && session.status === "completed" && this.observedRun === session.work?.startedAt) this.receiptAnchor = anchor;
+    if (this.receiptAnchor !== anchor) this.receiptAnchor = undefined;
+    this.previousStatus = session.status;
+    this.preview.update(messages, session.status === "working", session.work?.startedAt, session.status === "paused" || session.status === "failed" || session.status === "needs-input");
+    const groups = toolGroups(messages, showThinking);
+    const previews = new Map([...groups].map(([index, group]) => [index, this.preview.member(group, messages, showThinking)?.id ?? ""]));
     const cached = this.historyCache;
     const reusable = cached && cached.width === width && cached.showThinking === showThinking && cached.selected === this.selected
       ? cached : undefined;
-    if (reusable && isDeepStrictEqual(reusable.messages, messages)) return reusable.lines.concat(this.renderStatus(session, width));
+    if (reusable && isDeepStrictEqual(reusable.previews, previews) && isDeepStrictEqual(reusable.messages, messages)) {
+      const lines = reusable.lines.concat(this.renderStatus(session, width));
+      this.lineCount = lines.length;
+      return lines;
+    }
     let unchanged = 0;
     if (reusable) while (unchanged < Math.min(reusable.messages.length, messages.length)
       && isDeepStrictEqual(reusable.messages[unchanged], messages[unchanged])) unchanged++;
+    if (reusable) for (const index of new Set([...previews.keys(), ...reusable.previews.keys()])) {
+      if (previews.get(index) !== reusable.previews.get(index)) unchanged = Math.min(unchanged, index);
+    }
     const history = this.renderHistory(messages, width, reusable, unchanged);
     // Snapshot only changed inputs; nested tool arguments can mutate in place.
     const snapshot = (reusable?.messages.slice(0, unchanged) ?? []).concat(structuredClone(messages.slice(unchanged)));
-    this.historyCache = { width, showThinking, selected: this.selected, messages: snapshot, ...history };
-    return history.lines.concat(this.renderStatus(session, width));
+    this.historyCache = { width, showThinking, previews, selected: this.selected, messages: snapshot, ...history };
+    const lines = history.lines.concat(this.renderStatus(session, width));
+    this.lineCount = lines.length;
+    return lines;
   }
 
   private renderHistory(messages: TranscriptMessage[], width: number, cached?: HistoryCache, unchanged = 0): Pick<HistoryCache, "lines" | "checkpoints"> {
-    const groups = toolGroups(messages);
+    const showThinking = this.controller.store.settings.showThinking !== false;
+    const groups = toolGroups(messages, showThinking);
+    const cwd = this.controller.opened ? this.controller.store.sessionPath(this.controller.opened) : undefined;
+    const previousParents = this.parents;
+    this.parents = new Map();
     this.groupMembers.clear();
-    // The first call anchors a growing group; expansion remains attached to its member calls.
-    for (const [start, group] of groups) {
-      const id = group.tools[0]!.id;
-      const members = group.tools.map((tool) => tool.id);
+    this.mutations = new Set(messages.flatMap(message => message.role === "tool" && message.tool?.name === "edit" ? [message.tool.id] : []));
+    for (const group of groups.values()) {
+      const id = `group:${group.tools[0]!.id}`;
+      const members = group.tools.map(tool => tool.id);
       this.groupMembers.set(id, members);
-      if (this.selected && members.includes(this.selected)) this.selected = id;
-      for (let index = start; index <= group.end; index++) {
-        const message = messages[index]!;
-        if (message.role === "thinking" && this.selected === thinkingId(message, index)) this.selected = id;
-      }
+      for (const member of members) this.parents.set(member, id);
+      if (this.selected && members.includes(this.selected) && !this.openGroups.has(id)) this.selected = id;
+    }
+    for (const [member, oldGroup] of previousParents) {
+      const nextGroup = this.parents.get(member);
+      if (nextGroup && this.openGroups.has(oldGroup)) this.openGroups.add(nextGroup);
+    }
+    if (this.selected?.startsWith("group:") && !this.groupMembers.has(this.selected)) {
+      const member = [...previousParents].find(([, parent]) => parent === this.selected)?.[0];
+      this.selected = member ? this.parents.get(member) ?? member : undefined;
     }
     this.cache.length = messages.length;
     // Appending a routine tool can extend a group that starts before the changed message.
-    for (const [index, group] of groups) if (index < unchanged && group.end >= unchanged) unchanged = index;
+    for (const [index, group] of groups) if (index < unchanged && (group.end >= unchanged)) unchanged = index;
     const resume = cached?.checkpoints.findLast((checkpoint) => checkpoint.index <= unchanged);
     const start = resume?.index ?? 0;
     const prefixLines = resume?.line ?? 0;
@@ -176,9 +234,10 @@ export class Transcript implements Component {
     if (start) {
       this.ids.length = resume!.ids;
       for (const [id, line] of this.positions) if (line >= prefixLines) this.positions.delete(id);
+      for (const line of this.prompts.keys()) if (line >= prefixLines) this.prompts.delete(line);
       for (const line of this.hits.keys()) if (line >= prefixLines) this.hits.delete(line);
     } else {
-      this.ids = []; this.hits.clear(); this.positions.clear();
+      this.ids = []; this.hits.clear(); this.positions.clear(); this.prompts.clear();
     }
     let question = resume?.question;
     let groupedThrough = -1;
@@ -188,28 +247,40 @@ export class Transcript implements Component {
       checkpoints.push({ index, line: lines.length, ids: this.ids.length, question });
       const group = groups.get(index);
       if (group) {
-        const id = group.tools[0]!.id;
-        const open = group.tools.some((tool) => this.expanded.has(tool.id));
+        const id = `group:${group.tools[0]!.id}`;
+        const open = this.openGroups.has(id);
         const start = lines.length;
-        this.ids.push(id);
+        this.ids.push(id); this.positions.set(id, start);
         for (const tool of group.tools) this.positions.set(tool.id, start);
-        lines.push(...renderToolGroup(group.tools, width, open, this.selected === id));
-        const indent = width > 4 ? "  " : "";
-        const memberWidth = Math.max(1, width - indent.length);
-        for (let memberIndex = index; memberIndex <= group.end; memberIndex++) {
-          const member = messages[memberIndex]!;
-          if (member.role === "thinking" && hasThinkingContent(member) && this.controller.store.settings.showThinking !== false) {
-            this.positions.set(thinkingId(member, memberIndex), start);
-            if (open) lines.push(...thinkingLines(member, memberWidth, true, false).map((line) => indent + line));
-          } else if (member.role === "tool" && member.tool && open) {
-            lines.push(...renderToolResponse(member.tool, memberWidth, true, false).map((line) => indent + line), "");
+        const preview = this.preview.member(group, messages, showThinking);
+        const header = preview
+          ? open ? activityPreviewLines(preview, width, cwd).slice(0, 1) : activityPreviewLines(preview, width, cwd)
+          : renderToolGroup(group.tools, width, open, this.selected === id, cwd);
+        if (preview && !open && group.tools.some(tool => tool.status === "error")) {
+          header.push(fit("  " + warning(`${group.tools.filter(tool => tool.status === "error").length} failed`), width),
+            ...renderToolGroup(group.tools, width, false, false, cwd).slice(1));
+        }
+        if (preview && this.selected === id) header[0] = fit(accent(">") + header[0]!.slice(1), width);
+        lines.push(...header);
+        for (let y = start; y < lines.length; y++) this.hits.set(y, id);
+        if (open) {
+          const indent = width > 4 ? "  " : "";
+          const memberWidth = Math.max(1, width - indent.length);
+          for (const tool of group.tools) {
+            const memberStart = lines.length;
+            this.ids.push(tool.id); this.positions.set(tool.id, memberStart);
+            const expanded = this.expanded.has(tool.id);
+            lines.push(...renderToolResponse(tool, memberWidth, expanded, this.selected === tool.id, { cwd }).map(line => indent + line));
+            if (expanded && tool.images?.length) lines.push(...this.images.render(tool.images, `tool:${tool.id}`, memberWidth).map(line => indent + line));
+            for (let y = memberStart; y < lines.length; y++) this.hits.set(y, tool.id);
+            lines.push("");
           }
         }
-        for (let y = start; y < lines.length; y++) this.hits.set(y, id);
         lines.push("");
         groupedThrough = group.end;
         continue;
       }
+      if (invisibleActivity(message, showThinking)) continue;
       if (message.role === "shell") {
         lines.push(...renderShellResponse(message.shell, Math.max(1, width)), "");
         continue;
@@ -222,19 +293,21 @@ export class Transcript implements Component {
         continue;
       }
       if (message.role === "tool") {
+        if (message.tool && hiddenTask(message.tool)) continue;
         const tool = message.tool ?? { id: `legacy:${index}:${message.timestamp}`, name: "Tool output", arguments: {}, output: message.text, status: "done" };
         if (isQuestionTool(tool.name)) question = tool.status === "done" ? formQuestion(tool) : undefined;
         const id = tool.id;
         this.ids.push(id); this.positions.set(id, lines.length); this.hits.set(lines.length, id);
         const open = this.expanded.has(id);
         const start = lines.length;
-        lines.push(...renderToolResponse(tool, width, open, this.selected === id));
+        lines.push(...renderToolResponse(tool, width, open, this.selected === id, { cwd, codeExpanded: this.codeViews.get(id) ?? true }));
         for (let y = start; y < lines.length; y++) this.hits.set(y, id);
         if (open && tool.images?.length) lines.push(...this.images.render(tool.images, `tool:${tool.id}`, Math.max(1, width)));
         lines.push("");
         continue;
       }
       if (message.role === "user") {
+        if (!message.source) this.prompts.set(lines.length, message.text);
         const answers = !message.source && question && answeredQuestions(message.text, question);
         question = undefined;
         if (answers) {
@@ -289,7 +362,7 @@ export class Transcript implements Component {
       }
       lines.push("");
     }
-    const status = session.status !== "working" && lastReplyMessage(session)?.role === "shell" ? undefined : workLabel(session);
+    const status = session.status !== "working" && (!this.receiptAnchor || lastReplyMessage(session)?.role === "shell") ? undefined : workLabel(session);
     if (status) lines.push(...wrapTextWithAnsi(status, Math.max(1, width)), "");
     if (session.status === "needs-input") lines.push(...wrapTextWithAnsi(accent("? Waiting for your answer"), Math.max(1, width)), "");
     if (session.status === "paused") lines.push(...wrapTextWithAnsi(dim(session.stopped ? "Stopped. Reply to continue." : "Paused. Reply to continue."), Math.max(1, width)), "");

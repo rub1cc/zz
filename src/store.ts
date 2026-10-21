@@ -3,6 +3,7 @@ import type { Usage } from "@earendil-works/pi-ai";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { StateWriter } from "./state-writer.js";
 import { compactionPolicy, compactionSettingsError } from "./compaction-settings.js";
 import { join, resolve } from "node:path";
 import { isReplyBehavior, isThinkingLevel, type ShellResponse, type ImageAttachment, type AppSettings, type AgentSettings, type PendingInput, type PreparedInput, type Project, type Session, type Workspace, type WorkspaceSelection, type State, type ToolActivity } from "./model.js";
@@ -172,10 +173,12 @@ function isPreparedInput(value: PreparedInput): boolean {
 export class Store {
   readonly state: State;
   readonly file: string;
+  private readonly writer: StateWriter;
 
   constructor(readonly root: string) {
     mkdirSync(root, { recursive: true, mode: 0o700 });
     this.file = join(root, "state.json");
+    this.writer = new StateWriter(this.file, () => this.state);
     if (existsSync(this.file)) {
       const value: unknown = JSON.parse(readFileSync(this.file, "utf8"));
       if (!isState(value)) throw new Error(`Invalid zz state: ${this.file}. Restore it from a backup; it has not been overwritten.`);
@@ -281,8 +284,13 @@ export class Store {
   }
 
   save(): void {
+    this.writer.invalidate();
     const temporary = `${this.file}.${randomUUID()}.tmp`;
     writeFileSync(temporary, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });
     renameSync(temporary, this.file);
   }
+
+  saveAsync(): Promise<void> { return this.writer.save(); }
+  flush(): Promise<void> { return this.writer.flush(); }
+  close(): Promise<void> { return this.writer.close(); }
 }

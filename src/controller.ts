@@ -10,10 +10,10 @@ import { compactionPolicy, compactionSettingsError } from "./compaction-settings
 import { answerError, answerText, pendingQuestion, type QuestionForm, type QuestionAnswers } from "./questions.js";
 
 export interface Engine {
-  run(session: Session, project: Project, prompt: string, changed: () => void, images?: ImageAttachment[]): Promise<void>;
-  compact(session: Session, instructions: string | undefined, changed: () => void): Promise<CompactResult>;
+  run(session: Session, project: Project, prompt: string, changed: (persist?: boolean) => void, images?: ImageAttachment[]): Promise<void>;
+  compact(session: Session, instructions: string | undefined, changed: (persist?: boolean) => void): Promise<CompactResult>;
   undoCheckpoints(session: Session): Promise<UndoCheckpoint[]>;
-  undo(session: Session, checkpointId: string, changed: () => void): Promise<UndoResult>;
+  undo(session: Session, checkpointId: string, changed: (persist?: boolean) => void): Promise<UndoResult>;
   stop(sessionId: string): Promise<void>;
   cancel(sessionId: string): Promise<void>;
   close(): Promise<void>;
@@ -23,7 +23,7 @@ export interface Engine {
   listModels(): Promise<ModelOption[]>;
   configure(change: Partial<AgentSettings>, session?: Session): Promise<void>;
   listSkills(project: Project): Promise<SkillOption[]>;
-  approveWorkspace?(session: Session, requestId: string, approved: boolean, changed: () => void): Promise<void>;
+  approveWorkspace?(session: Session, requestId: string, approved: boolean, changed: (persist?: boolean) => void): Promise<void>;
 }
 
 export type Mode = "sessions" | "projects" | "session";
@@ -154,7 +154,7 @@ export class Controller {
     }
     if (expectedRequestId !== undefined && request.id !== expectedRequestId) { this.fail("Workspace approval changed. Reopen /workspace before deciding."); return; }
     try {
-      await this.engine.approveWorkspace(session, request.id, approved, () => this.changed(true));
+      await this.engine.approveWorkspace(session, request.id, approved, (persist = true) => this.changed(persist));
       if (this.dialog?.kind === "workspace" && this.dialog.sessionId === session.id) this.dialog = undefined;
       this.notice = approved ? "External workspace approved. Switching and continuing..." : "Workspace entry denied. The session stays in its current checkout.";
       this.changed(true);
@@ -451,7 +451,7 @@ export class Controller {
     if (this.closing) return;
     if (persist && !this.saveTimer) this.saveTimer = setTimeout(() => {
       this.saveTimer = undefined;
-      try { this.store.save(); } catch (error) { this.fail(error); }
+      void this.store.saveAsync().catch((error: unknown) => this.fail(error));
     }, 200);
     this.onChange();
   }
@@ -593,7 +593,7 @@ export class Controller {
     this.notice = "Compacting context...";
     this.changed();
     try {
-      const result = await this.engine.compact(session, instructions, () => this.changed(true));
+      const result = await this.engine.compact(session, instructions, (persist = true) => this.changed(persist));
       if (!this.closing) this.notice = result === "compacted" ? "Context compacted. History and usage totals are retained."
         : result === "unchanged" ? "Nothing to compact yet; recent context is kept verbatim."
         : result === "stale" ? "Summary superseded by a newer context; not applied." : "Compaction cancelled.";
@@ -647,7 +647,7 @@ export class Controller {
     this.notice = "Restoring the selected checkpoint...";
     this.changed();
     try {
-      const result = await this.engine.undo(session, checkpointId, () => this.changed(true));
+      const result = await this.engine.undo(session, checkpointId, (persist = true) => this.changed(persist));
       if (this.dialog === dialog) this.dialog = undefined;
       this.notice = `Undone: conversation and ${result.files} tracked file${result.files === 1 ? "" : "s"} restored.`
         + (result.shell ? " Shell-command changes were NOT undone." : "");
@@ -861,7 +861,7 @@ export class Controller {
     this.dialog = undefined;
     const active = session;
     this.pending.set(active.id, (this.pending.get(active.id) ?? 0) + 1);
-    void this.engine.run(active, project, text, () => this.changed(true), images)
+    void this.engine.run(active, project, text, (persist = true) => this.changed(persist), images)
       .catch((error: unknown) => {
         active.status = "failed";
         active.preview = error instanceof Error ? error.message : String(error);
@@ -885,7 +885,9 @@ export class Controller {
     if (this.dialog?.kind === "auth") this.dialog.flow.dispose();
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = undefined;
-    this.closePromise = Promise.all([this.engine.close(), shell?.done]).then(() => {}).finally(() => this.store.save());
+    this.closePromise = Promise.all([this.engine.close(), shell?.done]).then(() => {}).finally(async () => {
+      try { await this.store.saveAsync(); } finally { await this.store.close(); }
+    });
     return this.closePromise;
   }
 }

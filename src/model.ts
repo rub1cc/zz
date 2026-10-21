@@ -34,6 +34,12 @@ export interface ModelOption extends ModelRef {
 export interface ImageAttachment extends ImageContent { name?: string }
 
 export interface ToolActivity {
+  /** Arguments are still being generated; never an execution claim. */
+  preparing?: boolean;
+  /** View-only observed execution order within the current durable run. */
+  executionOrder?: number;
+  /** Native ID for pairing live slots; presentation IDs remain unique across entries. */
+  callId?: string;
   images?: ImageAttachment[];
   id: string;
   name: string;
