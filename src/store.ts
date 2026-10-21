@@ -6,7 +6,7 @@ import { homedir } from "node:os";
 import { StateWriter } from "./state-writer.js";
 import { compactionPolicy, compactionSettingsError } from "./compaction-settings.js";
 import { join, resolve } from "node:path";
-import { isReplyBehavior, isThinkingLevel, type ShellResponse, type ImageAttachment, type AppSettings, type AgentSettings, type PendingInput, type PreparedInput, type Project, type Session, type Workspace, type WorkspaceSelection, type State, type ToolActivity } from "./model.js";
+import { isReplyBehavior, isThinkingLevel, type ShellResponse, type ImageAttachment, type AppSettings, type AgentSettings, type PendingInput, type WorkerUpdate, type PreparedInput, type Project, type Session, type Workspace, type WorkspaceSelection, type State, type ToolActivity } from "./model.js";
 
 export function directory(value: string): string {
   const expanded = value === "~" ? homedir() : value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
@@ -58,7 +58,9 @@ function isState(value: unknown): value is State {
     && state.sessions.every((s) => typeof s.id === "string" && typeof s.projectId === "string"
       && (s.conversationId === undefined || Number.isSafeInteger(s.conversationId) && s.conversationId >= 0)
       && (s.delegation === undefined || !!s.delegation && typeof s.delegation.parentId === "string"
-        && typeof s.delegation.taskId === "string" && s.delegation.parentId !== s.id)
+        && typeof s.delegation.taskId === "string" && s.delegation.parentId !== s.id
+        && (s.delegation.runId === undefined || Number.isFinite(s.delegation.runId)))
+      && (s.workerUpdates === undefined || Array.isArray(s.workerUpdates) && s.workerUpdates.every(isWorkerUpdate))
       && (s.orchestrationPending === undefined || typeof s.orchestrationPending === "boolean")
       && (s.waitingFor === undefined || Array.isArray(s.waitingFor) && s.waitingFor.every((id) => typeof id === "string"))
       && (s.tasks === undefined || Array.isArray(s.tasks) && s.tasks.every((task) => !!task
@@ -74,6 +76,7 @@ function isState(value: unknown): value is State {
       && (s.queuedInputs === undefined || Array.isArray(s.queuedInputs) && s.queuedInputs.every((input) =>
         !!input && Number.isSafeInteger(input.id) && input.id >= 0 && typeof input.text === "string"
         && (input.mode === undefined || isReplyBehavior(input.mode))
+        && (input.source === undefined || isInputSource(input.source))
         && (input.imageCount === undefined || Number.isSafeInteger(input.imageCount) && input.imageCount >= 0)))
       && typeof s.title === "string" && typeof s.preview === "string"
       && (s.titleRenamed === undefined || typeof s.titleRenamed === "boolean")
@@ -150,6 +153,21 @@ function isToolActivity(value: ToolActivity): boolean {
     && !!value.arguments && typeof value.arguments === "object" && !Array.isArray(value.arguments)
     && (value.images === undefined || isImages(value.images))
     && typeof value.output === "string" && ["pending", "running", "done", "error", "interrupted"].includes(value.status);
+}
+
+function isWorkerResult(value: NonNullable<WorkerUpdate["result"]>): boolean {
+  return !!value && [value.sessionId, value.title, value.status, value.result].every((s) => typeof s === "string")
+    && typeof value.resultTruncated === "boolean";
+}
+
+function isWorkerUpdate(value: WorkerUpdate): boolean {
+  return !!value && [value.id, value.taskId, value.sessionId, value.title, value.message].every((s) => typeof s === "string")
+    && Number.isFinite(value.runId) && Number.isFinite(value.timestamp)
+    && ["progress", "blocker", "result"].includes(value.kind)
+    && ["recorded", "pending", "delivered", "acknowledged", "disposed"].includes(value.delivery)
+    && (value.result === undefined || isWorkerResult(value.result))
+    && (value.waitResults === undefined || Array.isArray(value.waitResults) && value.waitResults.every(isWorkerResult))
+    && (value.observedSessionIds === undefined || Array.isArray(value.observedSessionIds) && value.observedSessionIds.every((id) => typeof id === "string"));
 }
 
 function isInputSource(value: NonNullable<PendingInput["source"]>): boolean {

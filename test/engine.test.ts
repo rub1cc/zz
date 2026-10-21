@@ -2727,13 +2727,15 @@ test("workspace agent revalidates the prepared destination before committing a b
   } finally { await engine.close(); f.cleanup(); }
 });
 
+function orchestrationReply(context: Context): (TextContent | ToolCall)[] {
+  const last = context.messages.findLast((m) => m.role !== "system");
+  let text = last?.role === "user" && typeof last.content === "string" ? last.content : "";
+  if (text.startsWith("Agent-authored ")) text = text.slice(text.indexOf("\n\n") + 2);
+  return text.startsWith("tools:") ? JSON.parse(text.slice(6)) as ToolCall[] : [{ type: "text", text: "Task result" }];
+}
+
 function orchestrationModels(observe?: (context: Context) => void) {
-  return models({ context: observe, reply: (context) => {
-    const last = context.messages.findLast((m) => m.role !== "system");
-    let text = last?.role === "user" && typeof last.content === "string" ? last.content : "";
-    if (text.startsWith("Agent-authored ")) text = text.slice(text.indexOf("\n\n") + 2);
-    return text.startsWith("tools:") ? JSON.parse(text.slice(6)) as ToolCall[] : [{ type: "text", text: "Task result" }];
-  } });
+  return models({ context: observe, reply: orchestrationReply });
 }
 
 async function orchestrationIdle(engine: DurableEngine): Promise<void> {
@@ -2964,6 +2966,297 @@ test("independent sessions have no delegation lifecycle and explicit cancellatio
     assert.ok(f.s.messages.some((m) => m.tool?.name === "session_cancel" && m.tool.status === "done"));
     assert.deepEqual(f.errors, []);
   } finally { await f.engine.close(); f.cleanup(); }
+});
+
+
+test("eight worker progress reports stay passive and finish with one result review", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  try {
+    const reports = Array.from({ length: 8 }, (_, index) => ({ ...taskCall("session_update", { kind: "progress", message: `Progress ${index}: @missing.png $not-a-skill` }), id: `progress-${index}` }));
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { isolation: "shared", title: "Settings worker",
+      task: toolPrompt(...reports, taskCall("bash", { command: "sleep 0.5" })) })).replaceAll("@missing.png", "\\u0040missing.png"), () => {});
+    const worker = f.store.state.sessions.find((s) => s.delegation?.parentId === f.s.id)!;
+    await until(() => f.s.workerUpdates?.filter((update) => update.kind === "progress").length === 8);
+    assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 0);
+    assert.equal(f.s.queuedInputs, undefined);
+    assert.equal(f.s.status, "completed");
+    assert.ok(f.s.workerUpdates!.every((update) => update.delivery === "recorded" && update.runId === worker.delegation?.runId));
+    await orchestrationIdle(f.engine);
+    assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 1);
+    assert.equal(f.s.workerUpdates?.filter((update) => update.result).length, 1);
+    assert.equal(f.s.orchestrationPending, undefined);
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("completed siblings share one mailbox delivery after the parent's human question", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  try {
+    const delegates = Array.from({ length: 3 }, (_, index) => ({ ...taskCall("session_delegate", { isolation: "shared", title: `Worker ${index}`, task: toolPrompt(taskCall("bash", { command: "sleep 0.4" })) }), id: `delegate-${index}` }));
+    await f.engine.run(f.s, f.project, toolPrompt(...delegates), () => {});
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("ask_question", { question: "May I deploy?" })), () => {});
+    await orchestrationIdle(f.engine);
+    assert.equal(f.s.status, "needs-input");
+    assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 0);
+    assert.equal(f.s.workerUpdates?.filter((update) => update.result && update.delivery === "pending").length, 3);
+    await f.engine.run(f.s, f.project, "Do not deploy", () => {});
+    await orchestrationIdle(f.engine);
+    const notifications = f.s.messages.filter((m) => m.source?.kind === "notification");
+    assert.equal(notifications.length, 1);
+    for (let index = 0; index < 3; index++) assert.match(notifications[0]!.text, new RegExp(`Worker ${index}`));
+    assert.ok(f.s.workerUpdates!.every((update) => update.delivery === "delivered"));
+    assert.equal(f.s.orchestrationPending, undefined);
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("reading an owned result acknowledges its pending wake and later worker activity cannot reopen it", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { isolation: "shared", task: toolPrompt(taskCall("bash", { command: "sleep 0.4" })) })), () => {});
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("ask_question", { question: "Review first?" })), () => {});
+    await orchestrationIdle(f.engine);
+    const worker = f.store.state.sessions.find((s) => s.delegation?.parentId === f.s.id)!;
+    assert.equal(f.s.workerUpdates?.find((update) => update.result)?.delivery, "pending");
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_read", { sessionId: worker.id, cursor: 0, limit: 1 })), () => {});
+    await orchestrationIdle(f.engine);
+    assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 0);
+    const read = JSON.parse(f.s.messages.findLast((m) => m.tool?.name === "session_read")!.tool!.output);
+    assert.equal(read.taskResult.result, "Task result");
+    assert.equal(read.taskResult.status, "completed");
+    assert.equal(f.s.workerUpdates?.find((update) => update.result)?.delivery, "acknowledged");
+    await f.engine.run(worker, f.project, toolPrompt(taskCall("session_update", { kind: "blocker", message: "Late old coordination note" })), () => {});
+    await f.engine.run(worker, f.project, toolPrompt(taskCall("ask_question", { question: "A different task question?" })), () => {});
+    await orchestrationIdle(f.engine);
+    assert.equal(worker.status, "needs-input");
+    assert.equal(f.s.workerUpdates?.find((update) => update.message === "Late old coordination note")?.delivery, "recorded");
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_read", { sessionId: worker.id })), () => {});
+    await orchestrationIdle(f.engine);
+    const reread = JSON.parse(f.s.messages.findLast((m) => m.tool?.name === "session_read")!.tool!.output);
+    assert.equal(reread.status, "needs-input");
+    assert.deepEqual(reread.taskResult, read.taskResult);
+    assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 0);
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("pending worker results survive restart and observed results never wake again", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels()); let engine = f.engine; let store = f.store;
+  try {
+    await engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { isolation: "shared", task: toolPrompt(taskCall("bash", { command: "sleep 0.4" })) })), () => {});
+    await engine.run(f.s, f.project, toolPrompt(taskCall("ask_question", { question: "Keep waiting?" })), () => {});
+    await orchestrationIdle(engine);
+    const workerId = store.state.sessions.find((s) => s.delegation?.parentId === f.s.id)!.id;
+    for (let round = 0; round < 2; round++) {
+      await engine.close(); store = new Store(store.root);
+      engine = await openEngine(store, undefined, (error) => f.errors.push(error), orchestrationModels());
+      await engine.restore(() => {}); await orchestrationIdle(engine);
+      const parent = store.state.sessions.find((s) => s.id === f.s.id)!;
+      assert.equal(parent.messages.filter((m) => m.source?.kind === "notification").length, 0);
+      if (round === 0) {
+        assert.equal(parent.status, "needs-input");
+        assert.equal(parent.workerUpdates?.find((update) => update.result)?.delivery, "pending");
+        await engine.run(parent, f.project, toolPrompt(taskCall("session_read", { sessionId: workerId })), () => {});
+        await orchestrationIdle(engine);
+      }
+      assert.equal(parent.workerUpdates?.find((update) => update.result)?.delivery, "acknowledged");
+    }
+    assert.deepEqual(f.errors, []);
+  } finally { await engine.close(); f.cleanup(); }
+});
+
+test("immediate session_wait returns and acknowledges original task results", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { isolation: "shared", task: toolPrompt(taskCall("bash", { command: "sleep 0.4" })) })), () => {});
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("ask_question", { question: "Wait for review?" })), () => {});
+    await orchestrationIdle(f.engine);
+    const worker = f.store.state.sessions.find((s) => s.delegation?.parentId === f.s.id)!;
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_wait", { sessionIds: [worker.id] })), () => {});
+    await orchestrationIdle(f.engine);
+    const waited = JSON.parse(f.s.messages.findLast((m) => m.tool?.name === "session_wait")!.tool!.output);
+    assert.equal(waited.sessions[0].taskResult.result, "Task result");
+    assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 0);
+    assert.equal(f.s.workerUpdates?.find((update) => update.result)?.delivery, "acknowledged");
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("top-level sessions cannot report worker updates and stopping disposes pending delivery", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_update", { kind: "progress", message: "Not a worker" })), () => {});
+    assert.match(f.s.messages.findLast((m) => m.tool?.name === "session_update")!.tool!.output, /Only a delegated worker/);
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { isolation: "shared", task: toolPrompt(taskCall("bash", { command: "sleep 0.4" })) })), () => {});
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("ask_question", { question: "Pending approval?" })), () => {});
+    await orchestrationIdle(f.engine);
+    assert.equal(f.s.workerUpdates?.find((update) => update.result)?.delivery, "pending");
+    await f.engine.cancel(f.s.id); await orchestrationIdle(f.engine);
+    const doc = await f.engine.harness.snapshot(SessionsDoc, f.s.conversationId as ConversationId, BACKGROUND_CONTEXT);
+    assert.ok(doc!.workerUpdates!.every((update) => update.delivery === "disposed"));
+    assert.equal(f.s.stopped, true);
+    assert.equal(f.s.messages.filter((m) => m.source?.kind === "notification").length, 0);
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+
+test("result reads atomically rewrite partial native batches and withdraw empty ones without interrupting active work", { timeout: 10000 }, async () => {
+  const options = { pause: false, reply: orchestrationReply };
+  const f = await undoFixture(models(options));
+  try {
+    const delegates = Array.from({ length: 3 }, (_, index) => ({ ...taskCall("session_delegate", { isolation: "shared", title: `Queued worker ${index}`,
+      task: toolPrompt(taskCall("bash", { command: "sleep 0.4" })) }), id: `queued-delegate-${index}` }));
+    await f.engine.run(f.s, f.project, toolPrompt(...delegates), () => {});
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("ask_question", { question: "Review queued results?" })), () => {});
+    await orchestrationIdle(f.engine);
+    f.engine.sessionAgent.enabled = false; await f.engine.sessionAgent.flush(); options.pause = true;
+    const cid = f.s.conversationId as ConversationId;
+    const conversation = (await f.engine.harness.conversation(cid, BACKGROUND_CONTEXT))!;
+    const before = (await f.engine.harness.snapshot(SessionsDoc, cid, BACKGROUND_CONTEXT))!;
+    const [requestId, command] = Object.entries(before.commands).find(([, command]) => command.workerUpdateIds?.length)!;
+    assert.equal(command.workerUpdateIds?.length, 3);
+    const active = await conversation.submit({ type: "input", requestId: "unrelated-active-turn", content: "Unrelated active work" }, BACKGROUND_CONTEXT);
+    const queued = await conversation.submit({ type: "input", requestId, content: command.prompt!, whenBusy: "followUp",
+      entry: { kind: "zz.agent_input", data: { source: command.source!, prompt: command.prompt! } } }, BACKGROUND_CONTEXT);
+    assert.equal((await queued.status(BACKGROUND_CONTEXT)).status, "queued");
+    // Model an admission that returned its receipt before the parent explicitly read any results.
+    await f.engine.harness.commit(async (tx) => {
+      const doc = await tx.doc(SessionsDoc, cid);
+      doc.commands[requestId]!.result = JSON.stringify({ status: "working" });
+      for (const update of doc.workerUpdates ?? []) if (command.workerUpdateIds!.includes(update.id)) update.delivery = "delivered";
+    }, BACKGROUND_CONTEXT);
+    const read = f.engine.sessionAgent.extension.tools!.find((tool) => tool.name === "session_read")!;
+    const api = { conversationId: cid } as unknown as import("@earendil-works/pi-durable").ToolExecutionApi;
+    const workers = f.store.state.sessions.filter((session) => session.delegation?.parentId === f.s.id);
+    await read.execute({ sessionId: workers[0]!.id }, api, BACKGROUND_CONTEXT);
+    let inbox = await f.engine.harness.snapshot(InboxDoc, cid, BACKGROUND_CONTEXT);
+    const remainder = inbox!.items.find((item) => item.id === queued.id)!;
+    assert.equal(remainder.mode, "followUp");
+    assert.ok("content" in remainder && typeof remainder.content === "string" && !remainder.content.includes(workers[0]!.id));
+    assert.equal((await queued.status(BACKGROUND_CONTEXT)).status, "queued");
+    await read.execute({ sessionId: workers[1]!.id }, api, BACKGROUND_CONTEXT);
+    await read.execute({ sessionId: workers[2]!.id }, api, BACKGROUND_CONTEXT);
+    inbox = await f.engine.harness.snapshot(InboxDoc, cid, BACKGROUND_CONTEXT);
+    assert.equal(inbox!.items.some((item) => item.id === queued.id), false);
+    const receipt = await queued.status(BACKGROUND_CONTEXT);
+    assert.equal(receipt.status, "unanswered");
+    assert.equal("reason" in receipt && receipt.reason, "aborted");
+    assert.equal((await active.status(BACKGROUND_CONTEXT)).status, "placed", "never abort the unrelated active turn");
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+test("worker blockers request one safe review while explicit result drafts remain passive", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { isolation: "shared", task: toolPrompt(
+      taskCall("session_update", { kind: "result", message: "Draft: changes ready, checks still running" }),
+      taskCall("session_update", { kind: "blocker", message: "Need the API contract clarified" }),
+      taskCall("bash", { command: "sleep 0.5" })) })), () => {});
+    await until(() => f.s.messages.some((message) => message.source?.kind === "notification"));
+    const worker = f.store.state.sessions.find((session) => session.delegation?.parentId === f.s.id)!;
+    assert.equal(worker.status, "working");
+    assert.equal(f.s.workerUpdates?.find((update) => update.message.startsWith("Draft:"))?.delivery, "recorded");
+    assert.equal(f.s.workerUpdates?.some((update) => update.result), false, "a result draft is not runtime completion");
+    assert.match(f.s.messages.find((message) => message.source?.kind === "notification")!.text, /API contract/);
+    await orchestrationIdle(f.engine);
+    assert.equal(f.s.messages.filter((message) => message.source?.kind === "notification").length, 2);
+    assert.equal(f.s.workerUpdates?.filter((update) => update.result).length, 1);
+    assert.deepEqual(f.errors, []);
+  } finally { await f.engine.close(); f.cleanup(); }
+});
+
+
+test("a result observed before delayed native admission cannot produce a stale wake", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels()); let release!: () => void;
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { isolation: "shared", task: toolPrompt(taskCall("bash", { command: "sleep 0.4" })) })), () => {});
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("ask_question", { question: "Hold the result?" })), () => {});
+    await orchestrationIdle(f.engine);
+    const worker = f.store.state.sessions.find((session) => session.delegation?.parentId === f.s.id)!;
+    const admit = f.engine.sessionAgent.admitNotification.bind(f.engine.sessionAgent);
+    let intercepted = false;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    f.engine.sessionAgent.admitNotification = async <T>(parent: Session, id: string, submit: (command: import("../src/session-agent.js").SessionCommand) => Promise<T>) => {
+      intercepted = true; await gate;
+      return admit(parent, id, submit);
+    };
+    await f.engine.run(f.s, f.project, "Resume without acting on the worker yet", () => {});
+    await until(() => intercepted);
+    const read = f.engine.sessionAgent.extension.tools!.find((tool) => tool.name === "session_read")!;
+    await read.execute({ sessionId: worker.id }, { conversationId: f.s.conversationId } as unknown as import("@earendil-works/pi-durable").ToolExecutionApi, BACKGROUND_CONTEXT);
+    assert.equal(f.s.workerUpdates?.find((update) => update.result)?.delivery, "acknowledged");
+    release(); await orchestrationIdle(f.engine);
+    assert.equal(f.s.messages.filter((message) => message.source?.kind === "notification").length, 0);
+    assert.equal(f.s.orchestrationPending, undefined);
+    assert.deepEqual(f.errors, []);
+  } finally { release?.(); await f.engine.close(); f.cleanup(); }
+});
+
+test("observing a worker result also cancels its pending explicit-wait summary", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_delegate", { isolation: "shared", task: toolPrompt(taskCall("bash", { command: "sleep 0.4" })) })), () => {});
+    const worker = f.store.state.sessions.find((session) => session.delegation?.parentId === f.s.id)!;
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_wait", { sessionIds: [worker.id] })), () => {});
+    // A pending external-workspace approval holds mailbox delivery but is never answered by worker data.
+    f.s.workspaceSwitch = { id: "held-approval", phase: "approval", workspaceId: "external", path: f.root };
+    await orchestrationIdle(f.engine);
+    assert.equal(f.s.workerUpdates?.filter((update) => update.delivery === "pending").length, 2);
+    const read = f.engine.sessionAgent.extension.tools!.find((tool) => tool.name === "session_read")!;
+    await read.execute({ sessionId: worker.id }, { conversationId: f.s.conversationId } as unknown as import("@earendil-works/pi-durable").ToolExecutionApi, BACKGROUND_CONTEXT);
+    assert.ok(f.s.workerUpdates!.every((update) => update.delivery === "acknowledged"));
+    assert.equal(f.s.workspaceSwitch.id, "held-approval");
+    delete f.s.workspaceSwitch; f.engine.sessionAgent.schedule(); await orchestrationIdle(f.engine);
+    assert.equal(f.s.messages.filter((message) => message.source?.kind === "notification").length, 0);
+    assert.deepEqual(f.errors, []);
+  } finally { delete f.s.workspaceSwitch; await f.engine.close(); f.cleanup(); }
+});
+
+test("explicit waits use original task snapshots even if a completed worker starts unrelated work", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt(
+      taskCall("session_delegate", { title: "First worker", isolation: "shared", task: toolPrompt(taskCall("bash", { command: "sleep 0.3" })) }),
+      taskCall("session_delegate", { title: "Second worker", isolation: "shared", task: toolPrompt(taskCall("bash", { command: "sleep 0.9" })) })), () => {});
+    const workers = f.store.state.sessions.filter((session) => session.delegation?.parentId === f.s.id);
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_wait", { sessionIds: workers.map((worker) => worker.id) })), () => {});
+    f.s.workspaceSwitch = { id: "held-approval", phase: "approval", workspaceId: "external", path: f.root };
+    await until(() => !!f.s.workerUpdates?.some((update) => update.result?.sessionId === workers[0]!.id));
+    await f.engine.run(workers[0]!, f.project, toolPrompt(taskCall("ask_question", { question: "Unrelated later task question" })), () => {});
+    await orchestrationIdle(f.engine);
+    const summary = f.s.workerUpdates!.find((update) => update.waitResults)!;
+    const original = summary.waitResults!.find((result) => result.sessionId === workers[0]!.id)!;
+    assert.equal(workers[0]!.status, "needs-input");
+    assert.equal(original.status, "completed");
+    assert.equal(original.result, "Task result");
+    assert.doesNotMatch(summary.message, /Unrelated later task question/);
+    assert.equal(f.s.waitingFor, undefined);
+    assert.equal(f.s.messages.filter((message) => message.source?.kind === "notification").length, 0);
+    assert.deepEqual(f.errors, []);
+  } finally { delete f.s.workspaceSwitch; await f.engine.close(); f.cleanup(); }
+});
+
+test("deleting a completed worker cannot replace its retained result in a multi-worker wait", { timeout: 10000 }, async () => {
+  const f = await undoFixture(orchestrationModels());
+  try {
+    await f.engine.run(f.s, f.project, toolPrompt(
+      taskCall("session_delegate", { title: "Retained worker", isolation: "shared", task: toolPrompt(taskCall("bash", { command: "sleep 0.3" })) }),
+      taskCall("session_delegate", { title: "Remaining worker", isolation: "shared", task: toolPrompt(taskCall("bash", { command: "sleep 0.9" })) })), () => {});
+    const workers = f.store.state.sessions.filter((session) => session.delegation?.parentId === f.s.id);
+    await f.engine.run(f.s, f.project, toolPrompt(taskCall("session_wait", { sessionIds: workers.map((worker) => worker.id) })), () => {});
+    f.s.workspaceSwitch = { id: "held-approval", phase: "approval", workspaceId: "external", path: f.root };
+    await until(() => !!f.s.workerUpdates?.some((update) => update.result?.sessionId === workers[0]!.id));
+    const original = structuredClone(f.s.workerUpdates!.find((update) => update.result?.sessionId === workers[0]!.id)!.result);
+    await f.engine.stop(workers[0]!.id);
+    f.store.state.sessions = f.store.state.sessions.filter((session) => session.id !== workers[0]!.id); f.store.save();
+    await orchestrationIdle(f.engine);
+    const summary = f.s.workerUpdates!.find((update) => update.waitResults)!;
+    assert.deepEqual(summary.waitResults!.find((result) => result.sessionId === workers[0]!.id), original);
+    assert.equal(f.s.waitingFor, undefined);
+    assert.deepEqual(f.errors, []);
+  } finally { delete f.s.workspaceSwitch; await f.engine.close(); f.cleanup(); }
 });
 
 test("streaming repaints without persistence notifications and committed history still restores", async () => {
