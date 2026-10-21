@@ -145,7 +145,7 @@ async function main(): Promise<void> {
       if (shutdown.isClosing) return { consume: true };
       return undefined;
     });
-    await engine.restore(() => controller?.changed(true));
+    await engine.restore((persist = true) => controller?.changed(persist));
     if (shutdown.isClosing) return;
     tui.start();
     const updateDiffBackground = (colors: TerminalColors) => {

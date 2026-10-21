@@ -1000,6 +1000,12 @@ while zz is closed. An interrupted model request may be retried and billed again
 Forced shutdown relies on the last committed durable checkpoint; pending inputs
 were saved before execution. It does not undo effects of tools already executed.
 
+Live-only agent updates repaint without requesting JSON snapshots. Background saves
+serialize and write in one worker, coalesce pending updates, and flush on shutdown;
+accepted inputs and synchronous UI changes retain their recovery checkpoints.
+See [multi-agent performance](docs/performance.md) for the reproducible benchmark,
+before/after results, and memory trade-offs.
+
 **Agents can read/write files and execute shell commands with your permissions.**
 A workspace is not a sandbox. Concurrent sessions sharing a checkout can edit the
 same files. Only use trusted projects and prompts.

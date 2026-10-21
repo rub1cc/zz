@@ -137,7 +137,7 @@ export class WorkspaceAgent {
 
   private async publish(session: Session, id: ConversationId, context: Context): Promise<void> {
     this.sync(session, await this.harness.snapshot(WorkspaceDoc, id, context));
-    this.store.save(); this.host.changed(session);
+    await this.store.saveAsync(); this.host.changed(session);
   }
 
   private async request(args: { create?: { baseRef?: string; branch?: string }; workspaceId?: string }, exit: boolean,

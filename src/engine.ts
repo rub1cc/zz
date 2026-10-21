@@ -61,46 +61,30 @@ function thinkingMessages(message: ModelMessage, id: string): Message[] {
     timestamp: message.timestamp, thinking: { id: `thinking:${id}:${index}`, ...(block.redacted ? { redacted: true } : {}) } }] : []);
 }
 
-export function applyView(session: Session, view: ConversationView, priorUsage?: Usage): void {
+interface ProjectedHistory {
+  messages: Message[];
+  open: Map<string, { index: number; message: Message }>;
+  error?: string;
+  needsInput: boolean;
+}
+
+function projectHistory(entries: ConversationView["entries"], timestamp: number): ProjectedHistory {
   const messages: Message[] = [];
-  const usage = conversationUsage(view.docs["pi.usage"] as UsageState | undefined);
-  session.usage = priorUsage ? sumUsage([priorUsage, usage]) : usage;
-  const inbox = view.docs["pi.inbox"] as InboxState | undefined;
-  const queued = (inbox?.items ?? []).flatMap((item) => {
-    if (item.mode === "write" || item.entry?.kind === "zz.workspace_continue") return [];
-    const skill = item.entry?.kind === "zz.skill" ? skillEntry(item.entry.data) : undefined;
-    const text = skill?.prompt ?? (typeof item.content === "string" ? item.content
-      : item.content.filter((block) => block.type === "text").map((block) => block.text).join("\n"));
-    const imageCount = typeof item.content === "string" ? 0 : item.content.filter((block) => block.type === "image").length;
-    return [{ id: item.id, text, mode: item.mode, ...(imageCount ? { imageCount } : {}) }];
-  });
-  session.queuedInputs = queued.length ? queued : undefined;
-  const live = view.docs["pi.live"] as LiveState | undefined;
-  if (session.work?.finishedAt === undefined && session.work?.outputTokensStart !== undefined) {
-    // Completed attempts move into the ledger atomically as their live partial disappears.
-    session.work.outputTokens = Math.max(0, session.usage.output - session.work.outputTokensStart)
-      + (live?.generation?.message?.usage?.output ?? 0);
-  }
-  session.compactions = live?.compactions?.length ? structuredClone(live.compactions) : undefined;
-  session.compactionFailure = live?.compactionFailure && structuredClone(live.compactionFailure);
-  const agent = view.docs["pi.agent"] as AgentState | undefined;
-  if (agent) session.agent = { model: agent.model, thinkingLevel: agent.thinkingLevel ?? "off" };
   const calls = new Map<string, Message>();
-  const previousError = session.status === "failed" && !session.pendingInput
-    ? session.messages.findLast((m) => m.role === "error")?.text : undefined;
+  const open: ProjectedHistory["open"] = new Map();
   let error: string | undefined;
   let needsInput = false;
-  for (const entry of view.entries) {
+  for (const entry of entries) {
     if (entry.kind === "zz.workspace_continue") continue;
     if (entry.kind === "zz.workspace_failed") {
       const data = entry.data as { message?: string } | undefined;
       error = data?.message ?? "Workspace handoff failed.";
-      messages.push({ role: "error", text: error, timestamp: session.updatedAt });
+      messages.push({ role: "error", text: error, timestamp });
       continue;
     }
     if (entry.kind === "pi.compaction") {
       const reason = entry.data && typeof entry.data === "object" && !Array.isArray(entry.data) ? entry.data.reason : undefined;
-      messages.push({ role: "tool", text: "", timestamp: entry.model?.[0]?.timestamp ?? session.updatedAt, tool: {
+      messages.push({ role: "tool", text: "", timestamp: entry.model?.[0]?.timestamp ?? timestamp, tool: {
         id: `compaction:${entry.id}`, name: "compact", arguments: { reason: reason ?? "manual" },
         output: (entry.model ?? []).map(textOf).join("\n"), status: "done",
       } });
@@ -122,6 +106,7 @@ export function applyView(session: Session, view: ConversationView, priorUsage?:
           } };
           messages.push(call);
         }
+        open.delete(message.toolCallId);
         const tool = call.tool!;
         tool.images = imagesOf(message, typeof tool.arguments.path === "string" ? [tool.arguments.path] : []);
         tool.output = message.content.map((block) => block.type === "text" ? block.text : `[Image: ${block.mimeType}]`).join("\n");
@@ -151,13 +136,71 @@ export function applyView(session: Session, view: ConversationView, priorUsage?:
         for (const call of message.content.filter((block) => block.type === "toolCall")) {
           const card: Message = { role: "tool", text: "", timestamp: message.timestamp, tool: {
             id: `${entry.id}:${call.id}`, name: call.name, arguments: call.arguments, output: "",
-            status: live?.run ? "pending" : "interrupted",
+            status: "interrupted",
           } };
           calls.set(call.id, card);
+          open.set(call.id, { index: messages.length, message: card });
           messages.push(card);
         }
       }
     }
+  }
+  return { messages, open, error, needsInput };
+}
+
+/** The durable view preserves entry identity for live-only document updates. */
+export function createViewProjector(session: Session, priorUsage?: Usage): (view: ConversationView) => boolean {
+  let previous: ConversationView | undefined;
+  let status: Session["status"] | undefined;
+  let history: ProjectedHistory;
+  return (view) => {
+    const committed = view.entries !== previous?.entries;
+    if (committed) history = projectHistory(view.entries, session.updatedAt);
+    applyProjectedView(session, view, priorUsage, history);
+    const persist = committed || session.status !== status
+      || ["pi.agent", "pi.inbox", "pi.usage"].some((key) => view.docs[key] !== previous?.docs[key]);
+    previous = view;
+    status = session.status;
+    return persist;
+  };
+}
+
+export function applyView(session: Session, view: ConversationView, priorUsage?: Usage): void {
+  applyProjectedView(session, view, priorUsage, projectHistory(view.entries, session.updatedAt));
+}
+
+function applyProjectedView(session: Session, view: ConversationView, priorUsage: Usage | undefined, history: ProjectedHistory): void {
+  const messages = history.messages.slice();
+  const usage = conversationUsage(view.docs["pi.usage"] as UsageState | undefined);
+  session.usage = priorUsage ? sumUsage([priorUsage, usage]) : usage;
+  const inbox = view.docs["pi.inbox"] as InboxState | undefined;
+  const queued = (inbox?.items ?? []).flatMap((item) => {
+    if (item.mode === "write" || item.entry?.kind === "zz.workspace_continue") return [];
+    const skill = item.entry?.kind === "zz.skill" ? skillEntry(item.entry.data) : undefined;
+    const text = skill?.prompt ?? (typeof item.content === "string" ? item.content
+      : item.content.filter((block) => block.type === "text").map((block) => block.text).join("\n"));
+    const imageCount = typeof item.content === "string" ? 0 : item.content.filter((block) => block.type === "image").length;
+    return [{ id: item.id, text, mode: item.mode, ...(imageCount ? { imageCount } : {}) }];
+  });
+  session.queuedInputs = queued.length ? queued : undefined;
+  const live = view.docs["pi.live"] as LiveState | undefined;
+  if (session.work?.finishedAt === undefined && session.work?.outputTokensStart !== undefined) {
+    // Completed attempts move into the ledger atomically as their live partial disappears.
+    session.work.outputTokens = Math.max(0, session.usage.output - session.work.outputTokensStart)
+      + (live?.generation?.message?.usage?.output ?? 0);
+  }
+  session.compactions = live?.compactions?.length ? structuredClone(live.compactions) : undefined;
+  session.compactionFailure = live?.compactionFailure && structuredClone(live.compactionFailure);
+  const agent = view.docs["pi.agent"] as AgentState | undefined;
+  if (agent) session.agent = { model: agent.model, thinkingLevel: agent.thinkingLevel ?? "off" };
+  const previousError = session.status === "failed" && !session.pendingInput
+    ? session.messages.findLast((m) => m.role === "error")?.text : undefined;
+  const { error, needsInput } = history;
+  const calls = new Map<string, Message>();
+  for (const [id, pending] of history.open) {
+    const message = { ...pending.message, tool: { ...pending.message.tool!, status: live?.run ? "pending" as const : "interrupted" as const } };
+    messages[pending.index] = message;
+    calls.set(id, message);
   }
   for (const slot of live?.tools ?? []) {
     const tool = calls.get(slot.callId)?.tool;
@@ -213,7 +256,7 @@ export class DurableEngine implements Engine {
   private readonly preparations = new Map<string, AbortController>();
   private undoPending = new Set<string>();
   private readonly taskCleanup: TaskCleanup;
-  private readonly changes = new Map<string, () => void>();
+  private readonly changes = new Map<string, (persist?: boolean) => void>();
 
   private constructor(
     readonly store: Store, readonly harness: Harness, readonly models: Models,
@@ -286,7 +329,7 @@ export class DurableEngine implements Engine {
       || this.store.workspaces.find((w) => w.id === s.workspaceSwitch!.workspaceId)?.path === path));
   }
 
-  async approveWorkspace(session: Session, requestId: string, approved: boolean, changed: () => void): Promise<void> {
+  async approveWorkspace(session: Session, requestId: string, approved: boolean, changed: (persist?: boolean) => void): Promise<void> {
     if (this.closing || this.stopping.has(session.id)) throw new Error("This session is stopping.");
     await this.workspaceAgent.approve(session, requestId, approved, ctx); changed();
   }
@@ -338,10 +381,10 @@ export class DurableEngine implements Engine {
     if (conversation) await conversation.configure(next, ctx);
     if (session) session.agent = next;
     else this.store.state.defaults = next;
-    this.store.save();
+    await this.store.saveAsync();
   }
 
-  async restore(changed: () => void): Promise<void> {
+  async restore(changed: (persist?: boolean) => void): Promise<void> {
     // Reconnect a conversation if a crash happened between its commit and saving the UI index.
     let cursor: Cursor | undefined;
     do {
@@ -361,7 +404,7 @@ export class DurableEngine implements Engine {
         await this.observe(session, conversation, changed);
       }
     }
-    this.store.save();
+    await this.store.saveAsync();
     // Complete a restore interrupted between filesystem writes and the conversation fork.
     for (const session of this.store.state.sessions) {
       const conversation = this.handles.get(session.id);
@@ -382,7 +425,7 @@ export class DurableEngine implements Engine {
         }
       }
     }
-    this.store.save();
+    await this.store.saveAsync();
     for (const session of this.store.state.sessions) {
       if (session.stopped) { await this.cancel(session.id); continue; }
       const inputs = [session.pendingInput, ...(session.followUps ?? [])].filter((input): input is PendingInput => !!input);
@@ -408,7 +451,7 @@ export class DurableEngine implements Engine {
     }
   }
 
-  private async observe(session: Session, conversation: Conversation, changed: () => void): Promise<void> {
+  private async observe(session: Session, conversation: Conversation, changed: (persist?: boolean) => void): Promise<void> {
     this.changes.set(session.id, changed);
     if (this.views.has(session.id)) return;
     // Conversation views mount only built-in docs; observe our checklist separately.
@@ -448,7 +491,7 @@ export class DurableEngine implements Engine {
           const context = await conversation.context(ctx);
           if (current === revision && !this.closing) {
             session.context = contextEstimate(context);
-            changed();
+            changed(false);
           }
         } while (current !== revision && !this.closing);
       })().catch((error: unknown) => { if (!this.closing && !this.stopping.has(session.id)) this.report(error); })
@@ -456,13 +499,14 @@ export class DurableEngine implements Engine {
       this.contextUpdates.set(session.id, update);
       return update;
     };
-    applyView(session, view.value, priorUsage);
+    const project = createViewProjector(session, priorUsage);
+    project(view.value);
     this.workspaceAgent.decorate(session);
     view.subscribe((value) => {
-      applyView(session, value, priorUsage);
+      const persist = project(value);
       this.workspaceAgent.decorate(session);
       if (value.entries !== entries) { entries = value.entries; void refresh(); }
-      changed();
+      changed(persist);
     });
     this.views.set(session.id, { get value() { return view.value; }, dispose: () => {
       this.taskCleanup.forget(conversation.id); view.dispose(); tasks.dispose(); workspace.dispose();
@@ -470,7 +514,7 @@ export class DurableEngine implements Engine {
     await refresh();
   }
 
-  private startTitle(session: Session, prompt: string, changed: () => void): void {
+  private startTitle(session: Session, prompt: string, changed: (persist?: boolean) => void): void {
     if (this.closing || this.stopping.has(session.id) || session.titleRenamed) return;
     const ref = this.configuration(session).model;
     const model = ref && this.models.getModel(ref.provider, ref.modelId);
@@ -480,18 +524,18 @@ export class DurableEngine implements Engine {
     const done = generateSessionTitle(this.models, model, prompt, abort.signal, (usage) => {
       if (this.closing) return;
       session.titleUsage = structuredClone(usage);
-      this.store.save();
+      void this.store.saveAsync().catch(this.report);
       changed();
-    }).then((title) => {
+    }).then(async (title) => {
       if (!title || abort.signal.aborted || this.closing || this.stopping.has(session.id) || session.titleRenamed || session.title !== original) return;
       session.title = title;
-      this.store.save();
+      await this.store.saveAsync();
       changed();
     }).catch((error: unknown) => { this.report(error); }).finally(() => { this.titles.delete(session.id); });
     this.titles.set(session.id, { abort, done });
   }
 
-  async run(session: Session, project: Project, prompt: string, changed: () => void, images: ImageAttachment[] = []): Promise<void> {
+  async run(session: Session, project: Project, prompt: string, changed: (persist?: boolean) => void, images: ImageAttachment[] = []): Promise<void> {
     if (this.closing) throw new Error("zz is closing.");
     if (!session.workspaceId) this.store.assignWorkspace(session, project);
     if (this.undoWorkspaces.has(this.store.workspaceKey(session))) throw new Error("This workspace is being restored. Wait for /undo to finish.");
@@ -504,6 +548,7 @@ export class DurableEngine implements Engine {
     const input: PendingInput = { requestId: randomUUID(), prompt, ...(images.length ? { images: structuredClone(images) } : {}), whenBusy: this.store.settings.replyBehavior };
     if (!session.pendingInput) session.pendingInput = input;
     else (session.followUps ??= []).push(input);
+    // send() acknowledges synchronously: accepted input must already survive a crash.
     this.store.save();
     return this.startInput(session, project, input, changed);
   }
@@ -514,7 +559,7 @@ export class DurableEngine implements Engine {
     if (!session.followUps?.length) delete session.followUps;
   }
 
-  private startInput(session: Session, project: Project, input: PendingInput, changed: () => void): Promise<void> {
+  private startInput(session: Session, project: Project, input: PendingInput, changed: (persist?: boolean) => void): Promise<void> {
     const previous = this.admissions.get(session.id) ?? Promise.resolve();
     const admitted = previous.then(() => this.admit(session, project, input, changed));
     // Only admission is serialized. Waiting here would turn this into a host-side queue.
@@ -533,20 +578,20 @@ export class DurableEngine implements Engine {
     }).catch((error: unknown) => {
       if (!this.closing) this.removeInput(session, input);
       this.failure(session, error);
-    }).finally(() => {
+    }).finally(async () => {
       runs.delete(promise);
       if (!runs.size) {
         this.active.delete(session.id);
         if (!this.closing) finishWork(session);
       }
-      this.store.save();
+      await this.store.saveAsync();
       changed();
     });
     runs.add(promise);
     return promise;
   }
 
-  private async admit(session: Session, project: Project, input: PendingInput, changed: () => void): Promise<Submission | undefined> {
+  private async admit(session: Session, project: Project, input: PendingInput, changed: (persist?: boolean) => void): Promise<Submission | undefined> {
     if (this.closing || this.stopping.has(session.id)) return;
     const preparation = new AbortController();
     this.preparations.set(session.id, preparation);
@@ -565,7 +610,7 @@ export class DurableEngine implements Engine {
       const prepared = await this.skills.prepare(cwd, input.prompt);
       input.images = [...(input.images ?? []), ...images];
       input.prepared = prepared;
-      this.store.save();
+      await this.store.saveAsync();
     }
     if (input.images?.length) {
       if (!this.supportsImages(session)) throw new Error("This model does not accept images. Choose an image-capable model with /model, then resend.");
@@ -587,7 +632,7 @@ export class DurableEngine implements Engine {
       this.handles.set(session.id, conversation);
       const latestThinking = clampThinkingLevel(model, this.configuration(session).thinkingLevel);
       if (latestThinking !== config.thinkingLevel) await conversation.configure({ thinkingLevel: latestThinking }, ctx);
-      this.store.save();
+      await this.store.saveAsync();
       this.startTitle(session, input.prompt, changed);
     }
     if (this.closing || this.stopping.has(session.id)) return;
@@ -598,7 +643,7 @@ export class DurableEngine implements Engine {
     }, ctx);
   }
 
-  compact(session: Session, instructions: string | undefined, changed: () => void): Promise<CompactResult> {
+  compact(session: Session, instructions: string | undefined, changed: (persist?: boolean) => void): Promise<CompactResult> {
     if (this.undoWorkspaces.has(this.store.workspaceKey(session)) || this.pendingUndo(this.store.workspaceKey(session))) return Promise.reject(new Error("Finish /undo before compacting this session."));
     if (this.closing) return Promise.reject(new Error("zz is closing."));
     if (session.workspaceSwitch) return Promise.reject(new Error("Finish the workspace handoff before compacting."));
@@ -608,16 +653,16 @@ export class DurableEngine implements Engine {
     }
     const conversation = this.handles.get(session.id);
     if (!conversation) return Promise.reject(new Error("No conversation to compact. Send a task first."));
-    const promise = this.compactConversation(session, conversation, instructions, changed).finally(() => {
+    const promise = this.compactConversation(session, conversation, instructions, changed).finally(async () => {
       this.manualCompactions.delete(session.id);
-      this.store.save();
+      await this.store.saveAsync();
       changed();
     });
     this.manualCompactions.set(session.id, promise);
     return promise;
   }
 
-  private async compactConversation(session: Session, conversation: Conversation, instructions: string | undefined, changed: () => void): Promise<CompactResult> {
+  private async compactConversation(session: Session, conversation: Conversation, instructions: string | undefined, changed: (persist?: boolean) => void): Promise<CompactResult> {
     try {
       await this.observe(session, conversation, changed);
       if (this.closing || this.stopping.has(session.id)) return "aborted";
@@ -655,7 +700,7 @@ export class DurableEngine implements Engine {
     return conversation ? this.undoHistory.checkpoints(conversation.id) : [];
   }
 
-  undo(session: Session, checkpointId: string, changed: () => void): Promise<UndoResult> {
+  undo(session: Session, checkpointId: string, changed: (persist?: boolean) => void): Promise<UndoResult> {
     if (this.store.state.sessions.some((other) => this.store.workspaceKey(other) === this.store.workspaceKey(session) && other.id !== session.id && this.undoPending.has(other.id))) {
       return Promise.reject(new Error("Finish the interrupted /undo in this workspace's other session first."));
     }
@@ -672,7 +717,7 @@ export class DurableEngine implements Engine {
     return promise;
   }
 
-  private async undoSession(session: Session, checkpointId: string, changed: () => void): Promise<UndoResult> {
+  private async undoSession(session: Session, checkpointId: string, changed: (persist?: boolean) => void): Promise<UndoResult> {
     const conversation = this.handles.get(session.id);
     if (!conversation) throw new Error("Nothing to undo. Send a task first.");
     for (const other of this.store.state.sessions.filter((item) => this.store.workspaceKey(item) === this.store.workspaceKey(session))) {
@@ -735,7 +780,7 @@ export class DurableEngine implements Engine {
     this.undoPending.delete(session.id);
     session.preview = "Undone. Edit or resend your prompt to continue.";
     session.updatedAt = Date.now();
-    this.store.save();
+    await this.store.saveAsync();
     changed();
     return { ...restored, prompt: point.prompt };
   }
@@ -759,7 +804,7 @@ export class DurableEngine implements Engine {
         // Persist stop intent before aborting so a restart never resubmits this input.
         session.stopped = true;
         session.preview = "Stopping...";
-        this.store.save();
+        await this.store.saveAsync();
       }
       if (session) await this.workspaceAgent.cancel(session, ctx);
       const title = this.titles.get(sessionId);
@@ -768,7 +813,7 @@ export class DurableEngine implements Engine {
         ? await this.harness.conversation(session.conversationId as ConversationId, ctx) : undefined);
       await Promise.all([conversation?.abort(ctx, { background: true }), ...(running ?? []), title?.done, this.manualCompactions.get(sessionId)?.catch(() => {})]);
       await this.contextUpdates.get(sessionId);
-      if (session?.stopped) { markStopped(session); this.store.save(); }
+      if (session?.stopped) { markStopped(session); await this.store.saveAsync(); }
     } finally { this.stopping.delete(sessionId); }
   }
 
@@ -801,6 +846,7 @@ export class DurableEngine implements Engine {
         for (const view of this.views.values()) view.dispose();
         this.views.clear();
         this.changes.clear();
+        await this.store.close();
       }
     })();
     return this.closePromise;
