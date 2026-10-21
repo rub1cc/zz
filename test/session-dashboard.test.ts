@@ -38,12 +38,35 @@ test("dashboard nests normal worker sessions and distinguishes waiting from work
     assert.equal(displayStatus(f.coordinator), "waiting"); assert.match(workLabel(f.coordinator)!, /Waiting on 2 sessions/);
     const screen = f.screen();
     assert.match(screen, /Checkout flow \[3 workers\]/); assert.match(screen, /1 waiting/);
-    assert.match(screen, /\|- .*Frontend/); assert.match(screen, /Waiting on 2 sessions/);
+    assert.match(screen, /├─ .*Frontend/); assert.match(screen, /├─ .*Backend/);
+    assert.match(screen, /└─ .*Review/); assert.match(screen, /Waiting on 2 sessions/);
     for (const width of [1, 12, 32, 80, 120]) {
       f.terminal.columns = width; f.terminal.onResize(); f.screen();
       assert.ok(f.tui.getScreenLines().every((line) => visibleWidth(line) <= width));
     }
     f.coordinator.stopped = true; assert.equal(displayStatus(f.coordinator), "completed");
+  } finally { await f.cleanup(); }
+});
+
+test("tree gutters continue ancestor branches and reset between top-level sessions and projects", async () => {
+  const f = fixture();
+  try {
+    const grandchild: Session = { ...f.review, id: "API review", title: "API review",
+      delegation: { parentId: f.frontend.id, taskId: "api-review" } };
+    const lastGrandchild: Session = { ...grandchild, id: "Final review", title: "Final review",
+      delegation: { parentId: f.review.id, taskId: "final-review" } };
+    const otherPath = join(f.root, "other-project"); mkdirSync(otherPath);
+    const otherProject = f.store.addProject(otherPath);
+    const otherRoot: Session = { ...f.independent, id: "Other root", title: "Other root", projectId: otherProject.id };
+    const otherChild: Session = { ...grandchild, id: "Other worker", title: "Other worker", projectId: otherProject.id,
+      delegation: { parentId: otherRoot.id, taskId: "other-worker" } };
+    f.store.state.sessions.push(grandchild, lastGrandchild, otherRoot, otherChild);
+    const lines = f.app.body.render(160).map(stripTerminalSequences);
+    assert.match(lines.find((line) => line.includes("API review"))!, /^  │  └─ .*API review/);
+    assert.match(lines.find((line) => line.includes("Final review"))!, /^     └─ .*Final review/);
+    assert.match(lines.find((line) => line.includes("Fix flaky tests"))!, /^  ∙ Fix flaky tests/);
+    assert.match(lines.find((line) => line.includes("Other worker"))!, /^  └─ .*Other worker/);
+    assert.ok(lines.every((line) => !line.includes("|-")));
   } finally { await f.cleanup(); }
 });
 
@@ -57,6 +80,8 @@ test("Tab folds workers without hiding questions; Enter and Space still open and
     assert.equal(f.c.currentRows.some((row) => row.kind === "session" && row.session.id === f.backend.id), false);
     assert.equal(f.c.currentRows.some((row) => row.kind === "session" && row.session.id === f.frontend.id), true);
     assert.match(f.screen(), /\[\+3 workers\]/);
+    assert.match(f.screen(), /└─ .*Frontend/);
+    assert.doesNotMatch(f.screen(), /├─/);
     f.c.select(`session:${f.frontend.id}`); f.terminal.onInput(" ");
     assert.equal(f.c.dialog?.kind, "peek"); f.c.dialog = undefined; f.c.changed();
     f.terminal.onInput("\r"); assert.equal(f.c.openedSessionId, f.frontend.id);
