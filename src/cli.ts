@@ -4,17 +4,10 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import lockfile from "proper-lockfile";
-import { matchesKey, ProcessTerminal, TuiAltScreen, type TerminalColors } from "@earendil-works/pi-tui";
-import { Controller } from "./controller.js";
-import { DurableEngine } from "./engine.js";
-import { Store } from "./store.js";
-import { Dashboard, scrollToEndIndicator } from "./ui.js";
-import { displayStatus } from "./model.js";
-import { loadPi } from "./pi.js";
-import { cancelExternalEditor, isExternalEditorOpen } from "./external-editor.js";
-import { setStatusColors, statusRefreshInterval } from "./format.js";
-import { createShutdown } from "./shutdown.js";
-import { setDiffBackground } from "./diff-background.js";
+import type { TuiAltScreen, TerminalColors } from "@earendil-works/pi-tui";
+import type { Controller } from "./controller.js";
+import type { DurableEngine } from "./engine.js";
+import type { Dashboard } from "./ui.js";
 import { upgrade } from "./upgrade.js";
 import { version } from "./version.js";
 
@@ -86,6 +79,18 @@ async function main(): Promise<void> {
   }
   if (positionals.length > 1) throw new Error("Pass at most one project directory.");
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("An interactive terminal is required. Use zz --help for usage.");
+  // Non-interactive commands must not initialize the runtime or load SQLite.
+  const [
+    { matchesKey, ProcessTerminal, TuiAltScreen }, { Controller }, { DurableEngine },
+    { Store }, { Dashboard, scrollToEndIndicator }, { displayStatus }, { loadPi },
+    { cancelExternalEditor, isExternalEditorOpen }, { setStatusColors, statusRefreshInterval },
+    { createShutdown }, { setDiffBackground },
+  ] = await Promise.all([
+    import("@earendil-works/pi-tui"), import("./controller.js"), import("./engine.js"),
+    import("./store.js"), import("./ui.js"), import("./model.js"), import("./pi.js"),
+    import("./external-editor.js"), import("./format.js"), import("./shutdown.js"),
+    import("./diff-background.js"),
+  ]);
   const root = resolve(values["data-dir"] ?? process.env.ZZ_DATA_DIR ?? join(homedir(), ".zz"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
   let release: () => Promise<void>;

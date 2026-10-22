@@ -6,6 +6,14 @@ import { pathToFileURL } from "node:url";
 import { test } from "node:test";
 import { temporary } from "./helpers.js";
 
+const rejectSqlite = `data:text/javascript,${encodeURIComponent(`
+  import { registerHooks } from "node:module";
+  registerHooks({ resolve(specifier, context, nextResolve) {
+    if (specifier === "node:sqlite") throw new Error("Non-interactive CLI loaded SQLite");
+    return nextResolve(specifier, context);
+  } });
+`)}`;
+
 for (const mode of ["default", "xdg", "env", "flag"] as const) {
   test(`CLI data directory uses ${mode === "default" || mode === "xdg" ? "~/.zz" : mode} (${mode})`, () => {
     const temp = temporary();
@@ -36,10 +44,11 @@ for (const mode of ["default", "xdg", "env", "flag"] as const) {
 }
 
 test("CLI help documents upgrade without running the installer", () => {
-  const result = spawnSync(process.execPath, ["--import", "tsx", "src/cli.ts", "upgrade", "--help"], {
+  const result = spawnSync(process.execPath, ["--import", "tsx", "--import", rejectSqlite, "src/cli.ts", "upgrade", "--help"], {
     encoding: "utf8", timeout: 20000,
   });
   assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, "");
   assert.match(result.stdout, /zz upgrade checks for updates and installs only a newer release/);
   assert.match(result.stdout, /zz --version/);
   assert.doesNotMatch(result.stdout, /Downloading zz/);
@@ -49,7 +58,7 @@ for (const flag of ["--version", "-v"]) {
   test(`CLI ${flag} prints the package version without a TTY or data directory`, () => {
     const temp = temporary();
     try {
-      const result = spawnSync(process.execPath, ["--import", "tsx", "src/cli.ts", flag], {
+      const result = spawnSync(process.execPath, ["--import", "tsx", "--import", rejectSqlite, "src/cli.ts", flag], {
         encoding: "utf8", timeout: 20000,
         env: { ...process.env, ZZ_DATA_DIR: join(temp.root, "unused-data") },
       });
