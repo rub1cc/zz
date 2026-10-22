@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import { Markdown, visibleWidth, wrapTextWithAnsi, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
+import { renderWorkerNotification, workerUpdatePreview } from "./worker-notification.js";
 import { renderShellResponse } from "./shell-response.js";
 import { ImageDisplay } from "./image-display.js";
 import type { Controller } from "./controller.js";
@@ -317,6 +318,12 @@ export class Transcript implements Component {
           continue;
         }
       }
+      if (message.role === "user" && message.source?.kind === "notification") {
+        lines.push(...renderWorkerNotification(message.text, message.workerUpdates, width));
+        if (message.images?.length) lines.push(...this.images.render(message.images, `message:${index}:${message.timestamp}`, Math.max(1, width)));
+        lines.push("");
+        continue;
+      }
       const contentWidth = Math.max(1, width - (width > 2 ? 2 : 0));
       if (message.role === "user") {
         if (message.source) lines.push(...wrapTextWithAnsi(dim(message.source.kind === "notification" ? "Orchestration" : `From ${oneLine(message.source.title)} (agent)`), Math.max(1, width)));
@@ -357,6 +364,10 @@ export class Transcript implements Component {
       const label = agent ? "Queued agent messages" : modes.size > 1 ? "Queued messages" : modes.has("steer") ? "Queued steering" : "Queued follow-ups";
       lines.push(...wrapTextWithAnsi(accent(`${label} (${inputs.length})`), Math.max(1, width)));
       for (const [index, input] of inputs.entries()) {
+        if (input.source?.kind === "notification") {
+          lines.push(...renderWorkerNotification(input.text, input.workerUpdates, width));
+          continue;
+        }
         if (input.source) lines.push(...wrapTextWithAnsi(dim(`From ${oneLine(input.source.title)} (agent ${input.source.kind})`), Math.max(1, width)));
         const mode = agent || modes.size > 1 ? `[${input.mode === "steer" ? "steer" : "follow-up"}] ` : "";
         for (const [lineIndex, source] of plain(`${input.text}${input.imageCount ? ` [${input.imageCount} image${input.imageCount === 1 ? "" : "s"}]` : ""}`).split("\n").entries()) {
@@ -373,7 +384,7 @@ export class Transcript implements Component {
       for (const update of updates.slice(-10)) {
         const title = Array.from(oneLine(update.title));
         const heading = `${title.length > 60 ? title.slice(0, 57).join("") + "..." : title.join("")} - ${update.kind} (${update.delivery})`;
-        const content = Array.from(`${heading}: ${oneLine(update.message).trim()}`);
+        const content = Array.from(`${heading}: ${oneLine(workerUpdatePreview(update)).trim()}`);
         const hint = "... [truncated; session_read for details]";
         const preview = content.length > 240 ? content.slice(0, 240 - hint.length).join("") + hint : content.join("");
         lines.push(...wrapTextWithAnsi(update.kind === "blocker" ? warning(preview) : dim(preview), Math.max(1, width)));
