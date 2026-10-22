@@ -409,7 +409,7 @@ export class SessionAgent {
         const item = submission && inbox.items.find((item) => item.id === submission.id);
         if (item && item.mode !== "write") {
           item.content = this.notificationContent(command.prompt);
-          if (item.entry?.kind === "zz.agent_input") item.entry.data = { source: command.source!, prompt: command.prompt };
+          if (item.entry?.kind === "zz.agent_input") item.entry.data = { source: command.source!, prompt: command.prompt, workerUpdates: JSON.parse(JSON.stringify(updates)) };
         }
       }
       doc.commands[id] = command;
@@ -431,10 +431,13 @@ export class SessionAgent {
   }
 
   /** Observation and native admission share one ordering boundary; neither can use a stale result snapshot. */
-  admitNotification<T>(parent: Session, id: string, submit: (command: SessionCommand) => Promise<T>): Promise<T | undefined> {
+  admitNotification<T>(parent: Session, id: string, submit: (command: SessionCommand, updates: WorkerUpdate[]) => Promise<T>): Promise<T | undefined> {
     return this.withMailbox(parent, async () => {
       const command = await this.prepareNotification(parent, id);
-      return command ? submit(command) : undefined;
+      if (!command) return;
+      const doc = await this.harness.snapshot(SessionsDoc, parent.conversationId as ConversationId, ctx);
+      const updates = (doc?.workerUpdates ?? []).filter((update) => command.workerUpdateIds?.includes(update.id));
+      return submit(command, structuredClone(updates));
     });
   }
 

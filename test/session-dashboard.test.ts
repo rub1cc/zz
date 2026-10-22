@@ -102,7 +102,8 @@ test("peer messages and orchestration notices are distinguishable from human mes
     f.c.openedSessionId = f.backend.id; f.c.mode = "session";
     const transcript = new Transcript(f.c, () => {});
     const text = transcript.render(100).map(stripTerminalSequences).join("\n");
-    assert.match(text, /Human instruction/); assert.match(text, /From Frontend \(agent\)/); assert.match(text, /Orchestration/);
+    assert.match(text, /Human instruction/); assert.match(text, /From Frontend \(agent\)/); assert.match(text, /Session update/);
+    assert.doesNotMatch(text, /❯ Review completed/);
     assert.deepEqual([...transcript.prompts.values()], ["Human instruction"], "Sticky prompts must not relabel peer messages as human instructions");
     for (const width of [1, 12, 40]) assert.ok(transcript.render(width).every((line) => visibleWidth(line) <= width));
     f.store.save(); const stored = new Store(f.store.root);

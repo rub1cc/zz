@@ -128,3 +128,20 @@ test("cached projections preserve agent provenance without duplicating tool card
   assert.equal(s.messages.find((message) => message.tool)?.tool?.output, "second");
   assert.equal(s.messages.filter((message) => message.tool).length, 1);
 });
+
+
+test("notification display snapshots project through history and native queues without replacing model text", () => {
+  const source = { sessionId: "parent", title: "Worker updates", kind: "notification" };
+  const updates = [{ id: "event", sessionId: "worker", title: "Worker", taskId: "task", runId: 1, timestamp: 1,
+    kind: "result", message: "Transport JSON", delivery: "delivered", result: { sessionId: "worker", title: "Worker", status: "completed", result: "Readable result", resultTruncated: false } }];
+  const data = { source, prompt: "Original transport prompt", workerUpdates: updates };
+  const entry = { id: 1, kind: "zz.agent_input", data, model: [{ role: "user", content: "Agent-authored safety envelope", timestamp: 1 }] };
+  const current = view([entry], {}, { "pi.inbox": { items: [{ id: 2, mode: "followUp", content: "Model input remains unchanged", entry: { kind: "zz.agent_input", data } }] } });
+  const s = session(); applyView(s, current);
+  assert.equal(s.messages[0]?.text, data.prompt);
+  assert.deepEqual(s.messages[0]?.workerUpdates, updates);
+  assert.deepEqual(s.queuedInputs?.[0]?.workerUpdates, updates);
+  assert.equal(s.queuedInputs?.[0]?.text, data.prompt);
+  assert.equal(entry.model[0]!.content, "Agent-authored safety envelope");
+  assert.equal(current.docs["pi.inbox"] && JSON.stringify(current.docs["pi.inbox"]).includes("Model input remains unchanged"), true);
+});

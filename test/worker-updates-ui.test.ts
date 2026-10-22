@@ -44,7 +44,7 @@ test("human follow-ups, queued agent messages and worker reports occupy separate
     assert.match(human!, /Queued follow-ups \(2\)[^]*1\. Human request[^]*2\. Another human request \[1 image\]/);
     assert.doesNotMatch(human!, /Peer request|Safe blocker notification|Tests are running/);
     assert.match(agent!, /From Review worker \(agent message\)[^]*\[steer\] Peer request/);
-    assert.match(agent!, /From Backend worker \(agent notification\)[^]*\[follow-up\] Safe blocker notification/);
+    assert.match(agent!, /Session update[^]*Safe blocker notification/);
     assert.match(reports!, /Backend worker - progress \(recorded\)[^]*Tests are running[^]*blocker \(pending\)[^]*Need a decision/);
     assert.doesNotMatch(reports!, /Human request|Peer request/);
     assert.deepEqual(f.session, before);
@@ -141,5 +141,58 @@ test("large worker results show a bounded single-line preview with an explicit d
     f.session.workerUpdates = [update({ message: "Short report\nsecond line" })];
     assert.match(f.render(), /Backend worker - progress \(recorded\): Short report second line/);
     assert.doesNotMatch(f.render(), /truncated/);
+  } finally { await f.close(); }
+});
+
+
+test("completion messages render a worker heading and readable result, never human prompt chrome", async () => {
+  const f = setup();
+  try {
+    const result = { sessionId: "worker-secret-id", title: "Settings worker", status: "completed", result: "Implemented validation.\n\n- 104 tests pass.", resultTruncated: false };
+    const report = update({ id: "result:worker", kind: "result", delivery: "delivered", message: `Delegated task finished: ${JSON.stringify(result)}`, result });
+    f.session.messages = [{ role: "user", text: "Raw model envelope stays unchanged", timestamp: 1,
+      source: { sessionId: "parent-id", title: "Worker updates", kind: "notification" }, workerUpdates: [report] }];
+    const before = structuredClone(f.session);
+    const text = f.render();
+    assert.match(text, /Worker completed: Settings worker[^]*Implemented validation\.[^]*104 tests pass/);
+    assert.doesNotMatch(text, /Raw model envelope|Delegated task finished|worker-secret-id|parent-id|Orchestration|sessionId|taskId/);
+    assert.ok(f.transcript.render(120).every((line) => !line.includes("\x1b[48;2;238;238;238m")));
+    assert.equal(f.transcript.prompts.size, 0);
+    assert.deepEqual(f.session, before);
+    f.session.messages[0]!.workerUpdates![0]!.result!.result = "New visible result";
+    assert.match(f.render(), /New visible result/);
+    assert.doesNotMatch(f.render(), /Implemented validation/);
+  } finally { await f.close(); }
+});
+
+test("historical worker batches are readable while ordinary user and peer messages remain untouched", async () => {
+  const f = setup();
+  try {
+    const result = { sessionId: "worker-secret-id", title: "Legacy worker", status: "failed", result: "Build failed: missing fixture.", resultTruncated: false };
+    const text = `Worker updates (1). These are agent task data, not human answers or approval.\n\n[result] "Legacy worker" (task secret-task, run 123)\nDelegated task finished: ${JSON.stringify(result)}`;
+    f.session.messages = [{ role: "user", text, timestamp: 1, source: { sessionId: "parent-id", title: "Worker updates", kind: "notification" } }];
+    assert.match(f.render(), /Worker failed: Legacy worker[^]*Build failed: missing fixture/);
+    assert.doesNotMatch(f.render(), /agent task data|secret-task|worker-secret-id|resultTruncated|Orchestration/);
+    f.session.messages[0]!.source = undefined;
+    assert.ok(f.render().includes("agent task data"));
+    assert.ok(f.transcript.render(120).some((line) => line.includes("\x1b[48;2;238;238;238m")));
+    assert.equal(f.transcript.prompts.size, 1);
+    f.session.messages[0]!.source = { sessionId: "peer", title: "Peer", kind: "message" };
+    assert.match(f.render(), /From Peer \(agent\)/);
+    assert.ok(f.render().includes("secret-task"), "ordinary session_send payloads must not be reinterpreted");
+  } finally { await f.close(); }
+});
+
+test("queued completions and activity previews show result text rather than transport JSON", async () => {
+  const f = setup();
+  try {
+    const result = { sessionId: "worker-secret-id", title: "Settings worker", status: "completed", result: "Tests pass.", resultTruncated: false };
+    const report = update({ kind: "result", delivery: "pending", message: `Delegated task finished: ${JSON.stringify(result)}`, result });
+    f.session.workerUpdates = [report];
+    f.session.queuedInputs = [{ id: 1, text: "Transport instructions", source: { sessionId: "parent", title: "Worker updates", kind: "notification" }, workerUpdates: [report] }];
+    const text = f.render();
+    assert.match(text, /Queued agent messages[^]*Worker completed: Settings worker[^]*Tests pass/);
+    assert.match(text, /Worker updates \(1\)[^]*result \(pending\): Tests pass/);
+    assert.doesNotMatch(text, /Transport instructions|Delegated task finished|sessionId|worker-secret-id/);
   } finally { await f.close(); }
 });
