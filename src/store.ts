@@ -77,6 +77,7 @@ function isState(value: unknown): value is State {
         !!input && Number.isSafeInteger(input.id) && input.id >= 0 && typeof input.text === "string"
         && (input.mode === undefined || isReplyBehavior(input.mode))
         && (input.source === undefined || isInputSource(input.source))
+        && (input.workerUpdates === undefined || Array.isArray(input.workerUpdates) && input.workerUpdates.every(isWorkerUpdate))
         && (input.imageCount === undefined || Number.isSafeInteger(input.imageCount) && input.imageCount >= 0)))
       && typeof s.title === "string" && typeof s.preview === "string"
       && (s.titleRenamed === undefined || typeof s.titleRenamed === "boolean")
@@ -101,6 +102,7 @@ function isState(value: unknown): value is State {
       && Array.isArray(s.messages) && s.messages.every((m) => typeof m.text === "string"
         && ["user", "assistant", "tool", "error", "thinking"].includes(m.role) && Number.isFinite(m.timestamp)
         && (m.source === undefined || isInputSource(m.source))
+        && (m.workerUpdates === undefined || Array.isArray(m.workerUpdates) && m.workerUpdates.every(isWorkerUpdate))
         && (m.thinking === undefined || !!m.thinking && typeof m.thinking.id === "string"
           && (m.thinking.redacted === undefined || typeof m.thinking.redacted === "boolean"))
         && (m.images === undefined || isImages(m.images))

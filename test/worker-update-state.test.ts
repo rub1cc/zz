@@ -14,13 +14,15 @@ test("worker presentation caches and queue provenance round-trip and reject malf
     const update: WorkerUpdate = { id: "result:worker", sessionId: "worker", title: "Worker", taskId: "task", runId: 1,
       kind: "result", message: "Done", timestamp: 2, delivery: "acknowledged", result, waitResults: [result], observedSessionIds: ["worker"] };
     const session: Session = { id: "coordinator", projectId: project.id, title: "Coordinator", preview: "Done", createdAt: 1, updatedAt: 2,
-      status: "completed", messages: [], workerUpdates: [update], delegation: { parentId: "owner", taskId: "task", runId: 1 },
-      queuedInputs: [{ id: 1, text: "Peer message", source: { sessionId: "peer", title: "Peer", kind: "message" } }] };
+      status: "completed", messages: [{ role: "user", text: "Transport", timestamp: 2, source: { sessionId: "owner", title: "Worker updates", kind: "notification" }, workerUpdates: [update] }], workerUpdates: [update], delegation: { parentId: "owner", taskId: "task", runId: 1 },
+      queuedInputs: [{ id: 1, text: "Peer message", workerUpdates: [update], source: { sessionId: "peer", title: "Peer", kind: "message" } }] };
     store.state.sessions.push(session); store.save();
     assert.deepEqual(new Store(temp.root).state.sessions[0], session);
     const saved = readFileSync(store.file, "utf8");
     for (const change of [
       (session: Session) => { session.workerUpdates = [null as never]; },
+      (session: Session) => { session.messages[0]!.workerUpdates = [null as never]; },
+      (session: Session) => { session.queuedInputs![0]!.workerUpdates = [null as never]; },
       (session: Session) => { session.workerUpdates![0]!.delivery = "invented" as never; },
       (session: Session) => { session.workerUpdates![0]!.runId = null as never; },
       (session: Session) => { session.workerUpdates![0]!.result!.resultTruncated = "yes" as never; },

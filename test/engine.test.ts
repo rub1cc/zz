@@ -2766,12 +2766,17 @@ test("session delegation uses an isolated normal session, explicit context, mode
     assert.ok(contexts.filter((c) => c.messages.some((m) => m.role === "user" && typeof m.content === "string" && m.content.startsWith("Agent-authored delegation")))
       .every((c) => !c.messages.some((m) => m.role === "user" && m.content === "private parent history")));
     assert.equal(parent.messages.filter((m) => m.source?.kind === "notification").length, 1);
+    const notification = parent.messages.find((m) => m.source?.kind === "notification")!;
+    assert.equal(notification.workerUpdates?.find((update) => update.result)?.result?.sessionId, child.id);
+    assert.ok(contexts.some((context) => context.messages.some((message) => message.role === "user" && typeof message.content === "string"
+      && message.content.startsWith("Agent-authored notification") && message.content.includes("Worker updates (1)"))), "display metadata must not replace the model transport prompt");
     assert.equal(child.messages[0]?.source?.kind, "delegation"); assert.equal(parent.waitingFor, undefined);
     await engine.close();
     const store = new Store(f.store.root);
     engine = await openEngine(store, undefined, (e) => errors.push(e), orchestrationModels()); await engine.restore(() => {}); await orchestrationIdle(engine);
     assert.equal(store.state.sessions.length, 2);
     assert.equal(store.state.sessions.find((s) => s.id === parent.id)?.messages.filter((m) => m.source?.kind === "notification").length, 1);
+    assert.deepEqual(store.state.sessions.find((s) => s.id === parent.id)?.messages.find((m) => m.source?.kind === "notification")?.workerUpdates, notification.workerUpdates);
     assert.equal(store.state.sessions.find((s) => s.id === child.id)?.delegation?.parentId, parent.id);
     assert.deepEqual(errors, []);
   } finally { await engine.close(); f.cleanup(); }
@@ -3135,6 +3140,10 @@ test("result reads atomically rewrite partial native batches and withdraw empty 
     assert.equal(remainder.mode, "followUp");
     assert.ok("content" in remainder && typeof remainder.content === "string" && !remainder.content.includes(workers[0]!.id));
     assert.equal((await queued.status(BACKGROUND_CONTEXT)).status, "queued");
+    assert.ok("entry" in remainder && remainder.entry?.kind === "zz.agent_input");
+    const display = remainder.entry!.data as { workerUpdates: import("../src/model.js").WorkerUpdate[] };
+    assert.equal(display.workerUpdates.length, 2);
+    assert.ok(display.workerUpdates.every((update) => update.sessionId !== workers[0]!.id), "queued display snapshots must follow partial acknowledgment too");
     await read.execute({ sessionId: workers[1]!.id }, api, BACKGROUND_CONTEXT);
     await read.execute({ sessionId: workers[2]!.id }, api, BACKGROUND_CONTEXT);
     inbox = await f.engine.harness.snapshot(InboxDoc, cid, BACKGROUND_CONTEXT);
@@ -3178,7 +3187,7 @@ test("a result observed before delayed native admission cannot produce a stale w
     const admit = f.engine.sessionAgent.admitNotification.bind(f.engine.sessionAgent);
     let intercepted = false;
     const gate = new Promise<void>((resolve) => { release = resolve; });
-    f.engine.sessionAgent.admitNotification = async <T>(parent: Session, id: string, submit: (command: import("../src/session-agent.js").SessionCommand) => Promise<T>) => {
+    f.engine.sessionAgent.admitNotification = async <T>(parent: Session, id: string, submit: (command: import("../src/session-agent.js").SessionCommand, updates: import("../src/model.js").WorkerUpdate[]) => Promise<T>) => {
       intercepted = true; await gate;
       return admit(parent, id, submit);
     };

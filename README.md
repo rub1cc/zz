@@ -831,6 +831,13 @@ file locks: concurrent edits can conflict. There are limits of twelve active wor
 per coordinator, four delegation levels, and 32 active sessions per project for
 agent-created work. Existing user-created sessions are not capped by these limits.
 
+Delivered worker notifications show a worker title and readable Markdown result,
+with headings such as **Worker completed**, **Worker failed**, or **Worker needs
+input**. They do not use the gray human-prompt box or display transport instructions,
+task/run IDs, or result-envelope JSON. Existing saved notifications use the same
+presentation when their legacy envelopes can be decoded. Model input and retained
+raw messages are unchanged.
+
 Worker reports appear in a separate **Worker updates** transcript section with the
 worker title, report kind and delivery state. It shows the latest ten reports from
 the latest-50 presentation cache as single-line previews capped at 240 characters

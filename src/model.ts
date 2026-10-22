@@ -117,6 +117,8 @@ export interface Workspace {
 
 export interface Message {
   source?: PendingInput["source"];
+  /** Display-only snapshot of worker notifications; never changes the model prompt. */
+  workerUpdates?: WorkerUpdate[];
   role: "user" | "assistant" | "tool" | "error" | "thinking";
   thinking?: { id: string; redacted?: boolean };
   images?: ImageAttachment[];
@@ -202,7 +204,7 @@ export interface Session {
   /** Additional outstanding submissions, including inputs awaiting durable admission. */
   followUps?: PendingInput[];
   /** Presentation cache of native pi.inbox inputs, rebuilt from the durable view. */
-  queuedInputs?: { id: number; text: string; mode?: ReplyBehavior; imageCount?: number; source?: PendingInput["source"] }[];
+  queuedInputs?: { id: number; text: string; mode?: ReplyBehavior; imageCount?: number; source?: PendingInput["source"]; workerUpdates?: WorkerUpdate[] }[];
   agent?: AgentSettings;
   projectId: string;
   workspaceId?: string;
